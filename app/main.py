@@ -2,10 +2,10 @@
 """
 main.py
 
-Punto de entrada de la aplicación de predicción de EUR/USD. Este script orquesta:
+Punto de entrada de la aplicación LTS (Live Trading System). Este script orquesta:
     - La carga y fusión de configuraciones (CLI, archivos locales y remotos).
-    - La inicialización de los plugins: Predictor, Optimizer, Pipeline y Preprocessor.
-    - La selección entre ejecutar la optimización de hiperparámetros o entrenar y evaluar directamente.
+    - La inicialización de los plugins: Pipeline, Strategy, Broker y Portfolio.
+    - La selección entre ejecutar la optimización de parámetros o ejecutar el trading directamente.
     - El guardado de la configuración resultante de forma local y/o remota.
 """
 
@@ -27,15 +27,15 @@ from app.plugin_loader import load_plugin
 from config_merger import merge_config, process_unknown_args
 
 # Se asume que los siguientes plugins se cargan desde sus respectivos namespaces:
-# - predictor.plugins
-# - optimizer.plugins
 # - pipeline.plugins
-# - preprocessor.plugins
+# - strategy.plugins
+# - broker.plugins
+# - portfolio.plugins
 
 def main():
     """
-    Orquesta la ejecución completa del sistema, incluyendo la optimización (si se configura)
-    y la ejecución del pipeline completo (preprocesamiento, entrenamiento, predicción y evaluación).
+    Orquesta la ejecución completa del sistema LTS, incluyendo la optimización (si se configura)
+    y la ejecución del pipeline completo de trading (pipeline, estrategia, broker y portfolio management).
     """
     print("Parsing initial arguments...")
     args, unknown_args = parse_args()
