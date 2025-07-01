@@ -10,34 +10,19 @@ setup(
         ],
         # Pipeline plugins - Definen el flujo de procesamiento para cada instrumento
         'pipeline.plugins': [
-            'default_pipeline=pipeline_plugins.default_pipeline:Plugin',
-            'scalping_pipeline=pipeline_plugins.scalping_pipeline:Plugin',
-            'swing_pipeline=pipeline_plugins.swing_pipeline:Plugin',
-            'momentum_pipeline=pipeline_plugins.momentum_pipeline:Plugin'
+            'default_pipeline=plugins_pipeline.default_pipeline:Plugin'
         ],
         # Strategy plugins - Implementan lógica de toma de decisiones de trading
         'strategy.plugins': [
-            'default_strategy=strategy_plugins.default_strategy:Plugin',
-            'breakout_strategy=strategy_plugins.breakout_strategy:Plugin',
-            'mean_reversion_strategy=strategy_plugins.mean_reversion_strategy:Plugin',
-            'trend_following_strategy=strategy_plugins.trend_following_strategy:Plugin',
-            'grid_strategy=strategy_plugins.grid_strategy:Plugin'
+            'default_strategy=plugins_strategy.default_strategy:Plugin'
         ],
         # Broker API plugins - Manejan conexión y ejecución con brokers
-        'broker_api.plugins': [
-            'default_broker=broker_api_plugins.default_broker:Plugin',
-            'oanda_broker=broker_api_plugins.oanda_broker:Plugin',
-            'binance_broker=broker_api_plugins.binance_broker:Plugin',
-            'mt5_broker=broker_api_plugins.mt5_broker:Plugin',
-            'simulation_broker=broker_api_plugins.simulation_broker:Plugin'
+        'broker.plugins': [
+            'default_broker=plugins_broker.default_broker:Plugin'
         ],
         # Portfolio Manager plugins - Administran asignación de capital
-        'portfolio_manager.plugins': [
-            'default_portfolio=portfolio_manager_plugins.default_portfolio:Plugin',
-            'equal_weight_portfolio=portfolio_manager_plugins.equal_weight_portfolio:Plugin',
-            'variance_minimization_portfolio=portfolio_manager_plugins.variance_minimization_portfolio:Plugin',
-            'risk_parity_portfolio=portfolio_manager_plugins.risk_parity_portfolio:Plugin',
-            'kelly_criterion_portfolio=portfolio_manager_plugins.kelly_criterion_portfolio:Plugin'
+        'portfolio.plugins': [
+            'default_portfolio=plugins_portfolio.default_portfolio:Plugin'
         ]
     },
     install_requires=[
