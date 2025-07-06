@@ -1,4 +1,23 @@
+"""
+CLI argument parser: parses and validates all arguments, including plugin-specific ones.
+"""
 import argparse
+from typing import Dict, Any
+
+def parse_cli_args() -> Dict[str, Any]:
+    parser = argparse.ArgumentParser(description="Feature Extractor CLI")
+    parser.add_argument("--csv_file", type=str, help="Input CSV file")
+    parser.add_argument("--encoder", type=str, help="Encoder plugin name")
+    parser.add_argument("--decoder", type=str, help="Decoder plugin name")
+    parser.add_argument("--output", type=str, help="Output file")
+    parser.add_argument("--remote_config", type=str, help="Remote config URL", required=False)
+    parser.add_argument("--help", action="help", help="Show help message and exit")
+    # Add plugin-specific args as needed
+    args, unknown = parser.parse_known_args()
+    # Validate required
+    if not args.csv_file or not args.encoder or not args.decoder:
+        parser.error("--csv_file, --encoder, and --decoder are required.")
+    return vars(args)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Predictor: A tool for timeseries prediction with plugin support.")

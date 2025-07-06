@@ -1,3 +1,9 @@
+"""
+reconstruction.py
+
+Provides functions for transforming windowed datasets into non-windowed datasets.
+"""
+
 import numpy as np
 import pandas as pd
 

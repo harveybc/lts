@@ -103,7 +103,62 @@ class Instrumento:
 - instrument.broker_api: nombre del plugin de broker_api.
 - instrument.max_positions: número máximo de posiciones simultáneas permitidas para este instrumento.
 
-## 6. Consideraciones generales
+---
+
+## 6. Database Plugin and ORM Integration
+
+All plugins and core modules interact with the database exclusively via SQLAlchemy ORM. The database engine is SQLite by default, but can be swapped for any SQLAlchemy-supported backend. The following tables are required:
+
+### User Table
+| Column         | Type        | Description                       |
+|---------------|------------|-----------------------------------|
+| id            | Integer PK | Unique user ID                    |
+| username      | String     | Unique username                   |
+| email         | String     | Unique email                      |
+| password_hash | String     | Hashed password                   |
+| role          | String     | User role (admin, user, etc.)     |
+| is_active     | Boolean    | Account active flag               |
+| created_at    | DateTime   | Account creation timestamp        |
+
+### Session Table
+| Column         | Type        | Description                       |
+|---------------|------------|-----------------------------------|
+| id            | Integer PK | Unique session ID                 |
+| user_id       | Integer FK | Linked user                       |
+| token         | String     | Session token (JWT or random)     |
+| created_at    | DateTime   | Session creation timestamp        |
+| expires_at    | DateTime   | Session expiration                |
+
+### AuditLog Table
+| Column         | Type        | Description                       |
+|---------------|------------|-----------------------------------|
+| id            | Integer PK | Unique log entry                  |
+| user_id       | Integer FK | Linked user                       |
+| action        | String     | Action performed                  |
+| timestamp     | DateTime   | When action occurred              |
+| details       | String     | Additional context                |
+
+### Config Table
+| Column         | Type        | Description                       |
+|---------------|------------|-----------------------------------|
+| id            | Integer PK | Unique config entry               |
+| key           | String     | Config key                        |
+| value         | String     | Config value (JSON/text)          |
+| updated_at    | DateTime   | Last update timestamp             |
+
+### Statistics Table
+| Column         | Type        | Description                       |
+|---------------|------------|-----------------------------------|
+| id            | Integer PK | Unique stat entry                 |
+| key           | String     | Stat key                          |
+| value         | Float      | Stat value                        |
+| timestamp     | DateTime   | When stat was recorded            |
+
+All plugin types (AAA, core, pipeline, strategy, broker, portfolio) must use the ORM models for all persistent data. Plugins must not access the database directly except via SQLAlchemy ORM.
+
+---
+
+## 7. Consideraciones generales
     Todas las clases de plugins deben inicializarse obligatoriamente con config: dict para garantizar coherencia con el sistema de configuración global de la aplicación.
     El portfolio_manager debe gestionar todas las instancias de instrumentos activas y ser el punto único de decisión sobre asignación de capital.
     Cada ejecución del daemon LTS debe orquestar el ciclo completo: asignación → predicción → pipeline → estrategia → ejecución en broker, en todos los instrumentos configurados.

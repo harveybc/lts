@@ -1,212 +1,155 @@
+# Live Trading System (LTS)
 
-# Predictor
+## Overview
 
-## Description
+LTS (Live Trading System) is a secure, modular, and extensible framework for automated trading, featuring:
+- **FastAPI** for a modern, async, and secure API layer.
+- **AdminLTE-based web interface** for admin and user dashboards, fully integrated with the API.
+- **Plugin-based AAA (Authentication, Authorization, Accounting)** for flexible, secure user management.
+- **Plugin-based core loop**: The core plugin runs the main trading loop and starts the API server.
+- **SQLite database via SQLAlchemy** for all AAA, configuration, statistics, and app state, with a fully documented schema.
+- **Full BDD/TDD methodology**: All endpoints and behaviors are covered by unit, integration, system, and acceptance tests.
 
-The predictor project is a comprehensive tool for timeseries prediction, equipped with a robust plugin architecture. This project allows for both local and remote configuration handling, as well as replicability of experimental results. The system can be extended with custom plugins for various types of neural networks, including artificial neural networks (ANN), convolutional neural networks (CNN), long short-term memory networks (LSTM), and transformer-based models. Examples of the aforementioned models are included alongside with historical EURUSD and other training data in the **examples** directory.
+## Architecture
 
-## Installation Instructions
+- **API Layer**: Built with FastAPI, providing secure, async endpoints for all system operations. All endpoints require authentication and authorization, enforced by AAA plugins.
+- **AdminLTE UI**: The web dashboard is built on AdminLTE, communicating with the FastAPI backend via secure API calls. All admin/user actions are performed through the API.
+- **Plugin System**: All major system components (AAA, core loop, pipelines, strategies, brokers, portfolio managers) are implemented as plugins. Plugins are loaded dynamically and can be extended or replaced without modifying the core.
+- **Security**: AAA plugins provide authentication (login, registration, password reset), authorization (role-based access), and accounting (audit logging). All API endpoints are protected.
+- **Core Plugin**: The core plugin is responsible for running the main trading loop and starting the FastAPI server. It coordinates all other plugins and system components.
+- **Database**: All AAA, configuration, statistics, and app state are stored in a SQLite database, accessed exclusively via SQLAlchemy ORM. The schema is fully documented below.
 
-To install and set up the predictor application, follow these steps:
+## Database Schema (SQLAlchemy ORM)
 
-1. **Clone the Repository**:
-    ```bash
-    git clone https://github.com/harveybc/predictor.git
-    cd predictor
-    ```
+### User Table
+| Column         | Type        | Description                       |
+|---------------|------------|-----------------------------------|
+| id            | Integer PK | Unique user ID                    |
+| username      | String     | Unique username                   |
+| email         | String     | Unique email                      |
+| password_hash | String     | Hashed password                   |
+| role          | String     | User role (admin, user, etc.)     |
+| is_active     | Boolean    | Account active flag               |
+| created_at    | DateTime   | Account creation timestamp        |
 
-2. **Add the clonned directory to the Windows or Linux PYTHONPATH environment variable**:
+### Session Table
+| Column         | Type        | Description                       |
+|---------------|------------|-----------------------------------|
+| id            | Integer PK | Unique session ID                 |
+| user_id       | Integer FK | Linked user                       |
+| token         | String     | Session token (JWT or random)     |
+| created_at    | DateTime   | Session creation timestamp        |
+| expires_at    | DateTime   | Session expiration                |
 
-In Windows a close of current command line promp may be required for the PYTHONPATH varible to be usable.
-Confirm you added the directory to the PYTHONPATH with the following commands:
+### AuditLog Table
+| Column         | Type        | Description                       |
+|---------------|------------|-----------------------------------|
+| id            | Integer PK | Unique log entry                  |
+| user_id       | Integer FK | Linked user                       |
+| action        | String     | Action performed                  |
+| timestamp     | DateTime   | When action occurred              |
+| details       | String     | Additional context                |
 
-- On Windows, run:
-    ```bash
-    echo %PYTHONPATH%
-    ```
+### Config Table
+| Column         | Type        | Description                       |
+|---------------|------------|-----------------------------------|
+| id            | Integer PK | Unique config entry               |
+| key           | String     | Config key                        |
+| value         | String     | Config value (JSON/text)          |
+| updated_at    | DateTime   | Last update timestamp             |
 
-- On Linux, run:
-    ```bash
-    echo $PYTHONPATH 
-    ```
-If the clonned repo directory appears in the PYTHONPATH, continue to the next step. 
+### Statistics Table
+| Column         | Type        | Description                       |
+|---------------|------------|-----------------------------------|
+| id            | Integer PK | Unique stat entry                 |
+| key           | String     | Stat key                          |
+| value         | Float      | Stat value                        |
+| timestamp     | DateTime   | When stat was recorded            |
 
-3. **Create and Activate a Virtual Environment (Anaconda is required)**:
+## Features
 
-    - **Using `conda`**:
-        ```bash
-        conda create --name predictor-env python=3.9
-        conda activate predictor-env
-        ```
+- **AdminLTE-based dashboard**: Modern, responsive UI for managing portfolios, assets, users, and system analytics.
+- **Secure API**: All actions (including UI) go through authenticated, authorized FastAPI endpoints.
+- **Plugin-based AAA**: Authentication, authorization, and audit logging are fully pluggable and configurable.
+- **Plugin-based core loop**: The main trading loop and API server are managed by a core plugin, allowing for custom execution logic.
+- **Extensible plugin system**: Pipelines, strategies, brokers, portfolio managers, and AAA can all be extended or replaced.
+- **Unified configuration**: All config is merged from defaults, files, CLI, and remote sources, and passed to every plugin.
+- **Full BDD/TDD**: All endpoints and behaviors are covered by tests at every level.
+- **SQLite/SQLAlchemy**: All persistent data is stored in a SQLite database, accessed via SQLAlchemy ORM only.
 
-4. **Install Dependencies**:
-    ```bash
-    pip install --upgrade pip
-    pip install -r requirements.txt
-    ```
+## Technology Stack
 
-5. **Build the Package**:
-    ```bash
-    python -m build
-    ```
+- **FastAPI** (API layer)
+- **AdminLTE** (web UI)
+- **SQLAlchemy** (ORM, SQLite backend)
+- **Python 3.12+**
+- **pytest, hypothesis, pydocstyle** (testing)
+- **httpx** (API testing)
+- **pandas, numpy, etc.** (data handling)
+- **All dependencies listed in requirements.txt**
 
-6. **Install the Package**:
-    ```bash
-    pip install .
-    ```
+## Running the System
 
-7. **(Optional) Run the predictor**:
-    - On Windows, run the following command to verify installation (it uses all default valuex, use predictor.bat --help for complete command line arguments description):
-        ```bash
-        predictor.bat --load_config examples\config\phase_1\phase_1_ann_6300_1h_config.json
-        ```
+1. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. **Initialize the database**:
+   ```bash
+   python app/init_db.py
+   ```
+3. **Configure your system**:
+   - Edit `input_config.json` or use CLI parameters to define plugins, AAA, and core loop.
+4. **Run the system**:
+   ```bash
+   python app/main.py --load_config input_config.json [other CLI options]
+   ```
+5. **Start the web dashboard**:
+   ```bash
+   python app/web.py
+   ```
+6. **Develop new plugins**:
+   - Implement the required interface as described in `REFERENCE_plugins.md` and register via `setup.py`.
 
-    - On Linux, run:
-        ```bash
-        sh predictor.sh --load_config examples\config\phase_1\phase_1_ann_6300_1h_config.json
-        ```
+## Testing
 
-8. **(Optional) Run Tests**:
-For pasing remote tests, requires an instance of [harveybc/data-logger](https://github.com/harveybc/data-logger)
-    - On Windows, run the following command to run the tests:
-        ```bash
-        set_env.bat
-        pytest
-        ```
+- **Unit tests**: `pytest tests/unit/`
+- **Integration tests**: `pytest tests/integration/` (includes real FastAPI endpoint tests)
+- **System tests**: `pytest tests/system/`
+- **Acceptance tests**: `pytest tests/acceptance/`
+- **All endpoints and behaviors are covered by real, executable tests.**
+- **Database tests**: All database models, migrations, and queries are covered by tests at every level.
 
-    - On Linux, run:
-        ```bash
-        sh ./set_env.sh
-        pytest
-        ```
+## Directory Structure
 
-9. **(Optional) Generate Documentation**:
-    - Run the following command to generate code documentation in HTML format in the docs directory:
-        ```bash
-        pdoc --html -o docs app
-        ```
-10. **(Optional) Install Nvidia CUDA GPU support**:
+- `app/`: Core application, plugin interfaces, API, and web modules.
+- `plugins_*`: Default plugin implementations for each type.
+- `examples/`: Example configs, data, and scripts.
+- `tests/`: Acceptance, system, integration, and unit tests (BDD/TDD methodology).
+- `README.md`: This file.
+- `REFERENCE_plugins.md`: Detailed plugin interface and requirements.
 
-Please read: [Readme - CUDA](https://github.com/harveybc/predictor/blob/master/README_CUDA.md)
+## User Stories
 
-## Usage
+- As a user/admin, I want to log in securely and access my dashboard (AdminLTE UI).
+- As a user/admin, I want to manage portfolios, assets, and users via the web UI and API.
+- As a developer, I want to implement and test new plugins for AAA, core loop, pipelines, strategies, brokers, and portfolio managers.
+- As an operator, I want all AAA, config, and statistics to be stored in a secure, auditable database (SQLite/SQLAlchemy).
+- As a tester, I want all database models and queries to be covered by tests at every level.
 
-Example config json files are located in examples\config, for a list of individual parameters to call via CLI or in a config json file, use: **predictor.bat --help**
+## Security & Compliance
 
-After executing the prediction pipeline, the predictor will generate 4 files:
-- **output_file**: csv file, predictions for the selected time_horizon **(see defaults in app\config.py)**
-- **results_file**: csv file, aggregated results for the configured number of iterations of the training with the selected number of training epochs 
-- **loss_plot_file**: png image, the plot of error vs epoch for training and validation in the last iteration 
-- **model_plot_file**: png image, the plot of the used Keras model
- 
-The application supports several command line arguments to control its behavior for example:
+- All API endpoints require authentication and authorization.
+- AAA plugins enforce role-based access and audit logging.
+- All actions are traceable and auditable.
+- The system is designed for robust, ethical, and maintainable operation.
 
-```
-usage: predictor.bat --load_config examples\config\phase_1\phase_1_ann_6300_1h_config.json --epochs 100 --iterations 5
-```
+## Extending the System
 
-There are many examples of config files in the **examples\config directory**, also training data of EURUSD and othertimeseries in **examples\data** and the results of the example config files are set to be on **examples\results**, there are some scripts to automate running sequential predictions in **examples\scripts**.
+- See `REFERENCE_plugins.md` for detailed plugin interfaces and extension points.
+- All plugins must be registered and configured via the unified config system.
+- The core plugin manages the main loop and API server; custom core plugins can be developed for advanced use cases.
 
+---
 
-### Directory Structure
-
-```
-predictor/
-│
-├── app/                                 # Main application package
-│   ├── __init__.py                     # Package initialization
-│   ├── cli.py                          # Command-line interface handling
-│   ├── config.py                       # Default configuration values
-│   ├── config_handler.py               # Configuration management
-│   ├── config_merger.py                # Configuration merging logic
-│   ├── data_handler.py                 # Data loading and saving functions
-│   ├── data_processor.py               # Core data processing pipeline
-│   ├── main.py                         # Application entry point
-│   ├── plugin_loader.py                # Dynamic plugin loading system
-│   ├── reconstruction.py               # Data reconstruction utilities
-│   └── plugins/                        # Prediction plugins directory
-│       ├── predictor_plugin_ann.py     # Artificial Neural Network plugin
-│       ├── predictor_plugin_cnn.py     # Convolutional Neural Network plugin
-│       ├── predictor_plugin_lstm.py    # Long Short-Term Memory plugin
-│       └── predictor_plugin_transformer.py # Transformer model plugin
-│
-├── tests/                              # Test suite directory
-│   ├── __init__.py                    # Test package initialization
-│   ├── conftest.py                    # pytest configuration
-│   ├── acceptance_tests/              # User acceptance tests
-│   ├── integration_tests/             # Integration test modules
-│   ├── system_tests/                  # System-wide test cases
-│   └── unit_tests/                    # Unit test modules
-│
-├── examples/                           # Example files directory
-│   ├── config/                         # Example configuration files
-│   ├── data/                           # Example training data
-│   ├── results/                        # Example output results
-│   └── scripts/                        # Example execution scripts
-│       └── run_phase_1.bat                 # Phase 1 execution script
-│
-├── concatenate_csv.py                  # CSV file manipulation utility
-├── setup.py                           # Package installation script
-├── predictor.bat                      # Windows execution script
-├── predictor.sh                       # Linux execution script
-├── set_env.bat                        # Windows environment setup
-├── set_env.sh                         # Linux environment setup
-├── requirements.txt                    # Python dependencies
-├── LICENSE.txt                        # Project license
-└── prompt.txt                         # Project documentation
-```
-
-## Example of plugin model:
-```mermaid
-graph TD
-
-    subgraph SP_Input ["Input Processing (Features Only)"]
-        I[/"Input (ws, num_channels)"/] --> FS{"Split Features"};
-
-        subgraph SP_Branches ["Feature Branches (Parallel)"]
-             FS -- Feature 1 --> F1_FLAT["Flatten"] --> F1_DENSE["Dense x M"];
-             FS -- ... --> F_DOTS["..."];
-             FS -- Feature n --> Fn_FLAT["Flatten"] --> Fn_DENSE["Dense x M"];
-        end
-
-        F1_DENSE --> M{"Merge Concat Features"};
-        F_DOTS --> M;
-        Fn_DENSE --> M;
-    end
-
-    subgraph SP_Heads ["Output Heads (Parallel)"]
-
-        subgraph Head1 ["Head for Horizon 1"]
-            M --> H1_DENSE["Dense x K"];
-            H1_DENSE --> H1_BAYES{"DenseFlipout (Bayesian)"};
-            H1_DENSE --> H1_BIAS["Dense (Bias)"];
-            H1_BAYES --> H1_ADD{"Add"};
-            H1_BIAS --> H1_ADD;
-            H1_ADD --> O1["Output H1"];
-        end
-
-         subgraph HeadN ["Head for Horizon N"]
-            M --> HN_DENSE["Dense x K"];
-            HN_DENSE --> HN_BAYES{"DenseFlipout (Bayesian)"};
-            HN_DENSE --> HN_BIAS["Dense (Bias)"];
-            HN_BAYES --> HN_ADD{"Add"};
-            HN_BIAS --> HN_ADD;
-            HN_ADD --> ON["Output HN"];
-        end
-
-    end
-
-    O1 --> Z((Final Output List));
-    ON --> Z;
-
-    subgraph Legend
-         NoteM["M = config['intermediate_layers']"];
-         NoteK["K = config['intermediate']"];
-         NoteNoFB["NOTE: Diagram simplified - Feedback loops not shown."];
-    end
-
-    style H1_BAYES,HN_BAYES fill:#556B2F,stroke:#333,color:#fff;
-    style H1_BIAS,HN_BIAS fill:#4682B4,stroke:#333,color:#fff;
-    style NoteM,NoteK,NoteNoFB fill:#8B413,stroke:#333,stroke-dasharray:5 5,color:#fff;
-
-```
+For full details, see the design documents for each level (acceptance, system, integration, unit) and the plugin reference.

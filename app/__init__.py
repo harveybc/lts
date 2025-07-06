@@ -1,3 +1,7 @@
+"""
+This package initializes the app and sets up the plugin path for dynamic loading.
+"""
+
 # Initialize the app package
 import os
 import sys

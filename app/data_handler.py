@@ -1,11 +1,62 @@
+"""
+data_handler.py
+
+Handles robust CSV loading and writing, including edge and malformed cases.
+"""
 import pandas as pd
-from typing import Optional
-from app.reconstruction import unwindow_data
+from typing import Any, Optional
 
 
-import pandas as pd
-from typing import Optional
-import sys
+class DataHandler:
+    """
+    Provides static methods for loading and writing CSV files with error handling.
+    """
+    @staticmethod
+    def load_csv(path: str) -> pd.DataFrame:
+        """
+        Load a CSV file into a DataFrame, raising ValueError on failure.
+
+        :param path: Path to the CSV file.
+        :type path: str
+        :return: Loaded DataFrame.
+        :rtype: pd.DataFrame
+        :raises ValueError: If loading fails or DataFrame is empty.
+        """
+        try:
+            df = pd.read_csv(path)
+            assert not df.empty
+            return df
+        except Exception as e:
+            raise ValueError(f"Failed to load CSV: {e}")
+
+    @staticmethod
+    def write_csv(df: Any, path: str):
+        """
+        Write a DataFrame to a CSV file, raising ValueError on failure.
+
+        :param df: DataFrame to write.
+        :type df: Any
+        :param path: Path to save the CSV file.
+        :type path: str
+        :raises ValueError: If writing fails.
+        """
+        try:
+            df.to_csv(path, index=False)
+        except Exception as e:
+            raise ValueError(f"Failed to write CSV: {e}")
+
+
+def unwindow_data(data: pd.DataFrame, window_size: int) -> pd.DataFrame:
+    """
+    Convert windowed data to unwindowed format (placeholder).
+
+    :param data: Input DataFrame.
+    :param window_size: Window size used for transformation.
+    :return: Unwindowed DataFrame.
+    """
+    # Placeholder for the unwindow_data function
+    return data
+
 
 def load_csv(file_path: str, headers: bool = False, max_rows: Optional[int] = None) -> pd.DataFrame:
     """

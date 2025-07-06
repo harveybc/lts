@@ -1,4 +1,8 @@
-# config.py
+"""
+config.py
+
+Defines the default configuration values for the application.
+"""
 
 DEFAULT_VALUES = {
     "use_normalization_json": "examples\\config\\phase_2_normalizer_debug_out.json",

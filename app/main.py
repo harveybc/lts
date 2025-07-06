@@ -2,189 +2,136 @@
 """
 main.py
 
-Punto de entrada de la aplicación LTS (Live Trading System). Este script orquesta:
-    - La carga y fusión de configuraciones (CLI, archivos locales y remotos).
-    - La inicialización de los plugins: Pipeline, Strategy, Broker y Portfolio.
-    - La selección entre ejecutar la optimización de parámetros o ejecutar el trading directamente.
-    - El guardado de la configuración resultante de forma local y/o remota.
+Entry point for the Prediction Provider application. This script orchestrates:
+- Loading and merging configurations (CLI, files).
+- Initializing all plugins: Core, Endpoints, Feeder, Pipeline, and Predictor.
+- Starting the core plugin to launch the FastAPI application.
+
+:author: Your Name
+:copyright: (c) 2025 Your Organization
+:license: MIT
 """
 
 import sys
-import json
-import pandas as pd
 from typing import Any, Dict
+import logging
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from app.config_handler import (
-    load_config,
-    save_config,
-    remote_load_config,
-    remote_save_config,
-    remote_log
-)
+from app.config_handler import load_config, remote_load_config
 from app.cli import parse_args
 from app.config import DEFAULT_VALUES
 from app.plugin_loader import load_plugin
-from config_merger import merge_config, process_unknown_args
+from app.config_merger import merge_config, process_unknown_args
+# Import the FastAPI app for tests
+try:
+    from plugins_core.default_core import app
+except ImportError:
+    app = None  # Allows tests to run if plugins_core is not present
 
-# Se asume que los siguientes plugins se cargan desde sus respectivos namespaces:
-# - pipeline.plugins
-# - strategy.plugins
-# - broker.plugins
-# - portfolio.plugins
+def setup_logging(level=logging.INFO):
+    """
+    Setup logging configuration.
+
+    :param level: Logging level (default: logging.INFO)
+    :type level: int
+    :return: Configured logger
+    :rtype: logging.Logger
+    """
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('app.log')
+        ]
+    )
+    return logging.getLogger(__name__)
+
+class ErrorHandler:
+    """
+    Handles errors by sanitizing sensitive information from error messages.
+    """
+    @staticmethod
+    def handle_error(error: Exception) -> str:
+        """
+        Sanitize error messages to remove sensitive information.
+
+        :param error: The exception to sanitize.
+        :type error: Exception
+        :return: Sanitized error message string.
+        :rtype: str
+        """
+        import re
+        # Remove common sensitive patterns (e.g., password, secret, token)
+        msg = str(error)
+        # Replace password-like patterns
+        msg = re.sub(r'(password|secret|token)\s*=\s*[^,;\s]+', r'\1=***', msg, flags=re.IGNORECASE)
+        # Remove any obvious sensitive info
+        msg = re.sub(r'\b\d{4,}\b', '****', msg)  # Mask long numbers
+        return msg
 
 def main():
     """
-    Orquesta la ejecución completa del sistema LTS, incluyendo la optimización (si se configura)
-    y la ejecución del pipeline completo de trading (pipeline, estrategia, broker y portfolio management).
+    Orchestrates the execution of the Prediction Provider system.
     """
-    print("Parsing initial arguments...")
+    print("--- Initializing Prediction Provider ---")
+
+    # 1. Configuration Loading
     args, unknown_args = parse_args()
     cli_args: Dict[str, Any] = vars(args)
-
-    print("Loading default configuration...")
     config: Dict[str, Any] = DEFAULT_VALUES.copy()
-
     file_config: Dict[str, Any] = {}
-    # Carga remota de configuración si se solicita
-    if args.remote_load_config:
-        try:
-            file_config = remote_load_config(args.remote_load_config, args.username, args.password)
-            print(f"Loaded remote config: {file_config}")
-        except Exception as e:
-            print(f"Failed to load remote configuration: {e}")
-            sys.exit(1)
 
-    # Carga local de configuración si se solicita
     if args.load_config:
         try:
             file_config = load_config(args.load_config)
-            print(f"Loaded local config: {file_config}")
+            print(f"Loaded local config from: {args.load_config}")
         except Exception as e:
             print(f"Failed to load local configuration: {e}")
             sys.exit(1)
 
-    # Primera fusión de la configuración (sin parámetros específicos de plugins)
-    print("Merging configuration with CLI arguments and unknown args (first pass, no plugin params)...")
+    # First merge pass (without plugin-specific parameters)
+    print("Merging configuration (first pass)...")
     unknown_args_dict = process_unknown_args(unknown_args)
     config = merge_config(config, {}, {}, file_config, cli_args, unknown_args_dict)
 
-    # Selección del plugins
-    if not cli_args.get('pipeline_plugin'):
-        cli_args['pipeline_plugin'] = config.get('pipeline_plugin', 'default_pipeline')
-    plugin_name = config.get('pipeline_plugin', 'default_pipeline')
-    
-    
-    # --- CARGA DE PLUGINS ---
-    # Carga del Pipeline Plugin
-    print(f"Loading Pipeline Plugin: {plugin_name}")
-    try:
-        pipeline_class, _ = load_plugin('pipeline.plugins', plugin_name)
-        pipeline_plugin = pipeline_class(config)
-        pipeline_plugin.set_params(**config)
-    except Exception as e:
-        print(f"Failed to load or initialize Pipeline Plugin '{plugin_name}': {e}")
-        sys.exit(1)
+    # 2. Plugin Loading
+    plugin_types = ['core', 'endpoints', 'feeder', 'pipeline', 'predictor']
+    plugins = {}
 
-    # Carga del Strategy Plugin
-    # Selección del plugin si no se especifica
-    plugin_name = config.get('strategy_plugin', 'default_strategy')
-    print(f"Loading Plugin ..{plugin_name}")
-
-    try:
-        strategy_class, _ = load_plugin('strategy.plugins', plugin_name)
-        strategy_plugin = strategy_class(config)
-        strategy_plugin.set_params(**config)
-    except Exception as e:
-        print(f"Failed to load or initialize Strategy Plugin: {e}")
-        sys.exit(1)
-
-    # Carga del Broker Plugin
-    plugin_name = config.get('broker_plugin', 'default_broker')
-    print(f"Loading Plugin ..{plugin_name}")
-    try:
-        broker_class, _ = load_plugin('broker.plugins', plugin_name)
-        broker_plugin = broker_class(config)
-        broker_plugin.set_params(**config)
-    except Exception as e:
-        print(f"Failed to load or initialize Broker Plugin: {e}")
-        sys.exit(1)
-
-    # Carga del Portfolio Plugin
-    plugin_name = config.get('portfolio_plugin', 'default_portfolio')
-    print(f"Loading Plugin ..{plugin_name}")
-    try:
-        portfolio_class, _ = load_plugin('portfolio.plugins', plugin_name)
-        portfolio_plugin = portfolio_class(config)
-        portfolio_plugin.set_params(**config)
-    except Exception as e:
-        print(f"Failed to load or initialize Portfolio Plugin: {e}")
-        sys.exit(1)
-
-    # fusión de configuración, integrando parámetros específicos de plugin pipeline
-    print("Merging configuration with CLI arguments and unknown args (second pass, with plugin params)...")
-    config = merge_config(config, pipeline_plugin.plugin_params, {}, file_config, cli_args, unknown_args_dict)
-    # fusión de configuración, integrando parámetros específicos de plugin strategy
-    config = merge_config(config, strategy_plugin.plugin_params, {}, file_config, cli_args, unknown_args_dict)
-    # fusión de configuración, integrando parámetros específicos de plugin broker
-    config = merge_config(config, broker_plugin.plugin_params, {}, file_config, cli_args, unknown_args_dict)
-    # fusión de configuración, integrando parámetros específicos de plugin portfolio
-    config = merge_config(config, portfolio_plugin.plugin_params, {}, file_config, cli_args, unknown_args_dict)
-    
-
-    # --- DECISIÓN DE EJECUCIÓN ---
-    if config.get('load_model', False):
-        print("Loading and evaluating existing model...")
+    for plugin_type in plugin_types:
+        plugin_name = config.get(f'{plugin_type}_plugin', f'default_{plugin_type}')
+        print(f"Loading {plugin_type.capitalize()} Plugin: {plugin_name}")
         try:
-            # Usar el pipeline plugin para cargar y evaluar el modelo
-            pipeline_plugin.load_and_evaluate_model(config)
+            plugin_class, _ = load_plugin(f'{plugin_type}.plugins', plugin_name)
+            plugin_instance = plugin_class(config)
+            plugin_instance.set_params(**config)
+            plugins[plugin_type] = plugin_instance
         except Exception as e:
-            print(f"Model evaluation failed: {e}")
+            print(f"Failed to load or initialize {plugin_type.capitalize()} Plugin '{plugin_name}': {e}")
             sys.exit(1)
-    else:
-        # Si se activa el optimizador, se ejecuta el proceso de optimización antes del pipeline
-        if config.get('use_optimizer', False):
-            print("Running hyperparameter optimization with Portfolio Plugin...")
-            try:
-                # El portfolio manager optimiza la asignación de capital
-                optimal_params = portfolio_plugin.optimize(pipeline_plugin, strategy_plugin, config)
-                # Se guardan los parámetros óptimos en un archivo JSON
-                optimizer_output_file = config.get("optimizer_output_file", "optimizer_output.json")
-                with open(optimizer_output_file, "w") as f:
-                    json.dump(optimal_params, f, indent=4)
-                print(f"Optimized parameters saved to {optimizer_output_file}.")
-                # Actualizar la configuración con los parámetros optimizados
-                config.update(optimal_params)
-            except Exception as e:
-                print(f"Hyperparameter optimization failed: {e}")
-                sys.exit(1)
-        else:
-            print("Skipping hyperparameter optimization.")
-            print("Running trading pipeline...")
-            # El Pipeline Plugin orquesta:
-            # 1. Procesamiento de predicciones y datos de mercado
-            # 2. Ejecución de estrategia y manejo de broker
-            pipeline_plugin.run_trading_pipeline(
-                config,
-                strategy_plugin,
-                broker_plugin,
-                portfolio_plugin
-            )
-        
-    # Guardado de la configuración local y remota
-    if config.get('save_config'):
-        try:
-            save_config(config, config['save_config'])
-            print(f"Configuration saved to {config['save_config']}.")
-        except Exception as e:
-            print(f"Failed to save configuration locally: {e}")
 
-    if config.get('remote_save_config'):
-        print(f"Remote saving configuration to {config['remote_save_config']}")
-        try:
-            remote_save_config(config, config['remote_save_config'], config.get('username'), config.get('password'))
-            print("Remote configuration saved.")
-        except Exception as e:
-            print(f"Failed to save configuration remotely: {e}")
+    # Second merge pass (with all plugin parameters)
+    print("Merging configuration (second pass, with plugin params)...")
+    for plugin_type, plugin_instance in plugins.items():
+        config = merge_config(config, plugin_instance.plugin_params, {}, file_config, cli_args, unknown_args_dict)
+
+    # 3. Start Application using the Core Plugin
+    core_plugin = plugins.get('core')
+    if not core_plugin:
+        print("Fatal: Core plugin not found. Cannot start application.")
+        sys.exit(1)
+    # Pass all loaded plugins to the core system
+    core_plugin.set_plugins(plugins)
+
+    try:
+        print("Starting Core Plugin...")
+        core_plugin.start()
+    except Exception as e:
+        print(f"An unexpected error occurred while starting the core plugin: {e}")
+        core_plugin.stop()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
