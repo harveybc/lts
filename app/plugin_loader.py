@@ -49,35 +49,50 @@ def load_plugin(plugin_group: str, plugin_name: str):
 
 def get_plugin_params(plugin_group: str, plugin_name: str):
     """
-    Retrieve the plugin parameters from a specified entry point group using the plugin name.
-    
-    This function loads the plugin class using the updated importlib.metadata API and returns 
-    its plugin_params attribute.
+    Get the required parameters for a specific plugin without loading it.
 
     Args:
-        plugin_group (str): The entry point group from which to retrieve the plugin.
+        plugin_group (str): The entry point group of the plugin.
         plugin_name (str): The name of the plugin.
 
     Returns:
-        dict: A dictionary representing the plugin parameters (plugin_params).
-
+        list: A list of required parameter keys for the plugin.
+    
     Raises:
-        ImportError: If the plugin is not found in the specified group.
-        ImportError: For any errors encountered while retrieving the plugin parameters.
+        ImportError: If the plugin is not found.
     """
-    print(f"Getting plugin parameters for: {plugin_name} from group: {plugin_group}")
     try:
-        # Filter entry points for the specified group using the new .select() method.
         group_entries = entry_points().select(group=plugin_group)
-        # Find the entry point that matches the plugin name.
         entry_point = next(ep for ep in group_entries if ep.name == plugin_name)
-        # Load the plugin class using the entry point's load method.
+        # Access the plugin's parameters directly from the loaded entry point object
+        # This assumes the plugin class has a `plugin_params` attribute.
         plugin_class = entry_point.load()
-        print(f"Retrieved plugin params: {plugin_class.plugin_params}")
-        return plugin_class.plugin_params
-    except StopIteration:
-        print(f"Failed to find plugin {plugin_name} in group {plugin_group}")
-        raise ImportError(f"Plugin {plugin_name} not found in group {plugin_group}.")
-    except Exception as e:
-        print(f"Failed to get plugin params for {plugin_name} from group {plugin_group}, Error: {e}")
-        raise ImportError(f"Failed to get plugin params for {plugin_name} from group {plugin_group}, Error: {e}")
+        return list(plugin_class.plugin_params.keys())
+    except (StopIteration, AttributeError):
+        raise ImportError(f"Could not get params for plugin {plugin_name} in group {plugin_group}.")
+
+def get_available_plugins(plugin_group: str = None):
+    """
+    List all available plugins, optionally filtered by a specific group.
+
+    Args:
+        plugin_group (str, optional): The entry point group to filter by. Defaults to None.
+
+    Returns:
+        dict: A dictionary where keys are group names and values are lists of plugin names.
+    """
+    all_plugins = {}
+    discovered_entry_points = entry_points()
+
+    if plugin_group:
+        # If a group is specified, only process that group
+        entries = discovered_entry_points.select(group=plugin_group)
+        all_plugins[plugin_group] = [entry.name for entry in entries]
+    else:
+        # Otherwise, process all groups
+        for entry in discovered_entry_points:
+            if entry.group not in all_plugins:
+                all_plugins[entry.group] = []
+            all_plugins[entry.group].append(entry.name)
+            
+    return all_plugins

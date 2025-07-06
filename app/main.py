@@ -5,7 +5,7 @@ main.py
 Entry point for the LTS (Live Trading System) application. This script orchestrates:
 - Loading and merging configurations (CLI, files, remote).
 - Initializing all plugins: AAA, Core, Pipeline, Strategy, Broker, and Portfolio.
-- Starting the core plugin to launch the trading system and FastAPI server.
+- Starting the pipeline plugin to launch the trading system.
 
 The LTS is a secure, modular trading framework with plugin-based architecture for
 authentication, authorization, accounting, and all trading components.
@@ -21,16 +21,11 @@ import logging
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from app.config_handler import load_config, remote_load_config
+from app.config_handler import load_config
 from app.cli import parse_args
 from app.config import DEFAULT_VALUES
 from app.plugin_loader import load_plugin
 from app.config_merger import merge_config, process_unknown_args
-# Import the FastAPI app for tests
-try:
-    from plugins_core.default_core import app
-except ImportError:
-    app = None  # Allows tests to run if plugins_core is not present
 
 def setup_logging(level=logging.INFO):
     """
@@ -50,27 +45,6 @@ def setup_logging(level=logging.INFO):
         ]
     )
     return logging.getLogger(__name__)
-
-class ErrorHandler:
-    """
-    Handles errors by sanitizing sensitive information from error messages.
-    """
-    @staticmethod
-    def handle_error(error: Exception) -> str:
-        """
-        Sanitize error messages to remove sensitive information.
-
-        :param error: The exception to sanitize.
-        :return: Sanitized error message string.
-        """
-        import re
-        # Remove common sensitive patterns (e.g., password, secret, token)
-        msg = str(error)
-        # Replace password-like patterns
-        msg = re.sub(r'(password|secret|token)\s*=\s*[^,;\s]+', r'\1=***', msg, flags=re.IGNORECASE)
-        # Remove any obvious sensitive info
-        msg = re.sub(r'\b\d{4,}\b', '****', msg)  # Mask long numbers
-        return msg
 
 def main():
     """
@@ -98,7 +72,6 @@ def main():
     config = merge_config(config, {}, {}, file_config, cli_args, unknown_args_dict)
 
     # 2. Plugin Loading
-    # LTS uses these plugin types: aaa, core, pipeline, strategy, broker, portfolio
     plugin_types = ['aaa', 'core', 'pipeline', 'strategy', 'broker', 'portfolio']
     plugins = {}
 

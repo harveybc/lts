@@ -100,13 +100,13 @@ class DefaultAAA(AAAPluginBase):
             return
 
         try:
-            log_entry = AuditLog(
+            audit_log_entry = AuditLog(
                 user_id=user_id,
                 action=action,
                 details=json.dumps(details) if details else "{}",
                 timestamp=datetime.now(timezone.utc)
             )
-            self.db.add(log_entry)
+            self.db.add(audit_log_entry)
             self.db.commit()
         except Exception as e:
             self.db.rollback()

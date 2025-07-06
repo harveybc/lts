@@ -11,23 +11,25 @@ The system is portfolio-centric where:
 - Assets have strategy/broker/pipeline plugins and JSON configs
 - Orders and positions track trading activity
 """
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Float, ForeignKey, Text, JSON, Numeric
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
-from datetime import datetime, timezone
-import sqlite3
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, JSON, Numeric, text
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+import datetime
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
 
-# Database configuration
-DATABASE_URL = 'sqlite:///./lts_trading.db'
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Use aiosqlite for async operations
+DATABASE_URL = 'sqlite+aiosqlite:///./lts_trading.db'
+ASYNC_DATABASE_URL = 'sqlite+aiosqlite://'
+
+# Base for declarative models
 Base = declarative_base()
 
 @contextmanager
 def db_session():
-    """Provide a transactional scope around a series of operations."""
+    """Provide a transactional scope around a series of operations (for synchronous parts)."""
+    engine = create_engine(DATABASE_URL.replace('+aiosqlite', ''), connect_args={"check_same_thread": False})
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = SessionLocal()
     try:
         yield session
@@ -40,48 +42,46 @@ def db_session():
 
 class Database:
     def __init__(self, db_path=':memory:'):
-        if db_path and db_path != ':memory:':
-            self.db_path = db_path
-        else:
-            self.db_path = DATABASE_URL.replace('sqlite:///', '')
+        self.is_memory = db_path == ':memory:'
+        self.db_url = f"{ASYNC_DATABASE_URL}/{db_path}" if self.is_memory else f"sqlite+aiosqlite:///{db_path}"
+        self.engine = create_async_engine(self.db_url, echo=False)
+        self.SessionLocal = sessionmaker(
+            bind=self.engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autocommit=False,
+            autoflush=False,
+        )
 
     async def initialize(self):
-        pass
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
     async def cleanup(self):
-        pass
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
 
     @asynccontextmanager
-    async def get_connection(self):
-        # Use asyncio.to_thread to run the synchronous sqlite3.connect call
-        conn = await asyncio.to_thread(sqlite3.connect, self.db_path)
-        conn.row_factory = sqlite3.Row
+    async def get_session(self) -> AsyncSession:
+        """Provide a transactional scope around a series of operations."""
+        session = self.SessionLocal()
         try:
-            yield conn
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
         finally:
-            await asyncio.to_thread(conn.close)
+            await session.close()
 
-    @asynccontextmanager
-    async def transaction(self):
-        async with self.get_connection() as conn:
-            try:
-                yield conn
-                await asyncio.to_thread(conn.commit)
-            except Exception:
-                await asyncio.to_thread(conn.rollback)
-                raise
+    async def execute_sql(self, sql, params={}):
+        async with self.get_session() as session:
+            await session.execute(text(sql), params)
 
-    async def execute_sql(self, sql, params=()):
-        async with self.get_connection() as conn:
-            cursor = await asyncio.to_thread(conn.execute, sql, params)
-            await asyncio.to_thread(conn.commit)
-            return cursor
-
-    async def fetch_all(self, sql, params=()):
-        cursor = await self.execute_sql(sql, params)
-        rows = await asyncio.to_thread(cursor.fetchall)
-        # Convert rows to dicts
-        return [dict(row) for row in rows]
+    async def fetch_all(self, sql, params={}):
+        async with self.get_session() as session:
+            result = await session.execute(text(sql), params)
+            return result.fetchall()
 
 # LTS Database Models - Complete Schema
 
@@ -95,9 +95,9 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(String(20), nullable=False, default="user")  # admin, user, etc.
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), 
-                       onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), 
+                       onupdate=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
     
     # Relationships
     sessions = relationship("Session", back_populates="user")
@@ -112,7 +112,7 @@ class Session(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
     token = Column(String(255), unique=True, index=True, nullable=False)  # JWT or random token
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
     expires_at = Column(DateTime, nullable=False)
     
     # Relationships
@@ -125,7 +125,7 @@ class AuditLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=True)
     action = Column(String(100), nullable=False)
-    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    timestamp = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
     details = Column(Text, nullable=True)
     
     # Relationships
@@ -138,8 +138,8 @@ class Config(Base):
     id = Column(Integer, primary_key=True, index=True)
     key = Column(String(100), unique=True, index=True, nullable=False)
     value = Column(Text, nullable=False)  # JSON or text value
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), 
-                       onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), 
+                       onupdate=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
 
 class Statistics(Base):
     """Statistics table for system metrics and analytics"""
@@ -148,7 +148,7 @@ class Statistics(Base):
     id = Column(Integer, primary_key=True, index=True)
     key = Column(String(100), nullable=False)
     value = Column(Float, nullable=False)
-    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    timestamp = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
 
 class Portfolio(Base):
     """Portfolio table - core of the LTS system"""
@@ -162,9 +162,9 @@ class Portfolio(Base):
     portfolio_plugin = Column(String(100), nullable=False, default="default_portfolio")
     portfolio_config = Column(JSON, nullable=True)  # JSON config for portfolio plugin
     total_capital = Column(Numeric(15, 2), nullable=False, default=0.0)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), 
-                       onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), 
+                       onupdate=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
     
     # Relationships
     user = relationship("User", back_populates="portfolios")
@@ -189,9 +189,9 @@ class Asset(Base):
     pipeline_config = Column(JSON, nullable=True)  # JSON config for pipeline plugin
     allocated_capital = Column(Numeric(15, 2), nullable=False, default=0.0)
     max_positions = Column(Integer, nullable=False, default=1)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), 
-                       onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), 
+                       onupdate=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
     
     # Relationships
     portfolio = relationship("Portfolio", back_populates="assets")
@@ -215,9 +215,9 @@ class Order(Base):
     filled_quantity = Column(Numeric(15, 8), nullable=False, default=0.0)
     filled_price = Column(Numeric(15, 8), nullable=True)
     commission = Column(Numeric(15, 8), nullable=False, default=0.0)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), 
-                       onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), 
+                       onupdate=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
     executed_at = Column(DateTime, nullable=True)
     user_id = Column(Integer, ForeignKey("users.id"))
 
@@ -242,7 +242,7 @@ class Position(Base):
     realized_pnl = Column(Numeric(15, 2), nullable=False, default=0.0)
     commission = Column(Numeric(15, 8), nullable=False, default=0.0)
     is_open = Column(Boolean, default=True, nullable=False)
-    opened_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    opened_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
     closed_at = Column(DateTime, nullable=True)
     
     # Relationships
@@ -252,10 +252,13 @@ class Position(Base):
 # Database utility functions
 def create_tables():
     """Create all database tables"""
+    engine = create_engine(DATABASE_URL.replace('+aiosqlite', ''), connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
 
 def get_db():
-    """Get database session"""
+    """Get database session (for synchronous parts, like FastAPI dependencies)."""
+    engine = create_engine(DATABASE_URL.replace('+aiosqlite', ''), connect_args={"check_same_thread": False})
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     db = SessionLocal()
     try:
         yield db
@@ -266,6 +269,3 @@ def init_db():
     """Initialize the database with tables"""
     create_tables()
     print("Database initialized with complete LTS schema")
-
-#if __name__ == "__main__":
-#    init_db()

@@ -63,7 +63,6 @@ def run_tests(test_level=None, verbose=False, coverage=False, parallel=False):
     cmd.extend([
         "--tb=short",  # Shorter traceback format
         "--strict-markers",  # Strict marker enforcement
-        "--disable-warnings"  # Disable warnings for cleaner output
     ])
     
     print(f"Running command: {' '.join(cmd)}")

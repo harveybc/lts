@@ -10,19 +10,22 @@ This file contains tests for:
 
 import pytest
 from unittest.mock import MagicMock, patch
+import json
 
 from plugins_aaa.default_aaa import DefaultAAA
 
 @pytest.fixture
 def aaa_plugin():
     """
-    Provides a DefaultAAA plugin instance with a mocked database.
+    Provides a DefaultAAA plugin instance with a mocked database session.
     """
-    with patch('app.database.Database') as mock_db:
+    with patch('plugins_aaa.default_aaa.SessionLocal') as mock_session_local:
         mock_db_instance = MagicMock()
+        mock_session_local.return_value = mock_db_instance
+        
         plugin = DefaultAAA(config={})
-        plugin.db = mock_db_instance
-        return plugin
+        # The plugin's __init__ calls SessionLocal, so its db is already the mock
+        yield plugin
 
 def test_aaa_authorization_authorized(aaa_plugin):
     """
@@ -53,8 +56,12 @@ def test_aaa_accounting_audit_log(aaa_plugin):
     
     aaa_plugin.audit_action(user_id, action, details)
     
-    # Verify that the database's execute method was called with the correct query
-    aaa_plugin.db.execute.assert_called_once()
-    call_args = aaa_plugin.db.execute.call_args[0][0]
-    assert "INSERT INTO audit_log" in str(call_args)
-    assert "user_id, action, details" in str(call_args)
+    # Verify that the database's add and commit methods were called
+    aaa_plugin.db.add.assert_called_once()
+    aaa_plugin.db.commit.assert_called_once()
+    
+    # Verify the contents of the call to add
+    added_object = aaa_plugin.db.add.call_args[0][0]
+    assert added_object.user_id == user_id
+    assert added_object.action == action
+    assert added_object.details == json.dumps(details)

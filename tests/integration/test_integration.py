@@ -16,32 +16,17 @@ import pytest
 import asyncio
 import os
 import sys
-import time
-import tempfile
 import json
-from unittest.mock import Mock, patch, MagicMock, AsyncMock
-from contextlib import asynccontextmanager
-import sqlite3
+from unittest.mock import Mock, patch, MagicMock
+from sqlalchemy import text
+from fastapi.testclient import TestClient
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 
-from app.plugin_loader import load_plugin
-from app.plugin_base import PluginBase
-from app.database import Database
-from app.config_handler import ConfigHandler
-from app.config_merger import merge_config
+from app.database import Database, Base
 from app.main import main
-
-# Helper function to create a temporary config file
-@pytest.fixture
-def temp_config_file():
-    def _create_temp_config(config_data):
-        fd, path = tempfile.mkstemp(suffix=".json")
-        with os.fdopen(fd, 'w') as f:
-            json.dump(config_data, f)
-        return path
-    return _create_temp_config
+from plugins_core.default_core import create_app, get_current_user, core_plugin_instance
 
 class TestPluginSystemIntegration:
     """
@@ -56,82 +41,101 @@ class TestPluginSystemIntegration:
         mock_parse_args.return_value = (MagicMock(load_config=None), [])
         mock_plugin_instance = MagicMock()
         mock_plugin_instance.plugin_params = {}
-        mock_load_plugin.return_value = (MagicMock(return_value=mock_plugin_instance), None)
+        # The CorePlugin now returns a FastAPI app, so we mock that behavior
+        mock_core_plugin = MagicMock()
+        mock_core_plugin.plugin_params = {}
+        
+        # Side effect to return the core plugin mock first, then other mocks
+        mock_load_plugin.side_effect = [
+            (MagicMock(return_value=mock_core_plugin), None),
+            (MagicMock(return_value=mock_plugin_instance), None),
+            (MagicMock(return_value=mock_plugin_instance), None),
+            (MagicMock(return_value=mock_plugin_instance), None),
+            (MagicMock(return_value=mock_plugin_instance), None),
+            (MagicMock(return_value=mock_plugin_instance), None),
+        ]
 
         with patch('app.main.sys.exit'):
-            main()
+             with patch('plugins_core.default_core.CorePlugin.initialize'):
+                main()
 
         # Check that load_plugin was called for each plugin type
         assert mock_load_plugin.call_count == 6
         # Check that plugins are configured
         mock_plugin_instance.set_params.assert_called()
 
-    @pytest.mark.asyncio
-    async def test_plugin_communication_protocols(self, temp_config_file):
-        """INT-002: Test plugins communicate through standardized interfaces."""
-        pytest.skip("Test requires significant mocking of inter-plugin communication.")
-
-    @pytest.mark.asyncio
-    async def test_plugin_configuration_integration(self, temp_config_file):
-        """INT-003: Test plugin-specific configurations are properly merged and validated."""
-        pytest.skip("Test requires significant mocking of configuration loading.")
-
 class TestDatabaseIntegration:
     """
     INT-004, INT-005, INT-006: Database Integration Tests
     """
-    @pytest.fixture
+    @pytest.fixture(scope="function")
     async def db_instance(self):
         db = Database(db_path=":memory:")
         await db.initialize()
-        # Drop the table if it exists, then create it
-        await db.execute_sql("DROP TABLE IF EXISTS test_table")
-        await db.execute_sql("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT)")
+        # Create a simple test table for these tests
+        async with db.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.execute(text("CREATE TABLE IF NOT EXISTS test_table (id INTEGER PRIMARY KEY, data TEXT)"))
         yield db
         await db.cleanup()
 
     @pytest.mark.asyncio
     async def test_database_connection_management(self, db_instance):
         """INT-004: Test database connection pooling and management."""
-        # The fixture itself tests initialization and cleanup.
-        # We'll test getting a connection.
-        conn = await db_instance.get_connection()
-        assert conn is not None
-        await conn.close()
+        async with db_instance.get_session() as session:
+            assert session.is_active
+        
+        # After the context manager exits, the session should be closed.
+        assert not session.is_active
 
     @pytest.mark.asyncio
     async def test_transaction_integrity_acid(self, db_instance):
         """INT-005: Test that database transactions maintain ACID properties."""
         try:
-            async with db_instance.transaction() as conn:
-                await conn.execute("INSERT INTO test_table (data) VALUES (?)", ("test1",))
-                # Simulate an error
+            async with db_instance.get_session() as session:
+                await session.execute(text("INSERT INTO test_table (data) VALUES (:data)"), {"data": "test1"})
                 raise ValueError("Forced error")
         except ValueError:
-            pass # Expected
+            pass  # Expected
 
-        async with db_instance.get_connection() as conn:
-            cursor = await conn.execute("SELECT * FROM test_table")
-            results = await cursor.fetchall()
-            assert len(results) == 0 # Transaction should have been rolled back
+        async with db_instance.get_session() as session:
+            result = await session.execute(text("SELECT * FROM test_table"))
+            results = result.fetchall()
+            assert len(results) == 0  # Transaction should have been rolled back
 
-        async with db_instance.transaction() as conn:
-            await conn.execute("INSERT INTO test_table (data) VALUES (?)", ("test2",))
+        async with db_instance.get_session() as session:
+            await session.execute(text("INSERT INTO test_table (data) VALUES (:data)"), {"data": "test2"})
         
-        async with db_instance.get_connection() as conn:
-            cursor = await conn.execute("SELECT * FROM test_table")
-            results = await cursor.fetchall()
+        async with db_instance.get_session() as session:
+            result = await session.execute(text("SELECT * FROM test_table"))
+            results = result.fetchall()
             assert len(results) == 1
 
     @pytest.mark.asyncio
     async def test_orm_and_data_mapping(self, db_instance):
         """INT-006: Test the integration between the data access layer and the database schema."""
-        # This test assumes a simple data access pattern, not a full ORM.
-        await db_instance.execute_sql("INSERT INTO test_table (data) VALUES (?)", ("orm_test",))
+        async with db_instance.get_session() as session:
+            await session.execute(text("INSERT INTO test_table (data) VALUES (:data)"), {"data": "orm_test"})
+
+        async with db_instance.get_session() as session:
+            result = await session.execute(text("SELECT * FROM test_table WHERE data = :data"), {"data": "orm_test"})
+            rows = result.fetchall()
+            assert len(rows) == 1
+            assert rows[0][1] == 'orm_test' # data is the second column
+
+    @pytest.mark.asyncio
+    async def test_orm_model_integration(self, db_instance):
+        """Test that ORM models can be created and queried."""
+        from app.database import User
+        async with db_instance.get_session() as session:
+            new_user = User(username='testuser', email='test@test.com', password_hash='123')
+            session.add(new_user)
         
-        results = await db_instance.fetch_all("SELECT * FROM test_table WHERE data = 'orm_test'")
-        assert len(results) == 1
-        assert results[0]['data'] == 'orm_test'
+        async with db_instance.get_session() as session:
+            result = await session.execute(text("SELECT * FROM users WHERE username = :username"), {"username": "testuser"})
+            user = result.fetchone()
+            assert user is not None
+            assert user.email == 'test@test.com'
 
 class TestWebAPIIntegration:
     """
@@ -139,74 +143,41 @@ class TestWebAPIIntegration:
     """
     @pytest.fixture
     def client(self):
-        from app.web import app
-        from fastapi.testclient import TestClient
-        return TestClient(app)
+        app = create_app()
+        # Mock the AAA plugin for the core plugin instance
+        core_plugin_instance.initialize(plugins={'aaa': MagicMock()})
+        with TestClient(app) as c:
+            yield c
 
     def test_web_api_authentication_integration(self, client):
         """INT-007: Test that API endpoints are correctly protected by the authentication plugin."""
-        response = client.get("/api/v1/status") # Assuming this is a protected endpoint
-        assert response.status_code in [401, 403] # Unauthorized or Forbidden
+        # Hit the secure endpoint without a token
+        response = client.get("/api/v1/secure")
+        assert response.status_code == 403 # Now expecting 403 based on our dependency
 
-    @pytest.mark.asyncio
-    async def test_api_request_validation_and_sanitization(self):
-        """INT-008: Test that API inputs are validated and sanitized."""
-        # This test is highly dependent on the specific endpoints and their validation logic.
-        # As a placeholder, we acknowledge its importance.
-        pytest.skip("Requires specific endpoint implementation to test validation.")
-
-    @pytest.mark.asyncio
-    async def test_api_rate_limiting_and_throttling(self):
-        """INT-009: Test that API rate limiting and throttling mechanisms work as expected."""
-        pytest.skip("Rate limiting test requires a running server and client.")
+        # Hit the secure endpoint with a valid token
+        client.app.dependency_overrides[get_current_user] = lambda: {"username": "testuser"}
+        response = client.get("/api/v1/secure", headers={"Authorization": "Bearer validtoken"})
+        assert response.status_code == 200
+        
+        # Clear overrides
+        client.app.dependency_overrides = {}
 
 class TestConfigurationIntegration:
     """
     INT-010, INT-011: Configuration Integration Tests
     """
-    def test_multi_source_configuration_merging(self, temp_config_file):
+    def test_multi_source_configuration_merging(self):
         """INT-010: Test that configuration from different sources is merged with the correct precedence."""
+        from app.config_merger import merge_config
         default_config = {"a": 1, "b": 1}
         file_config_data = {"b": 2, "c": 2}
         
-        # Use the actual merge_config function
         merged = merge_config(default_config, {}, {}, file_config_data, {}, {})
         
         assert merged['a'] == 1
         assert merged['b'] == 2
         assert merged['c'] == 2
-
-    def test_configuration_validation_and_security(self):
-        """INT-011: Test that configuration values are validated for correctness and security."""
-        # This depends on the validation logic in ConfigHandler, which is not fully implemented.
-        pytest.skip("Configuration validation logic not specified.")
-
-class TestErrorHandlingAndDataFlow:
-    """
-    INT-012, INT-013, INT-014, INT-015: Error Handling, Data Flow, and Resource Management
-    """
-    @pytest.mark.asyncio
-    async def test_cross_component_error_propagation(self, temp_config_file):
-        """INT-012: Test that errors are propagated correctly across different components."""
-        pytest.skip("Test requires significant mocking of the application main loop.")
-
-    @pytest.mark.asyncio
-    async def test_audit_logging_integration(self):
-        """INT-013: Test that critical events are logged correctly for auditing purposes."""
-        # This would require inspecting logs, which is out of scope for this test runner.
-        pytest.skip("Audit logging verification is an out-of-band process.")
-
-    @pytest.mark.asyncio
-    async def test_data_flow_and_transformation(self, temp_config_file):
-        """INT-014: Test the end-to-end data flow from input to output, including transformations."""
-        pytest.skip("Test requires significant mocking of the application main loop.")
-
-    @pytest.mark.asyncio
-    async def test_system_resource_management(self):
-        """INT-015: Test that system resources (memory, connections) are managed efficiently."""
-        # Resource management is hard to test in unit/integration tests.
-        # This is better suited for long-running system tests.
-        pytest.skip("Resource management testing is out of scope for integration tests.")
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

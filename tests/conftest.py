@@ -12,8 +12,6 @@ import sys
 import tempfile
 import asyncio
 from unittest.mock import Mock, MagicMock
-from app.main import app as fastapi_app
-from starlette.testclient import TestClient
 from app.config_handler import ConfigHandler
 from app.database import Database, db_session, Base
 
@@ -195,41 +193,6 @@ def sample_portfolio_data():
             }
         }
     }
-
-@pytest.fixture(scope="module")
-def app_with_config():
-    """
-    Provides a FastAPI app instance with a mock configuration for testing.
-    """
-    # Use a temporary file for the config
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".json") as temp_config_file:
-        # A mock configuration
-        mock_config_content = {
-            "database": {"type": "sqlite", "path": ":memory:"},
-            "api": {"host": "127.0.0.1", "port": 8080},
-            "security": {"secret_key": "test_secret"}
-        }
-        import json
-        json.dump(mock_config_content, temp_config_file)
-        temp_config_file.flush()
-
-        # Set the config path for the app
-        fastapi_app.state.config_path = temp_config_file.name
-        
-        yield fastapi_app
-
-    # Cleanup the temp file
-    os.unlink(fastapi_app.state.config_path)
-
-
-@pytest.fixture(scope="module")
-def client(app_with_config):
-    """
-    Provides a TestClient for making requests to the FastAPI app.
-    """
-    with TestClient(app_with_config) as c:
-        yield c
-
 
 # Test markers for categorizing tests
 def pytest_configure(config):
