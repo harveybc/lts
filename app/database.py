@@ -15,12 +15,73 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime, timezone
+import sqlite3
+import asyncio
+from contextlib import asynccontextmanager, contextmanager
 
 # Database configuration
 DATABASE_URL = 'sqlite:///./lts_trading.db'
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+@contextmanager
+def db_session():
+    """Provide a transactional scope around a series of operations."""
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+class Database:
+    def __init__(self, db_path=':memory:'):
+        if db_path and db_path != ':memory:':
+            self.db_path = db_path
+        else:
+            self.db_path = DATABASE_URL.replace('sqlite:///', '')
+
+    async def initialize(self):
+        pass
+
+    async def cleanup(self):
+        pass
+
+    @asynccontextmanager
+    async def get_connection(self):
+        # Use asyncio.to_thread to run the synchronous sqlite3.connect call
+        conn = await asyncio.to_thread(sqlite3.connect, self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            await asyncio.to_thread(conn.close)
+
+    @asynccontextmanager
+    async def transaction(self):
+        async with self.get_connection() as conn:
+            try:
+                yield conn
+                await asyncio.to_thread(conn.commit)
+            except Exception:
+                await asyncio.to_thread(conn.rollback)
+                raise
+
+    async def execute_sql(self, sql, params=()):
+        async with self.get_connection() as conn:
+            cursor = await asyncio.to_thread(conn.execute, sql, params)
+            await asyncio.to_thread(conn.commit)
+            return cursor
+
+    async def fetch_all(self, sql, params=()):
+        cursor = await self.execute_sql(sql, params)
+        rows = await asyncio.to_thread(cursor.fetchall)
+        # Convert rows to dicts
+        return [dict(row) for row in rows]
 
 # LTS Database Models - Complete Schema
 
@@ -35,11 +96,14 @@ class User(Base):
     role = Column(String(20), nullable=False, default="user")  # admin, user, etc.
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), 
+                       onupdate=lambda: datetime.now(timezone.utc), nullable=False)
     
     # Relationships
     sessions = relationship("Session", back_populates="user")
     audit_logs = relationship("AuditLog", back_populates="user")
     portfolios = relationship("Portfolio", back_populates="user")
+    orders = relationship("Order", back_populates="user")
 
 class Session(Base):
     """Session table for user session management"""
@@ -155,10 +219,12 @@ class Order(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), 
                        onupdate=lambda: datetime.now(timezone.utc), nullable=False)
     executed_at = Column(DateTime, nullable=True)
-    
+    user_id = Column(Integer, ForeignKey("users.id"))
+
     # Relationships
     portfolio = relationship("Portfolio", back_populates="orders")
     asset = relationship("Asset", back_populates="orders")
+    user = relationship("User", back_populates="orders")
 
 class Position(Base):
     """Position table - open positions tracking"""
@@ -201,5 +267,5 @@ def init_db():
     create_tables()
     print("Database initialized with complete LTS schema")
 
-if __name__ == "__main__":
-    init_db()
+#if __name__ == "__main__":
+#    init_db()

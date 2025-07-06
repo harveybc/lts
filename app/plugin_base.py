@@ -25,6 +25,10 @@ class PluginBase:
         if config:
             self.set_params(**config)
 
+    @property
+    def config(self):
+        return self.params
+
     def set_params(self, **kwargs):
         """
         Update plugin parameters with global configuration.
@@ -46,6 +50,25 @@ class PluginBase:
         This method structure must be exactly the same in all plugins.
         """
         debug_info.update(self.get_debug_info())
+
+    def initialize(self):
+        """
+        Initialize the plugin.
+        This method can be overridden by plugins for specific initialization logic.
+        """
+        pass
+
+    def configure(self, params):
+        """
+        Configure the plugin with given parameters.
+        """
+        self.set_params(**params)
+
+    def shutdown(self):
+        """
+        Shutdown the plugin and clean up resources.
+        """
+        pass
 
 class AAAPluginBase(PluginBase):
     """Base class for AAA (Authentication, Authorization, Accounting) plugins"""

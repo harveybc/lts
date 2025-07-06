@@ -7,7 +7,7 @@ This plugin is responsible for:
 3. Coordinating all other plugins
 """
 
-from app.plugin_base import BasePlugin
+from app.plugin_base import PluginBase
 from app.database import SessionLocal, User, Portfolio, Asset, Order, Position, AuditLog
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -19,14 +19,38 @@ import asyncio
 import uvicorn
 import schedule
 import json
+import jwt
+from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # Create the FastAPI app instance that can be imported by main.py
 app = FastAPI(title="LTS API", description="Live Trading System API")
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Security
 security = HTTPBearer()
+SECRET_KEY = "a_very_secret_key"
+ALGORITHM = "HS256"
 
-class CorePlugin(BasePlugin):
+class UserRegistration(BaseModel):
+    username: str
+    password: str
+    email: str
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class CorePlugin(PluginBase):
     plugin_params = {
         "global_latency": 5,  # Minutes between main loop executions
         "api_host": "0.0.0.0",
@@ -45,10 +69,37 @@ class CorePlugin(BasePlugin):
         self.running = False
         self.plugins = {}
         self.setup_routes()
-    
-    def set_plugins(self, plugins):
-        """Set references to all loaded plugins"""
-        self.plugins = plugins
+
+    def get_db(self):
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    def create_access_token(self, data: dict, expires_delta: timedelta | None = None):
+        to_encode = data.copy()
+        if expires_delta:
+            expire = datetime.now(timezone.utc) + expires_delta
+        else:
+            expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+        to_encode.update({"exp": expire})
+        encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+        return encoded_jwt
+
+    async def get_current_user(self, credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
+        token = credentials.credentials
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            username: str = payload.get("sub")
+            if username is None:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        except jwt.PyJWTError:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        user = db.query(User).filter(User.username == username).first()
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        return user
     
     def setup_routes(self):
         """Setup API routes"""
@@ -60,46 +111,65 @@ class CorePlugin(BasePlugin):
         @self.app.get("/health")
         async def health_check():
             return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+        @self.app.get("/api/v1/status")
+        async def get_status():
+            return {"status": "ok"}
+
+        @self.app.post("/api/v1/users/register", status_code=status.HTTP_201_CREATED)
+        async def register_user(user: UserRegistration, db: Session = Depends(self.get_db)):
+            db_user = db.query(User).filter(User.username == user.username).first()
+            if db_user:
+                raise HTTPException(status_code=400, detail="Username already registered")
+            hashed_password = self.plugins['aaa'].hash_password(user.password)
+            new_user = User(username=user.username, password_hash=hashed_password, email=user.email)
+            db.add(new_user)
+            db.commit()
+            db.refresh(new_user)
+            return {"message": "User registered successfully"}
+
+        @self.app.post("/api/v1/users/login")
+        async def login_user(form_data: UserLogin, db: Session = Depends(self.get_db)):
+            user = db.query(User).filter(User.username == form_data.username).first()
+            if not user or not self.plugins['aaa'].verify_password(form_data.password, user.password_hash):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Incorrect username or password",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            access_token_expires = timedelta(minutes=30)
+            access_token = self.create_access_token(
+                data={"sub": user.username}, expires_delta=access_token_expires
+            )
+            return {"access_token": access_token, "token_type": "bearer"}
+
+        @self.app.get("/api/v1/users/me")
+        async def read_users_me(current_user: User = Depends(self.get_current_user)):
+            return current_user
         
         @self.app.get("/api/portfolios")
-        async def get_portfolios():
+        async def get_portfolios(db: Session = Depends(self.get_db)):
             """Get all portfolios"""
-            db = SessionLocal()
-            try:
-                portfolios = db.query(Portfolio).all()
-                return [self._portfolio_to_dict(p) for p in portfolios]
-            finally:
-                db.close()
+            portfolios = db.query(Portfolio).all()
+            return [self._portfolio_to_dict(p) for p in portfolios]
         
         @self.app.get("/api/assets/{portfolio_id}")
-        async def get_assets(portfolio_id: int):
+        async def get_assets(portfolio_id: int, db: Session = Depends(self.get_db)):
             """Get assets for a portfolio"""
-            db = SessionLocal()
-            try:
-                assets = db.query(Asset).filter(Asset.portfolio_id == portfolio_id).all()
-                return [self._asset_to_dict(a) for a in assets]
-            finally:
-                db.close()
+            assets = db.query(Asset).filter(Asset.portfolio_id == portfolio_id).all()
+            return [self._asset_to_dict(a) for a in assets]
         
         @self.app.get("/api/orders")
-        async def get_orders():
+        async def get_orders(db: Session = Depends(self.get_db)):
             """Get all orders"""
-            db = SessionLocal()
-            try:
-                orders = db.query(Order).all()
-                return [self._order_to_dict(o) for o in orders]
-            finally:
-                db.close()
+            orders = db.query(Order).all()
+            return [self._order_to_dict(o) for o in orders]
         
         @self.app.get("/api/positions")
-        async def get_positions():
+        async def get_positions(db: Session = Depends(self.get_db)):
             """Get all positions"""
-            db = SessionLocal()
-            try:
-                positions = db.query(Position).all()
-                return [self._position_to_dict(p) for p in positions]
-            finally:
-                db.close()
+            positions = db.query(Position).all()
+            return [self._position_to_dict(p) for p in positions]
     
     def _portfolio_to_dict(self, portfolio):
         """Convert portfolio to dict for API response"""

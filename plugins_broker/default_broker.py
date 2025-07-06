@@ -5,13 +5,13 @@ This is a dummy broker plugin for testing purposes that simulates
 broker responses without making actual API calls.
 """
 
-from app.plugin_base import BasePlugin
+from app.plugin_base import PluginBase
 from app.database import SessionLocal, Order, Position
 import random
 import uuid
 from datetime import datetime, timezone
 
-class BrokerPlugin(BasePlugin):
+class DefaultBroker(PluginBase):
     plugin_params = {
         "broker_api_url": "https://api.oanda.com/v3",
         "api_key": "dummy_api_key",
@@ -28,7 +28,7 @@ class BrokerPlugin(BasePlugin):
         self.order_id_counter = 1000
         self.position_id_counter = 2000
     
-    def execute(self, action, parameters):
+    def execute_order(self, action, parameters):
         """
         Execute trading action with the broker (dummy implementation)
         

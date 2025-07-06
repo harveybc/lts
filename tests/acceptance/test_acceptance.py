@@ -44,7 +44,7 @@ from app.main import main
 from app.database import Base, User, Portfolio, Asset, Order, Position, AuditLog, Session as DBSession
 from app.web import app as fastapi_app
 from app.config import DEFAULT_VALUES
-from plugins_aaa.default_aaa import DefaultAAAPlugin
+from plugins_aaa.default_aaa import DefaultAAA
 
 
 class TestAcceptance:

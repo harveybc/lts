@@ -10,27 +10,27 @@ setup(
         ],
         # AAA plugins - Authentication, Authorization, Accounting
         'plugins_aaa': [
-            'default_aaa=plugins_aaa.default_aaa:AAAPlugin'
+            'default_aaa=plugins_aaa.default_aaa:DefaultAAA'
         ],
         # Core plugins - Main trading loop and API server
         'plugins_core': [
-            'default_core=plugins_core.default_core:CorePlugin'
+            'default_core=plugins_core.default_core:DefaultCore'
         ],
         # Pipeline plugins - Orchestrate the trading flow for each instrument
         'plugins_pipeline': [
-            'default_pipeline=plugins_pipeline.default_pipeline:PipelinePlugin'
+            'default_pipeline=plugins_pipeline.default_pipeline:DefaultPipeline'
         ],
         # Strategy plugins - Trading decision logic
         'plugins_strategy': [
-            'default_strategy=plugins_strategy.default_strategy:StrategyPlugin'
+            'default_strategy=plugins_strategy.default_strategy:DefaultStrategy'
         ],
         # Broker plugins - Connection and execution with brokers
         'plugins_broker': [
-            'default_broker=plugins_broker.default_broker:BrokerPlugin'
+            'default_broker=plugins_broker.default_broker:DefaultBroker'
         ],
         # Portfolio plugins - Capital allocation management
         'plugins_portfolio': [
-            'default_portfolio=plugins_portfolio.default_portfolio:PortfolioPlugin'
+            'default_portfolio=plugins_portfolio.default_portfolio:DefaultPortfolio'
         ]
     },
     install_requires=[

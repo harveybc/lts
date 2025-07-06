@@ -31,3 +31,8 @@ uvicorn
 sqlalchemy
 bcrypt
 aiofiles
+pydantic
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
+PyJWT

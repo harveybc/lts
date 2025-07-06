@@ -5,11 +5,11 @@ This is a dummy strategy plugin for testing purposes that alternates between
 opening and closing orders based on the current position status.
 """
 
-from app.plugin_base import BasePlugin
+from app.plugin_base import PluginBase
 from app.database import SessionLocal, Order, Position
 import random
 
-class StrategyPlugin(BasePlugin):
+class DefaultStrategy(PluginBase):
     plugin_params = {
         "position_size": 0.02,
         "max_risk_per_trade": 0.02,
@@ -25,7 +25,7 @@ class StrategyPlugin(BasePlugin):
         super().__init__(config)
         self.order_counter = 0
     
-    def process(self, asset, market_data=None, predictions=None):
+    def generate_signal(self, asset, market_data=None, predictions=None):
         """
         Process asset data and return trading action.
         
