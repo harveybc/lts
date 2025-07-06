@@ -8,21 +8,29 @@ setup(
         'console_scripts': [
             'lts=app.main:main'
         ],
-        # Pipeline plugins - Definen el flujo de procesamiento para cada instrumento
-        'pipeline.plugins': [
-            'default_pipeline=plugins_pipeline.default_pipeline:Plugin'
+        # AAA plugins - Authentication, Authorization, Accounting
+        'plugins_aaa': [
+            'default_aaa=plugins_aaa.default_aaa:AAAPlugin'
         ],
-        # Strategy plugins - Implementan lógica de toma de decisiones de trading
-        'strategy.plugins': [
-            'default_strategy=plugins_strategy.default_strategy:Plugin'
+        # Core plugins - Main trading loop and API server
+        'plugins_core': [
+            'default_core=plugins_core.default_core:CorePlugin'
         ],
-        # Broker API plugins - Manejan conexión y ejecución con brokers
-        'broker.plugins': [
-            'default_broker=plugins_broker.default_broker:Plugin'
+        # Pipeline plugins - Orchestrate the trading flow for each instrument
+        'plugins_pipeline': [
+            'default_pipeline=plugins_pipeline.default_pipeline:PipelinePlugin'
         ],
-        # Portfolio Manager plugins - Administran asignación de capital
-        'portfolio.plugins': [
-            'default_portfolio=plugins_portfolio.default_portfolio:Plugin'
+        # Strategy plugins - Trading decision logic
+        'plugins_strategy': [
+            'default_strategy=plugins_strategy.default_strategy:StrategyPlugin'
+        ],
+        # Broker plugins - Connection and execution with brokers
+        'plugins_broker': [
+            'default_broker=plugins_broker.default_broker:BrokerPlugin'
+        ],
+        # Portfolio plugins - Capital allocation management
+        'plugins_portfolio': [
+            'default_portfolio=plugins_portfolio.default_portfolio:PortfolioPlugin'
         ]
     },
     install_requires=[
@@ -30,18 +38,24 @@ setup(
         'numpy',
         'requests',
         'websocket-client',
-        'oandapyV20',
-        'python-binance',
-        'MetaTrader5',
-        'scipy',
-        'scikit-learn',
-        'pyyaml',
-        'schedule'
+        'fastapi',
+        'uvicorn',
+        'sqlalchemy',
+        'jinja2',
+        'python-multipart',
+        'passlib',
+        'python-jose',
+        'bcrypt',
+        'pydantic',
+        'asyncio',
+        'schedule',
+        'matplotlib',
+        'seaborn'
     ],
-    author='Harvey Bastidas',
-    author_email='your.email@example.com',
+    author='LTS Development Team',
+    author_email='lts@example.com',
     description=(
-        'A Live Trading System (LTS) that supports dynamic loading of plugins for trading pipelines, '
-        'strategies, broker APIs, and portfolio management with real-time execution capabilities.'
+        'LTS (Live Trading System) - A secure, modular trading framework with plugin-based architecture '
+        'for authentication, authorization, accounting, and all trading components.'
     )
 )

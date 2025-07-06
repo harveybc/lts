@@ -2,13 +2,16 @@
 """
 main.py
 
-Entry point for the Prediction Provider application. This script orchestrates:
-- Loading and merging configurations (CLI, files).
-- Initializing all plugins: Core, Endpoints, Feeder, Pipeline, and Predictor.
-- Starting the core plugin to launch the FastAPI application.
+Entry point for the LTS (Live Trading System) application. This script orchestrates:
+- Loading and merging configurations (CLI, files, remote).
+- Initializing all plugins: AAA, Core, Pipeline, Strategy, Broker, and Portfolio.
+- Starting the core plugin to launch the trading system and FastAPI server.
 
-:author: Your Name
-:copyright: (c) 2025 Your Organization
+The LTS is a secure, modular trading framework with plugin-based architecture for
+authentication, authorization, accounting, and all trading components.
+
+:author: LTS Development Team
+:copyright: (c) 2025 LTS Project
 :license: MIT
 """
 
@@ -31,7 +34,7 @@ except ImportError:
 
 def setup_logging(level=logging.INFO):
     """
-    Setup logging configuration.
+    Setup logging configuration for the application.
 
     :param level: Logging level (default: logging.INFO)
     :type level: int
@@ -58,9 +61,7 @@ class ErrorHandler:
         Sanitize error messages to remove sensitive information.
 
         :param error: The exception to sanitize.
-        :type error: Exception
         :return: Sanitized error message string.
-        :rtype: str
         """
         import re
         # Remove common sensitive patterns (e.g., password, secret, token)
@@ -73,9 +74,9 @@ class ErrorHandler:
 
 def main():
     """
-    Orchestrates the execution of the Prediction Provider system.
+    Orchestrates the execution of the LTS (Live Trading System).
     """
-    print("--- Initializing Prediction Provider ---")
+    print("--- Initializing LTS (Live Trading System) ---")
 
     # 1. Configuration Loading
     args, unknown_args = parse_args()
@@ -97,14 +98,15 @@ def main():
     config = merge_config(config, {}, {}, file_config, cli_args, unknown_args_dict)
 
     # 2. Plugin Loading
-    plugin_types = ['core', 'endpoints', 'feeder', 'pipeline', 'predictor']
+    # LTS uses these plugin types: aaa, core, pipeline, strategy, broker, portfolio
+    plugin_types = ['aaa', 'core', 'pipeline', 'strategy', 'broker', 'portfolio']
     plugins = {}
 
     for plugin_type in plugin_types:
         plugin_name = config.get(f'{plugin_type}_plugin', f'default_{plugin_type}')
         print(f"Loading {plugin_type.capitalize()} Plugin: {plugin_name}")
         try:
-            plugin_class, _ = load_plugin(f'{plugin_type}.plugins', plugin_name)
+            plugin_class, _ = load_plugin(f'plugins_{plugin_type}', plugin_name)
             plugin_instance = plugin_class(config)
             plugin_instance.set_params(**config)
             plugins[plugin_type] = plugin_instance
@@ -117,20 +119,21 @@ def main():
     for plugin_type, plugin_instance in plugins.items():
         config = merge_config(config, plugin_instance.plugin_params, {}, file_config, cli_args, unknown_args_dict)
 
-    # 3. Start Application using the Core Plugin
-    core_plugin = plugins.get('core')
-    if not core_plugin:
-        print("Fatal: Core plugin not found. Cannot start application.")
+    # 3. Start Pipeline Plugin
+    pipeline_plugin = plugins.get('pipeline')
+    if not pipeline_plugin:
+        print("Fatal: Pipeline plugin not found. Cannot start application.")
         sys.exit(1)
-    # Pass all loaded plugins to the core system
-    core_plugin.set_plugins(plugins)
-
+    
+    # Pass all loaded plugins to the pipeline
+    pipeline_plugin.set_plugins(plugins)
+    
     try:
-        print("Starting Core Plugin...")
-        core_plugin.start()
+        print("Starting Pipeline Plugin...")
+        pipeline_plugin.start()
     except Exception as e:
-        print(f"An unexpected error occurred while starting the core plugin: {e}")
-        core_plugin.stop()
+        print(f"An unexpected error occurred while starting the pipeline plugin: {e}")
+        pipeline_plugin.stop()
         sys.exit(1)
 
 if __name__ == "__main__":

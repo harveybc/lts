@@ -1,107 +1,206 @@
 # REFERENCE_plugins.md
 **LTS (Live Trading System) - Detailed Plugin Design Document**
 
-Este documento describe de forma extensa, precisa y estructurada los **tipos de plugins requeridos en el sistema LTS**, especificando para cada tipo de plugin su funcionalidad exacta, los métodos clave y los parámetros que debe manejar. Todas las clases de plugins deben inicializarse con un parámetro obligatorio `config` (tipo `dict`), el cual se obtiene desde el módulo central `app/config.py` y es sobreescrito por parámetros de CLI, archivos JSON locales o configuraciones remotas.
+Este documento describe de forma extensa, precisa y estructurada los **tipos de plugins requeridos en el sistema LTS**, especificando para cada tipo de plugin su funcionalidad exacta, los métodos clave y los parámetros que debe manejar. Todas las clases de plugins deben heredar de `BasePlugin` y seguir la estructura exacta definida.
 
 ---
 
-## 1. pipeline plugins
+## Plugin Base Structure
+
+All plugins must inherit from `BasePlugin` and follow this exact structure:
+
+```python
+from app.plugin_base import BasePlugin
+
+class PluginName(BasePlugin):
+    plugin_params = {
+        # Plugin-specific parameters with default values
+    }
+    plugin_debug_vars = ["param1", "param2"]  # Parameters to include in debug info
+    
+    def __init__(self, config=None):
+        super().__init__(config)
+        # Plugin-specific initialization
+    
+    # Plugin-specific methods
+    def main_method(self, parameters):
+        # Main plugin functionality
+        pass
+```
+
+---
+
+## 1. AAA (Authentication, Authorization, Accounting) Plugins
 
 ### 1.1 Objetivo
-Definen el flujo de procesamiento dentro del ciclo de trading para cada instrumento, integrando decisiones sobre cuándo y cómo actuar en función de las predicciones recibidas del prediction_provider.
+Proporcionan autenticación, autorización y contabilidad (auditoría) para todo el sistema.
 
-### 1.2 Métodos mínimos
-- `__init__(self, config: dict)`: inicializa el plugin con la configuración global.
-- `run(self, predictions: np.ndarray, market_data: pd.DataFrame) -> dict`: procesa predicciones y datos de mercado para generar señales o decisiones.
+### 1.2 Métodos específicos
+- `authenticate(username, password) -> dict`: Autentica usuario y devuelve token
+- `authorize(token, action) -> bool`: Verifica si el token tiene autorización para la acción
+- `audit_log(user_id, action, details) -> None`: Registra acción en audit log
 
-### 1.3 Parámetros relevantes en config
-- `pipeline.trailing_stop`: configuración de trailing stop en pips o porcentaje.
-- `pipeline.take_profit`: configuración de take profit en pips o porcentaje.
-- `pipeline.stop_loss`: configuración de stop loss en pips o porcentaje.
-- `pipeline.signal_filter`: método de filtrado de señales (e.g., `ema`, `rsi_threshold`).
+### 1.3 Parámetros relevantes
+- `session_timeout`: Tiempo de vida de sesión en minutos
+- `max_login_attempts`: Intentos máximos de login antes de bloqueo
+- `token_secret`: Secreto para generar tokens JWT
 
 ---
 
-## 2. strategy plugins
+## 2. Core Plugins
 
 ### 2.1 Objetivo
-Implementan la lógica de toma de decisiones de trading específica para cada instrumento, en base a las señales generadas por el pipeline.
+Ejecutan el bucle principal del sistema de trading y manejan el servidor API.
 
-### 2.2 Métodos mínimos
-- `__init__(self, config: dict)`: inicializa el plugin con la configuración global.
-- `decide(self, signal_data: dict) -> dict`: recibe la información procesada del pipeline y devuelve decisiones como abrir, cerrar o modificar órdenes, junto con los parámetros de la orden (e.g., dirección, volumen).
+### 2.2 Métodos específicos
+- `start() -> None`: Inicia el servidor API y el bucle principal
+- `stop() -> None`: Detiene el servidor y limpia recursos
+- `execute_trading_loop() -> None`: Ejecuta un ciclo completo de trading
 
-### 2.3 Parámetros relevantes en config
-- `strategy.entry_rule`: definición de la condición para abrir una posición (e.g., cruce de medias, nivel de predicción).
-- `strategy.exit_rule`: definición de la condición para cerrar una posición.
-- `strategy.max_open_positions`: límite de posiciones abiertas simultáneamente.
-- `strategy.position_size`: tamaño estándar de cada operación, si no es determinado por el portfolio_manager.
+### 2.3 Parámetros relevantes
+- `global_latency`: Minutos entre ejecuciones del bucle principal
+- `api_host`: Host del servidor API
+- `api_port`: Puerto del servidor API
 
 ---
 
-## 3. broker_api plugins
+## 3. Pipeline Plugins
 
 ### 3.1 Objetivo
-Manejan la conexión y ejecución de operaciones en el broker correspondiente a cada instrumento, soportando brokers reales o simulados.
+Orquestan el flujo de trading para cada portfolio, coordinando strategy, broker y portfolio plugins.
 
-### 3.2 Métodos mínimos
-- `__init__(self, config: dict)`: inicializa el plugin con la configuración global.
-- `open_order(self, order_params: dict) -> dict`: abre una orden en el broker con los parámetros especificados.
-- `modify_order(self, order_id: str, new_params: dict) -> dict`: modifica una orden existente.
-- `close_order(self, order_id: str) -> dict`: cierra una orden abierta.
-- `get_open_orders(self) -> list`: devuelve las órdenes abiertas actuales.
+### 3.2 Métodos específicos
+- `execute_portfolio(portfolio, assets) -> None`: Ejecuta el pipeline completo para un portfolio
+- `process_asset(asset, strategy_plugin, broker_plugin) -> dict`: Procesa un asset individual
 
-### 3.3 Parámetros relevantes en config
-- `broker_api.broker_name`: identificador del broker (e.g., `oanda`, `binance`).
-- `broker_api.api_key`: clave de acceso al broker.
-- `broker_api.api_secret`: secreto de autenticación.
-- `broker_api.account_id`: número de cuenta.
-- `broker_api.endpoint`: URL base del API REST del broker.
+### 3.3 Parámetros relevantes
+- `max_parallel_assets`: Máximo número de assets procesados en paralelo
+- `error_retry_count`: Número de reintentos en caso de error
 
 ---
 
-## 4. portfolio_manager plugins
+## 4. Strategy Plugins
 
 ### 4.1 Objetivo
-Administran la asignación de capital de forma centralizada entre todos los instrumentos activos, aplicando reglas y metodologías de teoría de portafolios (moderna, postmoderna, personalizada).
+Implementan la lógica de decisión de trading basada en predicciones y datos de mercado.
 
-### 4.2 Métodos mínimos
-- `__init__(self, config: dict)`: inicializa el plugin con la configuración global.
-- `allocate(self, instruments: list) -> None`: calcula y asigna capital para cada instrumento, modificando su atributo `capital_asignado`.
-- `update(self, instrument: object, operation_result: dict) -> None`: recibe resultados de operaciones ejecutadas para ajustar las asignaciones futuras.
+### 4.2 Métodos específicos
+- `process(asset, market_data, predictions) -> dict`: Procesa datos y devuelve acción de trading
 
-### 4.3 Parámetros relevantes en config
-- `portfolio_manager.total_capital`: capital total disponible para distribuir.
-- `portfolio_manager.allocation_method`: método para asignar capital (e.g., `equal_weight`, `variance_minimization`).
-- `portfolio_manager.max_total_exposure`: exposición máxima agregada permitida como porcentaje del capital total.
-- `portfolio_manager.rebalance_frequency`: frecuencia de rebalanceo (e.g., `hourly`, `daily`).
+### 4.3 Retorno del método process
+```python
+{
+    "action": "open" | "close" | "none",
+    "parameters": {
+        "order_type": "market" | "limit",
+        "side": "buy" | "sell",
+        "quantity": float,
+        "price": float,  # Para órdenes limit
+        "stop_loss": float,
+        "take_profit": float
+    }
+}
+```
+
+### 4.4 Parámetros relevantes
+- `position_size`: Tamaño base de posición
+- `max_risk_per_trade`: Riesgo máximo por operación
+- `prediction_threshold`: Umbral de predicción para abrir posiciones
 
 ---
 
-## 5. instrument configuration
+## 5. Broker Plugins
 
 ### 5.1 Objetivo
-Cada instrumento es tratado como un sistema independiente que combina pipeline, strategy y broker_api, pero todos ellos comparten el mismo portfolio_manager.
+Manejan la comunicación con brokers para ejecutar órdenes.
 
-### 5.2 Clase sugerida
+### 5.2 Métodos específicos
+- `execute(action, parameters) -> dict`: Ejecuta la acción de trading con el broker
+
+### 5.3 Retorno del método execute
 ```python
-class Instrumento:
-    def __init__(self, nombre: str, pipeline, strategy, broker_api, config: dict):
-        self.nombre = nombre
-        self.pipeline = pipeline
-        self.strategy = strategy
-        self.broker_api = broker_api
-        self.config = config
-        self.capital_asignado = 0
-        self.estado_ordenes = []
-```        
-### 5.3 Parámetros relevantes en config (por instrumento)
-- instrument.symbol: símbolo o identificador del instrumento (e.g., EUR/USD).
-- instrument.broker: nombre del broker a usar para este instrumento.
-- instrument.pipeline: nombre del plugin de pipeline a usar.
-- instrument.strategy: nombre del plugin de estrategia.
-- instrument.broker_api: nombre del plugin de broker_api.
-- instrument.max_positions: número máximo de posiciones simultáneas permitidas para este instrumento.
+{
+    "success": bool,
+    "broker_order_id": str,
+    "broker_response": dict,
+    "error_message": str  # Si success=False
+}
+```
+
+### 5.4 Parámetros relevantes
+- `broker_api_url`: URL del API del broker
+- `api_key`: Clave de API del broker
+- `account_id`: ID de cuenta del broker
+- `timeout`: Timeout para requests al broker
+
+---
+
+## 6. Portfolio Plugins
+
+### 6.1 Objetivo
+Gestionan la asignación de capital entre assets de un portfolio.
+
+### 6.2 Métodos específicos
+- `allocate_capital(portfolio, assets) -> dict`: Asigna capital a cada asset
+
+### 6.3 Retorno del método allocate_capital
+```python
+{
+    "asset_id": float,  # Capital asignado por asset_id
+    "asset_id2": float,
+    # ...
+}
+```
+
+### 6.4 Parámetros relevantes
+- `allocation_method`: Método de asignación (equal_weight, risk_parity, etc.)
+- `max_allocation_per_asset`: Máximo porcentaje por asset
+- `rebalance_threshold`: Umbral para rebalanceo
+
+---
+
+## 7. Database Integration
+
+All plugins must use the SQLAlchemy ORM models for database operations:
+
+- **User**: Usuario system
+- **Session**: Sesiones de usuario
+- **AuditLog**: Registro de auditoría
+- **Config**: Configuración del sistema
+- **Statistics**: Estadísticas del sistema
+- **Portfolio**: Portfolios de usuario
+- **Asset**: Assets dentro de portfolios
+- **Order**: Órdenes de trading
+- **Position**: Posiciones abiertas
+
+---
+
+## 8. Plugin Configuration
+
+Each plugin receives configuration through:
+1. `plugin_params`: Valores por defecto
+2. `config` parameter in `__init__`: Configuración global merged
+3. JSON configuration stored in database (for portfolios/assets)
+
+---
+
+## 9. Error Handling
+
+All plugins must:
+- Handle exceptions gracefully
+- Log errors to the audit system
+- Return structured error responses
+- Not crash the main system
+
+---
+
+## 10. Testing
+
+All plugins must have:
+- Unit tests for individual methods
+- Integration tests with database
+- Mock tests for external APIs
+- Performance tests for critical paths
 
 ---
 

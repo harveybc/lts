@@ -6,6 +6,9 @@ h5py
 scipy
 build
 pytest
+pytest-asyncio
+pytest-cov
+pytest-mock
 pdoc3
 keras-multi-head
 pydot
@@ -22,3 +25,9 @@ tqdm
 PyWavelets
 hypothesis
 pydocstyle
+httpx
+fastapi
+uvicorn
+sqlalchemy
+bcrypt
+aiofiles

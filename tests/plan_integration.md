@@ -1,117 +1,268 @@
-# Integration Test Plan and Design
+# LTS (Live Trading System) - Integration Test Plan
 
 This document defines the integration test plan for the LTS (Live Trading System) project, including AAA (Authentication, Authorization, Accounting), web dashboard, and secure API. Integration tests validate the interactions between modules, plugins, system components, and API endpoints. Each test is specified with all required details for full coverage and traceability.
 
-# Feature-Extractor Project: Integration-Level Test Plan
+## 1. Test Overview and Principles
 
-This integration-level test plan defines tests for required interactions between modules, plugins, and external systems. All tests are behavior-driven and pragmatic, focusing on required integration behaviors and not implementation details. All persistent data (AAA, config, statistics, audit logs) is stored in SQLite via SQLAlchemy ORM, and all plugin/database integration points are covered.
+### 1.1 Test Philosophy
+Integration tests focus on interface contracts, data flow, and cross-component behaviors. Tests validate that different components work together correctly and handle errors gracefully. All persistent data (AAA, config, statistics, audit logs) is stored in SQLite via SQLAlchemy ORM, and all plugin/database integration points are covered.
 
-## 1. Test Coverage and Traceability
-- Every integration requirement is covered by at least one test case.
-- Traceability matrix maps requirements to test cases.
+### 1.2 Test Coverage and Traceability
+- Every integration requirement from `design_integration.md` is covered by at least one test case
+- Traceability matrix maps integration requirements to test cases
+- All test cases validate observable behaviors, not implementation details
+- Both positive and negative scenarios are covered, including adversarial cases
+
+### 1.3 Test Environment
+- **Test Database**: Isolated SQLite database for each test
+- **Plugin Sandbox**: Safe environment for plugin testing
+- **Mock Services**: Simulated external services for testing
+- **Network Simulation**: Controlled network conditions for failure testing
 
 ## 2. Test Case Structure
 Each test case includes:
-- **ID**
-- **Description**
-- **Preconditions**
-- **Steps**
-- **Expected Result**
-- **Negative/Adversarial Cases**
-- **Requirement Coverage**
+- **ID**: Unique identifier (INT-XXX)
+- **Description**: Behavior being tested
+- **Preconditions**: Required setup and state
+- **Steps**: Detailed execution steps
+- **Expected Result**: Observable outcomes
+- **Negative/Adversarial Cases**: Error conditions and malicious inputs
+- **Requirement Coverage**: Mapped to design requirements
+- **Risk Level**: High/Medium/Low based on business impact
 
-## 3. Test Cases
+## 3. Integration Test Cases
 
-### IN-1: Plugin Integration
-- **Description:** Encoder and decoder plugins are loaded, configured, and executed in sequence, each with their own parameters and debug variables, including version and provenance checks.
-- **Preconditions:** Valid plugins and parameters available; plugins with/without correct version/provenance.
-- **Steps:**
-  1. Run tool with valid encoder/decoder plugins and parameters; test version/provenance.
-- **Expected Result:** Only valid, compatible, and signed plugins loaded; others rejected.
-- **Negative/Adversarial Cases:** Invalid plugin, version/provenance mismatch, unsigned plugin. System logs error, returns sanitized message, and continues or exits safely.
-- **Requirement Coverage:** INT1, INT11, INT13
+### 3.1 Plugin System Integration
 
-### IN-2: Model Save/Load Integration
-- **Description:** Model save/load works for both encoder and decoder, supporting local files and remote endpoints, including permission and integrity errors.
-- **Preconditions:** Model files and remote endpoints available; simulate permission/integrity errors.
-- **Steps:**
-  1. Run tool with save/load arguments for both local and remote; simulate errors.
-- **Expected Result:** Models saved/loaded correctly; integrity verified; errors handled gracefully.
-- **Negative/Adversarial Cases:** Permission denied, network failure, corrupted file. System logs error, returns sanitized message, and continues or exits safely.
-- **Requirement Coverage:** INT2
+#### INT-001: Plugin Lifecycle Management
+- **Description**: Plugins are loaded, initialized, configured, and shut down consistently with proper error handling and resource cleanup
+- **Preconditions**: Valid plugin files, configuration, and database available
+- **Steps**:
+  1. Initialize plugin loader with valid configuration
+  2. Load multiple plugins (AAA, strategy, broker, portfolio)
+  3. Verify plugin initialization and configuration
+  4. Shutdown system and verify resource cleanup
+- **Expected Result**: All plugins loaded successfully, configured correctly, and resources cleaned up
+- **Negative/Adversarial Cases**: Invalid plugin files, corrupted configuration, resource exhaustion. System logs errors, rejects invalid plugins, and continues safely
+- **Requirement Coverage**: INT-001, INT-003
+- **Risk Level**: High
 
-### IN-3: Remote Config and Logging Integration
-- **Description:** Remote config is loaded/merged and remote logging captures all key events/errors, including network failures and replay attacks.
-- **Preconditions:** Remote config and logging endpoints available; simulate network/replay failures.
-- **Steps:**
-  1. Run tool with remote config/log arguments; simulate failures.
-- **Expected Result:** Config loaded, logs sent remotely, failures handled gracefully.
-- **Negative/Adversarial Cases:** Network failure, replay attack, config corruption. System logs error, returns sanitized message, and continues or exits safely.
-- **Requirement Coverage:** INT3
+#### INT-002: Plugin Communication Protocols
+- **Description**: Plugins communicate through standardized interfaces with proper data validation and error propagation
+- **Preconditions**: Multiple plugins loaded, communication channels established
+- **Steps**:
+  1. Strategy plugin generates trading signals
+  2. Broker plugin receives and validates signals
+  3. Portfolio plugin receives allocation requests
+  4. Verify data integrity and error handling
+- **Expected Result**: Clean data flow between plugins, proper validation, error propagation
+- **Negative/Adversarial Cases**: Malformed data, invalid signals, plugin crashes. System validates input, logs errors, and isolates failures
+- **Requirement Coverage**: INT-002, INT-004
+- **Risk Level**: High
 
-### IN-4: Plugin-Specific Parameter Propagation
-- **Description:** Plugin-specific parameters and debug variables are passed to the correct plugin instance, including edge cases.
-- **Preconditions:** Plugins support unique parameters; edge cases available.
-- **Steps:**
-  1. Pass unique parameters to encoder and decoder plugins; test edge cases.
-- **Expected Result:** Each plugin receives only its own parameters; edge cases handled.
-- **Negative/Adversarial Cases:** Parameter collision, missing/invalid parameter. System logs error, returns sanitized message, and continues or exits safely.
-- **Requirement Coverage:** INT4
+#### INT-003: Plugin Configuration Integration
+- **Description**: Plugin-specific configurations are properly merged, validated, and propagated during system initialization
+- **Preconditions**: Configuration files with plugin-specific settings
+- **Steps**:
+  1. Load configuration from multiple sources (CLI, file, database)
+  2. Merge plugin-specific configurations
+  3. Validate configuration consistency
+  4. Propagate to respective plugins
+- **Expected Result**: Configuration properly merged and validated, plugins receive correct settings
+- **Negative/Adversarial Cases**: Configuration conflicts, missing required settings, invalid values. System logs errors, uses defaults, and rejects invalid configurations
+- **Requirement Coverage**: INT-003, INT-005
+- **Risk Level**: Medium
 
-### IN-5: Error Propagation and Recovery
-- **Description:** All errors in plugin/model/config operations are caught, logged, and reported; system recovers or exits safely, including adversarial and malicious input.
-- **Preconditions:** Simulated error condition, adversarial input available.
-- **Steps:**
-  1. Simulate plugin/model/config error or adversarial input.
-- **Expected Result:** Error is caught, logged, and system recovers or exits safely; no sensitive data leaked.
-- **Negative/Adversarial Cases:** Malicious input, plugin crash, config error. System logs error, returns sanitized message, and continues or exits safely.
-- **Requirement Coverage:** INT5
+### 3.2 Database Integration
 
-### IN-6: Secure Remote Operations and Plugin Management
-- **Description:** All remote endpoints use HTTPS, require authentication, and validate integrity; plugins are sandboxed, versioned, and signed; API endpoints implement rate limiting/backoff.
-- **Preconditions:** Secure endpoints, signed plugins, API endpoints available; simulate high load.
-- **Steps:**
-  1. Run tool with secure endpoints and signed plugins; simulate high API load.
-- **Expected Result:** Secure connection, integrity checked, plugins loaded only if valid, rate limiting/backoff enforced.
-- **Negative/Adversarial Cases:** Insecure endpoint, unsigned plugin, rate limit bypass. System logs error, returns sanitized message, and continues or exits safely.
-- **Requirement Coverage:** INT6, INT7, INT12, INT13
+#### INT-004: Database Connection Management
+- **Description**: Database connections are properly managed with connection pooling, error handling, and resource cleanup
+- **Preconditions**: SQLite database available, connection pool configured
+- **Steps**:
+  1. Initialize database connection pool
+  2. Perform concurrent operations from multiple components
+  3. Simulate connection failures and recovery
+  4. Verify connection cleanup and resource management
+- **Expected Result**: Connection pool manages resources efficiently, handles failures gracefully
+- **Negative/Adversarial Cases**: Database unavailable, connection exhaustion, corruption. System logs errors, implements retry logic, and maintains data integrity
+- **Requirement Coverage**: INT-006, INT-007
+- **Risk Level**: High
 
-### IN-7: Resource Limits and Dependency Security
-- **Description:** All integration points enforce resource limits; all dependencies are scanned and pinned.
-- **Preconditions:** Resource limits and dependency scanning enabled; simulate high resource usage.
-- **Steps:**
-  1. Simulate high resource usage; review dependency list.
-- **Expected Result:** Resource limits enforced; dependencies are pinned and scanned.
-- **Negative/Adversarial Cases:** Resource exhaustion, dependency vulnerability. System logs error, returns sanitized message, and continues or exits safely.
-- **Requirement Coverage:** INT9, INT10
+#### INT-005: Transaction Integrity
+- **Description**: Database operations maintain ACID properties with proper transaction management and rollback capabilities
+- **Preconditions**: Database initialized, multiple components performing operations
+- **Steps**:
+  1. Begin complex transaction involving multiple tables
+  2. Simulate failure during transaction
+  3. Verify proper rollback and data consistency
+  4. Test concurrent transactions
+- **Expected Result**: Transaction boundaries maintained, rollback works correctly, data consistency preserved
+- **Negative/Adversarial Cases**: Transaction conflicts, deadlocks, system crashes. System implements proper locking, rollback, and recovery
+- **Requirement Coverage**: INT-007, INT-008
+- **Risk Level**: High
 
-### IN-8: Audit Logging, Replay, and Regression
-- **Description:** All sensitive operations are audit-logged; replay attacks are detected and blocked; regression tests for integration bugs are run.
-- **Preconditions:** Audit logging enabled; regression test suite available.
-- **Steps:**
-  1. Perform sensitive operations; simulate replay attacks; run regression tests.
-- **Expected Result:** Audit logs created, replay attacks blocked, regression tests pass.
-- **Negative/Adversarial Cases:** Audit log failure, replay attack, regression bug. System logs error, returns sanitized message, and continues or exits safely.
-- **Requirement Coverage:** INT8
+#### INT-006: ORM Model Integration
+- **Description**: All components use SQLAlchemy ORM models consistently for data access and manipulation
+- **Preconditions**: ORM models defined, database schema created
+- **Steps**:
+  1. Perform CRUD operations through different components
+  2. Verify model relationships and constraints
+  3. Test data validation and integrity
+  4. Validate audit logging integration
+- **Expected Result**: Consistent data access patterns, proper constraint enforcement, audit logging
+- **Negative/Adversarial Cases**: Schema mismatches, constraint violations, invalid data. System validates data, enforces constraints, and logs all operations
+- **Requirement Coverage**: INT-008, INT-009, INT-010
+- **Risk Level**: Medium
 
-### ITC-7: Config and Debug Info Propagation via API
-- **Description:** Plugins receive correct config and debug info via API; invalid requests are handled gracefully.
-- **Preconditions:** Plugins, web/API running.
-- **Steps:**
-  1. Set/get config and debug info via API.
-- **Expected Result:** Plugins receive correct config, debug info is accurate.
-- **Negative/Adversarial Cases:** Invalid config/debug request. API logs error, returns error response.
-- **Requirement Coverage:** INT4
+### 3.3 Web API Integration
 
-### ITC-8: Error Propagation Between Plugins, API, and Core
-- **Description:** Errors propagate correctly between plugins, API, and core; system recovers or exits safely.
-- **Preconditions:** Simulated error condition, adversarial input available.
-- **Steps:**
-  1. Simulate error in plugin/API/core.
-- **Expected Result:** Error is caught, logged, and system recovers or exits safely; no sensitive data leaked.
-- **Negative/Adversarial Cases:** Uncaught error, sensitive data leak. System logs error, returns sanitized message, and continues or exits safely.
-- **Requirement Coverage:** INT5
+#### INT-007: Authentication Integration
+- **Description**: Web API endpoints integrate with AAA plugins for secure authentication and authorization
+- **Preconditions**: AAA plugins loaded, API endpoints configured, test users created
+- **Steps**:
+  1. Attempt API access without authentication
+  2. Authenticate with valid credentials
+  3. Test role-based authorization
+  4. Verify session management and logout
+- **Expected Result**: Proper authentication required, authorization enforced, sessions managed securely
+- **Negative/Adversarial Cases**: Invalid credentials, privilege escalation attempts, session hijacking. System rejects unauthorized access, logs security events, and maintains session integrity
+- **Requirement Coverage**: INT-011, INT-014
+- **Risk Level**: High
 
-## 4. Best Practices
-- All persistent data and plugin/database integration points are tested for correctness, security, and traceability.
-- All test cases are reviewed and updated regularly.
+#### INT-008: API Request Validation
+- **Description**: All API requests are validated and sanitized to prevent injection attacks and data corruption
+- **Preconditions**: API endpoints configured, validation rules defined
+- **Steps**:
+  1. Send valid API requests with proper formatting
+  2. Send malformed requests with invalid data
+  3. Test input sanitization and validation
+  4. Verify error handling and logging
+- **Expected Result**: Valid requests processed correctly, invalid requests rejected with proper error messages
+- **Negative/Adversarial Cases**: SQL injection attempts, XSS payloads, malformed JSON. System sanitizes input, validates data, and logs security events
+- **Requirement Coverage**: INT-012, INT-014
+- **Risk Level**: High
+
+#### INT-009: API Rate Limiting
+- **Description**: API endpoints implement rate limiting and throttling to prevent abuse and DoS attacks
+- **Preconditions**: Rate limiting configured, API endpoints available
+- **Steps**:
+  1. Send normal API requests within limits
+  2. Exceed rate limits with rapid requests
+  3. Test different rate limit policies
+  4. Verify throttling and recovery
+- **Expected Result**: Normal requests processed, rate limits enforced, proper throttling behavior
+- **Negative/Adversarial Cases**: DoS attacks, rate limit bypass attempts. System enforces limits, logs violations, and implements backoff strategies
+- **Requirement Coverage**: INT-015
+- **Risk Level**: Medium
+
+### 3.4 Configuration Integration
+
+#### INT-010: Multi-Source Configuration Merging
+- **Description**: Configuration is properly loaded, merged, and validated from multiple sources (CLI, file, database, environment)
+- **Preconditions**: Configuration sources available, merge rules defined
+- **Steps**:
+  1. Load configuration from each source
+  2. Test merge priority and conflict resolution
+  3. Validate final configuration
+  4. Test dynamic configuration updates
+- **Expected Result**: Configuration merged correctly, conflicts resolved, validation passed
+- **Negative/Adversarial Cases**: Configuration conflicts, invalid values, missing required settings. System resolves conflicts, validates settings, and uses secure defaults
+- **Requirement Coverage**: INT-016, INT-017
+- **Risk Level**: Medium
+
+#### INT-011: Configuration Validation and Security
+- **Description**: Configuration values are validated for security, data integrity, and business rules
+- **Preconditions**: Configuration schema defined, validation rules implemented
+- **Steps**:
+  1. Load configuration with valid values
+  2. Test invalid and malicious configuration values
+  3. Verify security constraints and sanitization
+  4. Test configuration reload and validation
+- **Expected Result**: Valid configuration accepted, invalid values rejected, security constraints enforced
+- **Negative/Adversarial Cases**: Malicious configuration, path traversal attempts, credential exposure. System validates all values, sanitizes input, and protects sensitive data
+- **Requirement Coverage**: INT-018, INT-019
+- **Risk Level**: High
+
+### 3.5 Error Handling and Recovery
+
+#### INT-012: Cross-Component Error Propagation
+- **Description**: Errors propagate correctly between plugins, API, and core components with proper logging and recovery
+- **Preconditions**: Multiple components running, error simulation capability
+- **Steps**:
+  1. Simulate errors in different components
+  2. Verify error propagation and handling
+  3. Test recovery mechanisms
+  4. Validate error logging and reporting
+- **Expected Result**: Errors handled gracefully, proper logging, system recovery when possible
+- **Negative/Adversarial Cases**: Cascading failures, error loops, resource exhaustion. System isolates failures, prevents cascading, and maintains core functionality
+- **Requirement Coverage**: INT-020, INT-021
+- **Risk Level**: High
+
+#### INT-013: Audit Logging Integration
+- **Description**: All sensitive operations are audit-logged with proper correlation and traceability
+- **Preconditions**: Audit logging configured, database available
+- **Steps**:
+  1. Perform sensitive operations across components
+  2. Verify audit log creation and correlation
+  3. Test log integrity and tamper detection
+  4. Validate log retention and archival
+- **Expected Result**: Complete audit trail, proper correlation, log integrity maintained
+- **Negative/Adversarial Cases**: Log tampering attempts, storage failures, privacy violations. System protects logs, implements integrity checks, and maintains compliance
+- **Requirement Coverage**: INT-010, INT-022
+- **Risk Level**: Medium
+
+## 4. Test Execution Strategy
+
+### 4.1 Test Automation
+- All integration tests are automated using pytest framework
+- Continuous integration pipeline executes tests on every commit
+- Test results are tracked and reported with detailed metrics
+- Failed tests trigger immediate notifications and rollback procedures
+
+### 4.2 Test Data Management
+- Realistic test data representing production scenarios
+- Edge cases and boundary conditions
+- Malicious and adversarial inputs
+- Data privacy and security considerations
+
+### 4.3 Test Environment Management
+- Isolated test environments for each test suite
+- Database cleanup and state management
+- Mock services for external dependencies
+- Network condition simulation
+
+## 5. Requirements Traceability Matrix
+
+| Test Case | Integration Requirements | Risk Level | Automation Status |
+|-----------|-------------------------|------------|------------------|
+| INT-001 | INT-001, INT-003 | High | Automated |
+| INT-002 | INT-002, INT-004 | High | Automated |
+| INT-003 | INT-003, INT-005 | Medium | Automated |
+| INT-004 | INT-006, INT-007 | High | Automated |
+| INT-005 | INT-007, INT-008 | High | Automated |
+| INT-006 | INT-008, INT-009, INT-010 | Medium | Automated |
+| INT-007 | INT-011, INT-014 | High | Automated |
+| INT-008 | INT-012, INT-014 | High | Automated |
+| INT-009 | INT-015 | Medium | Automated |
+| INT-010 | INT-016, INT-017 | Medium | Automated |
+| INT-011 | INT-018, INT-019 | High | Automated |
+| INT-012 | INT-020, INT-021 | High | Automated |
+| INT-013 | INT-010, INT-022 | Medium | Automated |
+
+## 6. Test Review and Maintenance
+
+### 6.1 Test Review Process
+- Regular review of test effectiveness and coverage
+- Removal of obsolete or low-value tests
+- Addition of tests for new integration requirements
+- Validation of test alignment with design changes
+
+### 6.2 Test Maintenance
+- Keep tests synchronized with design and implementation changes
+- Update test data and scenarios based on production issues
+- Maintain test documentation and traceability
+- Monitor test execution performance and optimize as needed
+
+---
+
+*This document is maintained in alignment with the system design and is reviewed regularly to ensure comprehensive coverage of all integration requirements.*

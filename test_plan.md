@@ -1,6 +1,6 @@
 # Master Test Plan for LTS (Live Trading System)
 
-This master test plan defines the global testing strategy for the feature-extractor project. It ensures that all required behaviors, as specified in the design documents, are covered at the acceptance, system, integration, and unit levels. The plan emphasizes pragmatic, behavior-driven testing, exhaustive documentation, and traceability from requirements to tests.
+This master test plan defines the comprehensive testing strategy for the LTS (Live Trading System) project. It ensures that all required behaviors, as specified in the design documents, are covered at the acceptance, system, integration, and unit levels. The plan emphasizes pragmatic, behavior-driven testing, comprehensive requirements coverage, and full traceability from user stories to implementation.
 
 ## 1. Testing Principles and Best Practices
 - **Behavior-Driven:** All tests focus on required behaviors, not implementation details.
