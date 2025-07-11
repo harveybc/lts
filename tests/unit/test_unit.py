@@ -15,14 +15,14 @@ import pytest
 import asyncio
 import os
 import sys
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch, MagicMock, AsyncMock
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 
 # Import classes to be tested
 from app.plugin_base import PluginBase
-from app.database import Database, Base, engine
+from app.database import Database, Base, sync_engine as engine
 from app.utils.error_handler import ErrorHandler
 from app.utils.data_transformer import DataTransformer
 from app.utils.concurrency import ConcurrencyManager
@@ -123,25 +123,26 @@ class TestDatabaseComponents:
         # Conceptual test. Would involve creating related model instances and checking linkage.
         pass
 
-    @patch("app.database.Database.get_connection")
-    def test_database_query_optimization(self, mock_get_connection):
+    @patch("app.database.Database.get_session")
+    def test_database_query_optimization(self, mock_get_session):
         """UT-012: Test that database queries are constructed to use indexes effectively."""
-        # Mock the connection and cursor
-        mock_conn = MagicMock()
+        # Mock the session and its execute method
+        mock_session = AsyncMock()
         mock_cursor = MagicMock()
-        mock_conn.execute.return_value = mock_cursor
-        
+        mock_session.execute.return_value = mock_cursor
+
         # Make the async context manager work with the mock
-        async def mock_get_connection_async():
-            return mock_conn
-        mock_get_connection.return_value.__aenter__.side_effect = mock_get_connection_async
+        async def mock_get_session_async():
+            return mock_session
+        mock_get_session.return_value.__aenter__.side_effect = mock_get_session_async
 
         db = Database(":memory:")
         asyncio.run(db.fetch_all("SELECT * FROM users WHERE username = ?", ("test",)))
-        
+
         # Check that the correct SQL was executed
-        sql = mock_conn.execute.call_args[0][0]
-        assert "WHERE username" in sql
+        mock_session.execute.assert_awaited_once()
+        sql_text = mock_session.execute.call_args[0][0]
+        assert "WHERE username" in str(sql_text)
 
 class TestWebAPIComponents:
     """UT-013, UT-014: Web API Component Tests"""

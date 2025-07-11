@@ -22,8 +22,17 @@ from contextlib import asynccontextmanager, contextmanager
 DATABASE_URL = 'sqlite+aiosqlite:///./lts_trading.db'
 ASYNC_DATABASE_URL = 'sqlite+aiosqlite://'
 
+# Synchronous engine for tests and sync components
+sync_engine = create_engine(DATABASE_URL.replace('+aiosqlite', ''), connect_args={"check_same_thread": False})
+SyncSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=sync_engine)
+
 # Base for declarative models
 Base = declarative_base()
+
+def get_db_session():
+    engine = create_engine(DATABASE_URL.replace('+aiosqlite', ''), connect_args={"check_same_thread": False})
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    return SessionLocal()
 
 @contextmanager
 def db_session():

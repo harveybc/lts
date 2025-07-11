@@ -27,7 +27,7 @@ hypothesis
 pydocstyle
 httpx
 fastapi
-uvicorn
+uvicorn[standard]
 sqlalchemy
 bcrypt
 aiofiles

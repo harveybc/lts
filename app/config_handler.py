@@ -8,6 +8,7 @@ import json
 import hashlib
 import sys
 import requests
+import os
 from typing import Dict, Any
 from app.config import DEFAULT_VALUES
 from app.plugin_loader import load_plugin
@@ -17,17 +18,38 @@ class ConfigHandler:
     Handles configuration loading and merging from CLI, file, and remote sources.
     Maintains config integrity and provides checksum calculation.
     """
-    def __init__(self, cli_args: Dict[str, Any] = None, file_path: str = None, remote_url: str = None):
+    def __init__(self, default_file_path: str = None, override_file_path: str = None, cli_args: Dict[str, Any] = None, remote_url: str = None):
         self.config = {}
-        if file_path:
-            with open(file_path) as f:
+
+        # 1. Load defaults from file
+        if default_file_path and os.path.exists(default_file_path):
+            with open(default_file_path) as f:
                 self.config.update(json.load(f))
+
+        # 2. Load overrides from file
+        if override_file_path and os.path.exists(override_file_path):
+            with open(override_file_path) as f:
+                self.config.update(json.load(f))
+        
+        # 3. Load from remote
         if remote_url:
-            # Simulate remote fetch (stub)
-            self.config.update({"remote": True})
+            # In a real scenario, you would fetch and merge the remote config
+            remote_conf = remote_load_config(remote_url)
+            if remote_conf:
+                self.config.update(remote_conf)
+
+        # 4. Load environment variables
+        self.config['DATABASE_PATH'] = os.environ.get('LTS_DATABASE_PATH', self.config.get('DATABASE_PATH'))
+
+        # 5. Load CLI arguments (highest precedence)
         if cli_args:
-            self.config.update(cli_args)
+            # Filter out None values from cli_args to not override existing settings with None
+            self.config.update({k: v for k, v in cli_args.items() if v is not None})
+
         self.checksum = self._calc_checksum()
+
+    def get_config(self):
+        return self.config
 
     def _calc_checksum(self):
         """

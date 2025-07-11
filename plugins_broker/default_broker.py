@@ -6,7 +6,7 @@ broker responses without making actual API calls.
 """
 
 from app.plugin_base import PluginBase
-from app.database import SessionLocal, Order, Position
+from app.database import SyncSessionLocal as SessionLocal, Order, Position
 import random
 import uuid
 from datetime import datetime, timezone

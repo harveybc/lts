@@ -19,6 +19,7 @@ import sys
 import json
 from unittest.mock import Mock, patch, MagicMock
 from sqlalchemy import text
+from sqlalchemy.exc import ResourceClosedError
 from fastapi.testclient import TestClient
 
 # Add parent directory to path for imports
@@ -84,9 +85,10 @@ class TestDatabaseIntegration:
         """INT-004: Test database connection pooling and management."""
         async with db_instance.get_session() as session:
             assert session.is_active
+            connection = await session.connection()
+            assert not connection.closed
         
-        # After the context manager exits, the session should be closed.
-        assert not session.is_active
+        assert connection.closed
 
     @pytest.mark.asyncio
     async def test_transaction_integrity_acid(self, db_instance):

@@ -41,8 +41,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../'))
 
 from app.main import main
-from app.database import Base, User, Portfolio, Asset, Order, Position, AuditLog, Session as DBSession
-from app.web import app as fastapi_app
+from app.database import Base, User, Portfolio, Asset, Order, Position, AuditLog
 from app.config import DEFAULT_VALUES
 from plugins_aaa.default_aaa import DefaultAAA
 
@@ -56,30 +55,25 @@ class TestAcceptance:
     """
 
     @pytest.fixture(scope="function")
-    def test_db(self):
-        """Create isolated test database for each test."""
-        engine = create_engine("sqlite:///:memory:", echo=False)
-        Base.metadata.create_all(engine)
-        TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        
-        db = TestingSessionLocal()
+    def api_client(self, app):
+        """Create FastAPI test client with test database."""
+        client = TestClient(app)
+        return client
+
+    @pytest.fixture(scope="function")
+    def test_db(self, app):
+        """Provide a synchronous database session for test verification."""
+        # Use the same database as the app but with a sync connection
+        sync_engine = create_engine(
+            app.database.db_url.replace('+aiosqlite', ''), 
+            connect_args={"check_same_thread": False}
+        )
+        TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=sync_engine)
+        db = TestSessionLocal()
         try:
             yield db
         finally:
             db.close()
-
-    @pytest.fixture(scope="function")
-    def api_client(self, test_db):
-        """Create FastAPI test client with test database."""
-        def override_get_db():
-            try:
-                yield test_db
-            finally:
-                pass
-        
-        fastapi_app.dependency_overrides[DBSession] = override_get_db
-        client = TestClient(fastapi_app)
-        return client
 
     @pytest.fixture
     def sample_user_data(self):
@@ -106,10 +100,7 @@ class TestAcceptance:
         """Sample portfolio data for testing."""
         return {
             "name": "Test Portfolio",
-            "description": "Test portfolio for automated trading",
-            "portfolio_plugin": "default_portfolio",
-            "total_capital": 10000.0,
-            "is_active": True
+            "assets": ["AAPL", "GOOGL", "MSFT"]
         }
 
     @pytest.fixture
@@ -206,7 +197,7 @@ class TestAcceptance:
         portfolio_data = create_response.json()
         portfolio_id = portfolio_data["id"]
         assert portfolio_data["name"] == sample_portfolio_data["name"]
-        assert portfolio_data["total_capital"] == sample_portfolio_data["total_capital"]
+        assert portfolio_data["assets"] == sample_portfolio_data["assets"]
         
         # Step 2: View portfolio in portfolio list
         list_response = api_client.get("/portfolios", headers=headers)
@@ -520,10 +511,19 @@ class TestAcceptance:
         # Should implement rate limiting after several failed attempts
         assert failed_attempts < 10  # Should be rate limited before 10 attempts
         
-        # Test 4: Session timeout
-        # Login successfully
+        # Test 4: Session timeout (testing with a different user to avoid rate limiting)
+        # Create another user for session testing
+        session_user = {
+            "username": "session_user",
+            "email": "session@example.com", 
+            "password": "SecurePass123!@#",
+            "role": "trader"
+        }
+        api_client.post("/auth/register", json=session_user)
+        
+        # Login successfully with new user
         valid_login = {
-            "username": "secure_user",
+            "username": "session_user",
             "password": "SecurePass123!@#"
         }
         login_response = api_client.post("/auth/login", json=valid_login)

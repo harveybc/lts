@@ -11,12 +11,79 @@ import os
 import sys
 import tempfile
 import asyncio
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock, MagicMock, patch
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
 from app.config_handler import ConfigHandler
-from app.database import Database, db_session, Base
+from app.database import Database, db_session, Base, SyncSessionLocal, get_db
+from fastapi.testclient import TestClient
+from plugins_core.default_core import CorePlugin
+from fastapi import FastAPI, Depends
+import json
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+@pytest.fixture(scope="function")
+def app(fresh_db, mock_config):
+    """Create a FastAPI app for testing, with a fresh database."""
+    
+    core_plugin = CorePlugin()
+    
+    # This is a simplified version of the dependency override
+    # In a real app, you'd likely have a more robust way to manage this
+    async def get_test_db():
+        async with fresh_db.get_session() as session:
+            yield session
+
+    def get_sync_test_db():
+        """Provides a synchronous session for plugins that need it."""
+        # This uses the same underlying database file as the async session
+        # but with a separate synchronous engine.
+        sync_engine = create_engine(
+            fresh_db.db_url.replace('+aiosqlite', ''), 
+            connect_args={"check_same_thread": False}
+        )
+        TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=sync_engine)
+        db = TestSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app = FastAPI()
+    
+    # Initialize the core plugin, which sets up its routes
+    core_plugin.initialize(
+        plugins={'core': core_plugin}, 
+        config=mock_config, # Use the mock_config fixture
+        database=fresh_db,
+        get_db=get_sync_test_db # Pass the sync session provider
+    )
+    
+    # Ensure all tables are created on the sync engine as well
+    sync_engine = create_engine(
+        fresh_db.db_url.replace('+aiosqlite', ''), 
+        connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(bind=sync_engine)
+
+
+    # Override the dependencies in the core plugin's router
+    app.dependency_overrides[get_db] = get_sync_test_db
+    
+    app.include_router(core_plugin.router)
+    
+    # Add a reference to the database object to the app for tests that need it
+    app.database = fresh_db
+    
+    return app
+
+@pytest.fixture(scope="function")
+def client(app):
+    """Create a TestClient for the app."""
+    with TestClient(app) as c:
+        yield c
 
 @pytest.fixture(scope="session")
 def event_loop():
@@ -26,28 +93,70 @@ def event_loop():
     loop.close()
 
 @pytest.fixture(scope="function")
-def temp_database():
-    """Create a temporary database for testing."""
+async def fresh_db():
+    """Create a fresh database for each test function."""
     with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as temp_file:
         db_path = temp_file.name
     
-    yield db_path
+    db = Database(db_path=db_path)
+    await db.initialize()
+    yield db
+    await db.cleanup()
     
-    # Cleanup
     try:
         os.unlink(db_path)
     except FileNotFoundError:
         pass
 
-@pytest.fixture(scope="function")
-async def fresh_db(temp_database):
-    """Create a fresh database for each test function."""
-    db = Database(db_path=f"sqlite:///{temp_database}")
-    await db.initialize()
-    yield db
-    await db.cleanup()
 
-@pytest.fixture
+@pytest.fixture(scope="function")
+def app_with_config(fresh_db):
+    """Create a FastAPI app with a specific test configuration."""
+    with patch.dict(os.environ, {"LTS_DATABASE_PATH": "test_db_from_env.sqlite"}):
+        # Create temporary config files
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as f_default:
+            json.dump({"DEFAULT_SETTING": "file_value", "LOG_LEVEL": "INFO"}, f_default)
+            default_config_path = f_default.name
+
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as f_override:
+            json.dump({"LOG_LEVEL": "DEBUG"}, f_override)
+            override_config_path = f_override.name
+
+        config_handler = ConfigHandler(default_file_path=default_config_path, override_file_path=override_config_path)
+        config = config_handler.get_config()
+
+        core_plugin = CorePlugin()
+        app = FastAPI()
+
+        def get_sync_test_db():
+            sync_engine = create_engine(
+                fresh_db.db_url.replace('+aiosqlite', ''),
+                connect_args={"check_same_thread": False}
+            )
+            TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=sync_engine)
+            db = TestSessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        core_plugin.initialize(
+            plugins={'core': core_plugin},
+            config=config,
+            database=fresh_db,
+            get_db=get_sync_test_db
+        )
+
+        app.include_router(core_plugin.router)
+        app.config = config  # Attach config for easy access in tests
+
+        yield app
+
+    # Cleanup config files
+    os.unlink(default_config_path)
+    os.unlink(override_config_path)
+
+@pytest.fixture(scope="session")
 def mock_config():
     """Create a mock configuration for testing."""
     return {
@@ -70,7 +179,7 @@ def mock_config():
         }
     }
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def mock_plugin_loader():
     """Create a mock plugin loader for testing."""
     loader = Mock()

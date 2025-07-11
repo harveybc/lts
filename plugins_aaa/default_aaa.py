@@ -3,7 +3,7 @@ Default AAA (Authentication, Authorization, Accounting) plugin for LTS.
 Implements user authentication, role management, and audit logging.
 """
 from app.plugin_base import AAAPluginBase
-from app.database import SessionLocal, User, Session, AuditLog
+from app.database import SyncSessionLocal as SessionLocal, User, Session, AuditLog
 from datetime import datetime, timezone, timedelta
 import hashlib
 import secrets
