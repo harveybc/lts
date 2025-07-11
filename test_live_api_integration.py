@@ -106,7 +106,7 @@ class LiveAPIIntegrationTest:
             })
             
             # Create prediction client
-            client = PredictionProviderClient(config.config)
+            client = PredictionProviderClient(config)
             
             # Test prediction request
             test_datetime = "2023-01-15T10:00:00"
@@ -137,8 +137,8 @@ class LiveAPIIntegrationTest:
         
         try:
             # Configuration for API mode
-            config = Config()
-            config.config.update({
+            config = DEFAULT_VALUES.copy()
+            config.update({
                 'csv_test_mode': False,
                 'prediction_provider_url': 'http://localhost:8000',
                 'prediction_provider_timeout': 120,
@@ -160,7 +160,7 @@ class LiveAPIIntegrationTest:
             })
             
             # Create prediction client
-            client = PredictionProviderClient(config.config)
+            client = PredictionProviderClient(config)
             
             # Test prediction request
             test_datetime = "2023-01-15T10:00:00"
