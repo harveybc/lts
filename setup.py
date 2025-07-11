@@ -22,7 +22,8 @@ setup(
         ],
         # Strategy plugins - Trading decision logic
         'plugins_strategy': [
-            'default_strategy=plugins_strategy.default_strategy:DefaultStrategy'
+            'default_strategy=plugins_strategy.default_strategy:DefaultStrategy',
+            'prediction_strategy=plugins_strategy.prediction_strategy:PredictionBasedStrategy'
         ],
         # Broker plugins - Connection and execution with brokers
         'plugins_broker': [
@@ -36,6 +37,7 @@ setup(
     install_requires=[
         'pandas',
         'numpy',
+        'httpx',  # For async HTTP requests to prediction provider
         'requests',
         'websocket-client',
         'fastapi',
@@ -50,7 +52,9 @@ setup(
         'asyncio',
         'schedule',
         'matplotlib',
-        'seaborn'
+        'seaborn',
+        'backtrader',  # For broker simulation
+        'python-dateutil'  # For datetime parsing
     ],
     author='LTS Development Team',
     author_email='lts@example.com',

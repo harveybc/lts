@@ -48,9 +48,41 @@ DEFAULT_VALUES = {
     # Broker Plugin Configuration
     "broker_plugin": "default_broker",
     "default_broker_name": "demo_broker",
-    "default_account_id": "demo_account",
-    "default_spread": 0.0002,
-    "order_timeout": 10,  # seconds
+    
+    # Prediction Provider Integration Configuration
+    "prediction_provider_url": "http://localhost:8000",
+    "prediction_provider_api_key": None,
+    "prediction_provider_timeout": 300,  # seconds
+    "prediction_provider_retries": 3,
+    "prediction_provider_retry_delay": 5,  # seconds
+    
+    # Model Configuration for Predictions
+    # Short-term predictions (1-6 hours) using 1h transformer model
+    "short_term_model": {
+        "predictor_plugin": "transformer",
+        "window_size": 144,
+        "batch_size": 128,
+        "prediction_horizon": 6,
+        "interval": "1h",
+        "lookback_ticks": 1000,  # Number of previous ticks needed
+        "model_config": "phase_3_1/phase_3_1_transformer_1h_config.json"
+    },
+    
+    # Long-term predictions (1-6 days) using 1d CNN model  
+    "long_term_model": {
+        "predictor_plugin": "cnn", 
+        "window_size": 256,
+        "batch_size": 128,
+        "prediction_horizon": 6,
+        "interval": "1d",
+        "lookback_ticks": 1000,  # Number of previous ticks needed
+        "model_config": "phase_3_1_daily/phase_3_1_cnn_1d_config.json"
+    },
+    
+    # CSV Test Configuration (for testing with perfect predictions)
+    "csv_test_mode": False,
+    "csv_test_data_path": "examples/data/phase_3/base_d1.csv",
+    "csv_test_lookahead": True,  # Use future data for perfect predictions
     
     # Portfolio Plugin Configuration
     "portfolio_plugin": "default_portfolio",

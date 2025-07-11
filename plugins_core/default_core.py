@@ -160,6 +160,13 @@ class CorePlugin(PluginBase):
         self.router.add_api_route("/test/simulate-db-failure", self.simulate_db_failure, methods=["POST"])
         self.router.add_api_route("/test/simulate-pipeline-failure", self.simulate_pipeline_failure, methods=["POST"])
         self.router.add_api_route("/test/reset-failures", self.reset_test_failures, methods=["POST"])
+        
+        # Prediction and Strategy endpoints
+        self.router.add_api_route("/predictions/test", self.test_predictions, methods=["POST"])
+        self.router.add_api_route("/strategy/signal", self.get_strategy_signal, methods=["POST"], dependencies=[Depends(get_current_user)])
+        self.router.add_api_route("/strategy/backtest", self.backtest_strategy, methods=["POST"], dependencies=[Depends(get_current_user)])
+        self.router.add_api_route("/strategy/config", self.get_strategy_config, methods=["GET"], dependencies=[Depends(get_current_user)])
+        self.router.add_api_route("/strategy/config", self.update_strategy_config, methods=["PUT"], dependencies=[Depends(get_current_user)])
 
 
     async def list_plugins(self):
@@ -831,25 +838,171 @@ class CorePlugin(PluginBase):
         """Reset all test failure simulations"""
         self._test_mode_failures.clear()
         return {"status": "Test failure simulations reset"}
-
-    @staticmethod
-    def get_db() -> Session:
-        """
-        Provides a database session dependency.
-        """
-        db = next(get_db())
-        yield db
-
-# Create a singleton instance of the plugin for the app factory to use
-core_plugin_instance = CorePlugin()
-
-def create_app() -> FastAPI:
-    """
-    Application factory to create a fresh FastAPI instance.
-    This is essential for testing to ensure a clean state for each test.
-    """
-    app = FastAPI()
-    app.include_router(core_plugin_instance.router)
-    app.add_middleware(BaseHTTPMiddleware, dispatch=core_plugin_instance.add_security_headers)
-    app.add_exception_handler(Exception, core_plugin_instance.handle_500_error)
-    return app
+    
+    # Prediction and Strategy endpoints
+    async def test_predictions(self, request_data: dict):
+        """Test the prediction provider integration"""
+        try:
+            from app.prediction_client import PredictionProviderClient
+            
+            # Create prediction client with current config
+            prediction_client = PredictionProviderClient(self._config)
+            
+            # Extract request parameters
+            symbol = request_data.get('symbol', 'EURUSD')
+            datetime_str = request_data.get('datetime', None)
+            prediction_types = request_data.get('prediction_types', ['short_term', 'long_term'])
+            
+            if not datetime_str:
+                from datetime import datetime
+                datetime_str = datetime.now().isoformat()
+            
+            # Get predictions
+            predictions = await prediction_client.get_predictions(
+                symbol=symbol,
+                datetime_str=datetime_str,
+                prediction_types=prediction_types
+            )
+            
+            return {
+                "status": "success",
+                "predictions": predictions,
+                "model_info": prediction_client.get_model_info()
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Prediction test failed: {str(e)}")
+    
+    async def get_strategy_signal(self, request_data: dict, current_user: dict = Depends(get_current_user)):
+        """Get a trading signal from the prediction strategy"""
+        try:
+            from plugins_strategy.prediction_strategy import PredictionBasedStrategy
+            
+            # Initialize strategy
+            strategy = PredictionBasedStrategy()
+            strategy.initialize({}, self._config)
+            
+            # Extract request parameters
+            symbol = request_data.get('symbol', 'EURUSD')
+            current_price = request_data.get('current_price', 1.0)
+            historical_data = request_data.get('historical_data', [])
+            portfolio_context = request_data.get('portfolio_context', {
+                'positions': {},
+                'max_position_size': 0.1,
+                'available_capital': 10000
+            })
+            
+            # Generate signal
+            signal = await strategy.generate_signal(
+                symbol=symbol,
+                current_price=current_price,
+                historical_data=historical_data,
+                portfolio_context=portfolio_context
+            )
+            
+            return {
+                "status": "success",
+                "signal": {
+                    "action": signal.action,
+                    "confidence": signal.confidence,
+                    "quantity": signal.quantity,
+                    "reasoning": signal.reasoning,
+                    "timestamp": signal.timestamp.isoformat(),
+                    "short_term_predictions": signal.short_term_predictions,
+                    "long_term_predictions": signal.long_term_predictions,
+                    "uncertainties": signal.uncertainties
+                }
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Strategy signal failed: {str(e)}")
+    
+    async def backtest_strategy(self, request_data: dict, current_user: dict = Depends(get_current_user)):
+        """Backtest the strategy on historical data"""
+        try:
+            from plugins_strategy.prediction_strategy import PredictionBasedStrategy
+            
+            # Initialize strategy
+            strategy = PredictionBasedStrategy()
+            strategy.initialize({}, self._config)
+            
+            # Extract request parameters
+            symbol = request_data.get('symbol', 'EURUSD')
+            start_datetime = request_data.get('start_datetime')
+            end_datetime = request_data.get('end_datetime')
+            historical_data = request_data.get('historical_data', [])
+            
+            if not start_datetime or not end_datetime:
+                raise HTTPException(status_code=400, detail="start_datetime and end_datetime required")
+            
+            # Generate signal for the specific time
+            signal = await strategy.backtest_signal(
+                symbol=symbol,
+                datetime_str=start_datetime,
+                historical_data=historical_data
+            )
+            
+            return {
+                "status": "success",
+                "backtest_result": {
+                    "symbol": symbol,
+                    "datetime": start_datetime,
+                    "signal": {
+                        "action": signal.action,
+                        "confidence": signal.confidence,
+                        "quantity": signal.quantity,
+                        "reasoning": signal.reasoning,
+                        "timestamp": signal.timestamp.isoformat()
+                    }
+                }
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Strategy backtest failed: {str(e)}")
+    
+    async def get_strategy_config(self, current_user: dict = Depends(get_current_user)):
+        """Get current strategy configuration"""
+        try:
+            from plugins_strategy.prediction_strategy import PredictionBasedStrategy
+            
+            # Initialize strategy to get current config
+            strategy = PredictionBasedStrategy()
+            strategy.initialize({}, self._config)
+            
+            return {
+                "status": "success",
+                "strategy_config": strategy.get_strategy_parameters(),
+                "debug_info": strategy.get_debug_info()
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Get strategy config failed: {str(e)}")
+    
+    async def update_strategy_config(self, config_data: dict, current_user: dict = Depends(get_current_user)):
+        """Update strategy configuration"""
+        try:
+            from plugins_strategy.prediction_strategy import PredictionBasedStrategy
+            
+            # Initialize strategy
+            strategy = PredictionBasedStrategy()
+            strategy.initialize({}, self._config)
+            
+            # Update parameters
+            strategy.update_parameters(config_data)
+            
+            # Create audit log
+            audit_log = AuditLog(
+                user_id=1,
+                action="strategy_config_updated",
+                details=f"Strategy configuration updated: {config_data}"
+            )
+            # Note: Would add to DB in real implementation
+            
+            return {
+                "status": "success",
+                "message": "Strategy configuration updated",
+                "new_config": strategy.get_strategy_parameters()
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Update strategy config failed: {str(e)}")
