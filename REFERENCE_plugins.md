@@ -204,7 +204,151 @@ All plugins must have:
 
 ---
 
-## 6. Database Plugin and ORM Integration
+## 6. CSV Data Plugins (Prediction Provider Integration)
+
+### 6.1 CSV Feeder Plugin
+
+#### Objetivo
+Proporciona datos desde archivos CSV con manejo configurable de columnas datetime y filtrado basado en horizonte temporal.
+
+#### Métodos específicos
+- `load_data(horizon_periods=None) -> pandas.DataFrame`: Carga datos del CSV con filtrado temporal opcional
+- `get_ohlc_data(start_time, end_time) -> pandas.DataFrame`: Obtiene datos OHLC para rango temporal específico
+- `validate_data_format() -> bool`: Valida que el CSV tenga el formato esperado
+
+#### Parámetros específicos
+```python
+plugin_params = {
+    "csv_file": "path/to/data.csv",  # Ruta al archivo CSV
+    "datetime_column": "DATE_TIME",  # Nombre de columna datetime
+    "datetime_format": "%Y-%m-%d %H:%M:%S",  # Formato de parsing datetime
+    "horizon_periods": 24,  # Número de períodos a incluir hacia atrás
+    "data_columns": ["OPEN", "HIGH", "LOW", "CLOSE"]  # Columnas OHLC
+}
+```
+
+#### Formato de salida
+Retorna pandas DataFrame con:
+- Índice datetime
+- Columnas OHLC (OPEN, HIGH, LOW, CLOSE)
+- Filtrado a los últimos N períodos según horizon_periods
+
+### 6.2 CSV Predictor Plugin
+
+#### Objetivo
+Genera predicciones ideales de precios de cierre leyendo valores futuros del CSV, simulando predicciones perfectas para backtesting y evaluación de estrategias.
+
+#### Métodos específicos
+- `generate_predictions(current_time, horizons) -> dict`: Genera predicciones para múltiples horizontes
+- `get_future_close_return(current_time, horizon) -> float`: Calcula retorno de cierre futuro para horizonte específico
+- `validate_prediction_availability(current_time, horizons) -> bool`: Verifica disponibilidad de datos futuros
+
+#### Parámetros específicos
+```python
+plugin_params = {
+    "csv_file": "path/to/data.csv",  # Ruta al archivo CSV
+    "datetime_column": "DATE_TIME",  # Nombre de columna datetime
+    "prediction_horizons": ["1h", "1d"],  # Horizontes a predecir
+    "close_column": "CLOSE"  # Nombre de columna de precio de cierre
+}
+```
+
+#### Formato de salida
+```json
+{
+    "predictions": [
+        {
+            "horizon": "1h",
+            "prediction": 0.0025,  # retorno de cierre sobre 1h
+            "timestamp": "2024-01-01T12:00:00Z"
+        },
+        {
+            "horizon": "1d", 
+            "prediction": 0.0150,  # retorno de cierre sobre 1d
+            "timestamp": "2024-01-01T12:00:00Z"
+        }
+    ]
+}
+```
+
+### 6.3 Backtrader Broker Plugin
+
+#### Objetivo
+Integra con el framework backtrader para habilitar backtesting de estrategias con predicciones tanto ideales como reales.
+
+#### Métodos específicos
+- `buy(size, price=None) -> Order`: Ejecuta orden de compra
+- `sell(size, price=None) -> Order`: Ejecuta orden de venta
+- `get_portfolio_value() -> float`: Obtiene valor actual del portfolio
+- `get_cash() -> float`: Obtiene efectivo disponible
+- `get_position(symbol) -> Position`: Obtiene posición actual para símbolo
+- `switch_prediction_source(source_type) -> None`: Cambia entre fuente CSV e API en tiempo de ejecución
+
+#### Parámetros específicos
+```python
+plugin_params = {
+    "initial_cash": 10000.0,  # Capital inicial
+    "commission": 0.001,  # Comisión por operación
+    "prediction_source": "csv",  # "csv" para ideal, "api" para real
+    "csv_file": "path/to/data.csv",  # Archivo CSV para predicciones ideales
+    "api_url": "http://localhost:8001"  # URL del prediction_provider para predicciones reales
+}
+```
+
+#### Puntos de integración
+- Se conecta al servicio prediction_provider para predicciones reales
+- Usa CSV predictor para predicciones ideales
+- Interfaz con API de broker de backtrader
+- Rastrea posiciones, órdenes y valor del portfolio
+
+### 6.4 Flexibilidad y cambio de modos
+
+#### Cambio entre fuentes de datos
+- **Modo CSV**: Lee desde archivos CSV históricos
+- **Modo API**: Se conecta al servicio de predicciones en vivo
+
+#### Cambio entre tipos de predicción
+- **Ideal**: Usa datos futuros del CSV (predicciones perfectas)
+- **Real**: Usa predicciones reales del modelo ML via API
+
+#### Ejemplos de configuración
+
+##### Modo CSV (Predicciones ideales)
+```json
+{
+    "feeder_plugin": "csv_feeder",
+    "feeder_params": {
+        "csv_file": "examples/data/phase_3/base_d6.csv",
+        "datetime_column": "DATE_TIME",
+        "horizon_periods": 168
+    },
+    "predictor_plugin": "csv_predictor",
+    "predictor_params": {
+        "csv_file": "examples/data/phase_3/base_d6.csv",
+        "prediction_horizons": ["1h", "1d"]
+    }
+}
+```
+
+##### Modo API (Predicciones reales)
+```json
+{
+    "feeder_plugin": "api_feeder",
+    "feeder_params": {
+        "api_url": "http://localhost:8001",
+        "symbol": "EURUSD"
+    },
+    "predictor_plugin": "api_predictor", 
+    "predictor_params": {
+        "api_url": "http://localhost:8001",
+        "prediction_horizons": ["1h", "1d"]
+    }
+}
+```
+
+---
+
+## 7. Database Plugin and ORM Integration
 
 All plugins and core modules interact with the database exclusively via SQLAlchemy ORM. The database engine is SQLite by default, but can be swapped for any SQLAlchemy-supported backend. The following tables are required:
 
@@ -257,7 +401,7 @@ All plugin types (AAA, core, pipeline, strategy, broker, portfolio) must use the
 
 ---
 
-## 7. Consideraciones generales
+## 8. Consideraciones generales
     Todas las clases de plugins deben inicializarse obligatoriamente con config: dict para garantizar coherencia con el sistema de configuración global de la aplicación.
     El portfolio_manager debe gestionar todas las instancias de instrumentos activas y ser el punto único de decisión sobre asignación de capital.
     Cada ejecución del daemon LTS debe orquestar el ciclo completo: asignación → predicción → pipeline → estrategia → ejecución en broker, en todos los instrumentos configurados.

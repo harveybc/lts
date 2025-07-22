@@ -27,7 +27,8 @@ setup(
         ],
         # Broker plugins - Connection and execution with brokers
         'plugins_broker': [
-            'default_broker=plugins_broker.default_broker:DefaultBroker'
+            'default_broker=plugins_broker.default_broker:DefaultBroker',
+            'backtrader_broker=plugins_broker.backtrader_broker:BacktraderBroker'
         ],
         # Portfolio plugins - Capital allocation management
         'plugins_portfolio': [
@@ -47,6 +48,7 @@ setup(
         'python-multipart',
         'passlib',
         'python-jose',
+        'backtrader',  # For backtesting and strategy evaluation
         'bcrypt',
         'pydantic',
         'asyncio',

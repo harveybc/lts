@@ -10,6 +10,8 @@ This document details the integration-level design for the LTS project, covering
 - **Configuration Integration**: Multi-source configuration merging and validation
 - **Web API Integration**: FastAPI-based secure endpoints with database operations
 - **Authentication Integration**: AAA plugin integration with web API and database
+- **Prediction Provider Integration**: CSV and API-based prediction workflows
+- **Backtrader Integration**: Strategy backtesting with ideal and real predictions
 
 ### 1.2 Integration Layers
 - **Plugin Layer**: Standardized plugin interfaces and communication protocols
@@ -17,10 +19,59 @@ This document details the integration-level design for the LTS project, covering
 - **Service Layer**: Business logic integration and workflow orchestration
 - **API Layer**: External interface integration and request/response handling
 - **Security Layer**: Authentication, authorization, and audit logging integration
+- **Trading Layer**: Strategy execution with broker and prediction integration
 
-## 2. Integration Requirements
+## 2. CSV Plugin Integration Architecture
 
-### 2.1 Plugin Integration Requirements
+### 2.1 CSV Feeder Integration
+The CSV feeder plugin provides historical data access for backtesting and analysis:
+
+```
+CSV File -> CSV Feeder -> Strategy Plugin -> Backtrader Broker
+                     \                   /
+                      \-> Predictor Plugin
+```
+
+**Integration Points:**
+- **Data Source**: Configurable CSV file paths with OHLC data
+- **DateTime Handling**: Flexible datetime column parsing and timezone support
+- **Horizon Filtering**: Time-based data slicing for strategy requirements
+- **Cache Management**: Efficient data loading and memory management
+
+### 2.2 CSV Predictor Integration
+The CSV predictor plugin generates ideal predictions for strategy evaluation:
+
+```
+CSV File -> CSV Predictor -> Prediction API -> Strategy Plugin
+                         \                  /
+                          \-> Performance Evaluation
+```
+
+**Integration Points:**
+- **Future Data Access**: Read-ahead capability for ideal prediction generation
+- **Multi-Horizon Support**: 1h, 1d, 1w prediction horizons
+- **Return Calculation**: Close-to-close return predictions
+- **API Compatibility**: Standard prediction API format
+
+### 2.3 Backtrader Broker Integration
+The backtrader broker plugin enables strategy backtesting with prediction integration:
+
+```
+Strategy -> Backtrader Broker -> Prediction Source (CSV/API)
+                             \
+                              \-> Portfolio Tracking
+                               \-> Performance Metrics
+```
+
+**Integration Points:**
+- **Prediction Switching**: Runtime switching between CSV (ideal) and API (real) predictions
+- **Order Execution**: Backtrader-compatible broker interface
+- **Portfolio Management**: Position tracking and performance calculation
+- **Metrics Collection**: Trade analytics and prediction usage tracking
+
+## 3. Integration Requirements
+
+### 3.1 Plugin Integration Requirements
 | Int Req ID | Requirement/Scenario | Description | Source |
 |------------|---------------------|-------------|--------|
 | INT-001 | Plugin lifecycle management | All plugins must be loaded, initialized, configured, and managed consistently with proper error handling and resource cleanup. | main.py, plugin_loader.py |
@@ -28,26 +79,28 @@ This document details the integration-level design for the LTS project, covering
 | INT-003 | Plugin configuration integration | Plugin-specific configurations must be properly merged and validated during system initialization. | config_handler.py, main.py |
 | INT-004 | Plugin debug information aggregation | Debug information from all plugins must be collected, aggregated, and made available for system monitoring. | plugin_base.py, plugins/ |
 | INT-005 | Plugin parameter propagation | Plugin parameters must be correctly propagated during configuration merging and runtime updates. | config_merger.py, main.py |
+| INT-006 | CSV plugin data integrity | CSV feeder and predictor plugins must maintain data consistency and handle missing or corrupted data gracefully. | feeder_plugins/, predictor_plugins/ |
+| INT-007 | Prediction source switching | Backtrader broker must support runtime switching between CSV and API prediction sources without losing state. | plugins_broker/backtrader_broker.py |
 
-### 2.2 Database Integration Requirements
+### 3.2 Database Integration Requirements
 | Int Req ID | Requirement/Scenario | Description | Source |
 |------------|---------------------|-------------|--------|
-| INT-006 | Database connection management | Database connections must be properly managed with connection pooling, error handling, and resource cleanup. | database.py, SQLAlchemy |
-| INT-007 | Transaction integrity | All database operations must maintain ACID properties with proper transaction management and rollback capabilities. | database.py, all modules |
-| INT-008 | ORM model integration | All components must use SQLAlchemy ORM models consistently for data access and manipulation. | database.py, web.py, plugins/ |
-| INT-009 | Database schema validation | Database schema must be validated at startup and support migration operations. | database.py, init_db.py |
-| INT-010 | Audit logging integration | All database operations must be integrated with audit logging for compliance and traceability. | database.py, main.py |
+| INT-008 | Database connection management | Database connections must be properly managed with connection pooling, error handling, and resource cleanup. | database.py, SQLAlchemy |
+| INT-009 | Transaction integrity | All database operations must maintain ACID properties with proper transaction management and rollback capabilities. | database.py, all modules |
+| INT-010 | ORM model integration | All components must use SQLAlchemy ORM models consistently for data access and manipulation. | database.py, web.py, plugins/ |
+| INT-011 | Database schema validation | Database schema must be validated at startup and support migration operations. | database.py, init_db.py |
+| INT-012 | Audit logging integration | All database operations must be integrated with audit logging for compliance and traceability. | database.py, main.py |
 
-### 2.3 Web API Integration Requirements
+### 3.3 Web API Integration Requirements
 | Int Req ID | Requirement/Scenario | Description | Source |
 |------------|---------------------|-------------|--------|
-| INT-011 | Authentication integration | Web API endpoints must integrate with AAA plugins for secure authentication and authorization. | web.py, plugins_aaa/ |
-| INT-012 | Request validation and sanitization | All API requests must be validated and sanitized to prevent injection attacks and data corruption. | web.py, FastAPI |
-| INT-013 | Database operation integration | API endpoints must integrate with database operations using proper transaction management. | web.py, database.py |
-| INT-014 | Error handling integration | API error responses must be properly formatted and integrated with system logging. | web.py, main.py |
-| INT-015 | Rate limiting and throttling | API endpoints must implement rate limiting and throttling to prevent abuse and DoS attacks. | web.py, middleware |
+| INT-013 | Authentication integration | Web API endpoints must integrate with AAA plugins for secure authentication and authorization. | web.py, plugins_aaa/ |
+| INT-014 | Request validation and sanitization | All API requests must be validated and sanitized to prevent injection attacks and data corruption. | web.py, FastAPI |
+| INT-015 | Database operation integration | API endpoints must integrate with database operations using proper transaction management. | web.py, database.py |
+| INT-016 | Error handling integration | API error responses must be properly formatted and integrated with system logging. | web.py, main.py |
+| INT-017 | Rate limiting and throttling | API endpoints must implement rate limiting and throttling to prevent abuse and DoS attacks. | web.py, middleware |
 
-### 2.4 Configuration Integration Requirements
+### 3.4 Configuration Integration Requirements
 | Int Req ID | Requirement/Scenario | Description | Source |
 |------------|---------------------|-------------|--------|
 | INT-016 | Multi-source configuration merging | Configuration from multiple sources (defaults, files, CLI, API) must be properly merged and validated. | config_handler.py, config_merger.py |
