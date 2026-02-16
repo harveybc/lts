@@ -20,9 +20,7 @@ from unittest.mock import Mock, patch, MagicMock
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "prediction_provider"))
 
-# Mock backtrader to avoid dependency issues
-sys.modules['backtrader'] = Mock()
-sys.modules['backtrader.brokers'] = Mock()
+# backtrader is installed — no need to mock it
 sys.modules['backtrader.brokers.BackBroker'] = Mock()
 
 class TestCSVWorkflowEndToEnd:
@@ -31,7 +29,7 @@ class TestCSVWorkflowEndToEnd:
     def comprehensive_csv_data(self):
         """Create comprehensive CSV data for end-to-end testing."""
         # Create 2 weeks of hourly data with clear trend and patterns
-        dates = pd.date_range(start='2023-01-01', periods=336, freq='H')
+        dates = pd.date_range(start='2023-01-01', periods=336, freq='h')
         
         # Create predictable pattern: 
         # - Upward trend over 2 weeks

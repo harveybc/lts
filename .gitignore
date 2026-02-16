@@ -138,3 +138,5 @@ logs/
 # Others
 secrets.py
 credentials.ini
+*.pyc
+*.db

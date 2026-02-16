@@ -56,11 +56,9 @@ class BacktraderBroker(bt.brokers.BackBroker):
             self.config.update(config)
         
         # Initialize base backtrader broker
-        super().__init__(
-            cash=self.config["initial_cash"],
-            commission=bt.CommInfoBase(commission=self.config["commission"]),
-            **kwargs
-        )
+        super().__init__(**kwargs)
+        self.setcash(self.config["initial_cash"])
+        self.setcommission(commission=self.config["commission"])
         
         # Prediction source setup
         self.prediction_source = self.config["prediction_source"]

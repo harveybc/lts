@@ -14,17 +14,14 @@ from unittest.mock import Mock, patch, MagicMock
 # Add the lts path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# Mock backtrader imports to avoid dependency issues in tests
-sys.modules['backtrader'] = Mock()
-sys.modules['backtrader.brokers'] = Mock()
-sys.modules['backtrader.brokers.BackBroker'] = Mock()
+# backtrader is installed — no need to mock it
 
 class TestBacktraderBroker:
     
     @pytest.fixture
     def sample_csv_data(self):
         """Create sample CSV data for testing."""
-        dates = pd.date_range(start='2023-01-01', periods=100, freq='H')
+        dates = pd.date_range(start='2023-01-01', periods=100, freq='h')
         closes = 1.1000 + np.random.normal(0, 0.001, 100).cumsum() * 0.01
         
         data = {
