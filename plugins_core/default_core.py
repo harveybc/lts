@@ -7,6 +7,9 @@ This plugin is responsible for:
 3. Coordinating all other plugins
 """
 
+import os as _os
+_QUIET = _os.environ.get('LTS_QUIET', '0') == '1'
+
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Request, FastAPI
 from fastapi.responses import JSONResponse
@@ -84,6 +87,9 @@ class PluginConfigAcceptance(BaseModel):
     parameters: dict
 
 class CorePlugin(PluginBase):
+    # Expose get_db as a class-level attribute for dependency override in tests
+    get_db = staticmethod(get_db)
+
     def __init__(self):
         super().__init__()
         self.name = "Core"
@@ -1006,3 +1012,18 @@ class CorePlugin(PluginBase):
             
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Update strategy config failed: {str(e)}")
+
+
+# Module-level singleton instance
+core_plugin_instance = CorePlugin()
+
+
+def create_app():
+    """Factory function to create a FastAPI application with the core plugin routes."""
+    app = FastAPI()
+    app.include_router(core_plugin_instance.router)
+    # Add security headers middleware
+    app.add_middleware(BaseHTTPMiddleware, dispatch=core_plugin_instance.add_security_headers)
+    # Add 500 error handler
+    app.add_exception_handler(500, core_plugin_instance.handle_500_error)
+    return app

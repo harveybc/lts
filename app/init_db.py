@@ -9,6 +9,9 @@ This script creates the database tables and sets up initial data.
 :license: MIT
 """
 
+import os as _os
+_QUIET = _os.environ.get('LTS_QUIET', '0') == '1'
+
 import sys
 import os
 
@@ -39,11 +42,11 @@ def create_default_admin():
             )
             db.add(admin_user)
             db.commit()
-            print("Default admin user created (username: admin, password: admin123)")
+            if not _QUIET: print("Default admin user created (username: admin, password: admin123)")
         else:
-            print("Admin user already exists")
+            if not _QUIET: print("Admin user already exists")
     except Exception as e:
-        print(f"Error creating admin user: {e}")
+        if not _QUIET: print(f"Error creating admin user: {e}")
         db.rollback()
     finally:
         db.close()
@@ -153,13 +156,13 @@ def create_sample_portfolios():
                     db.add(asset)
                 
                 db.commit()
-                print("Sample portfolio and assets created")
+                if not _QUIET: print("Sample portfolio and assets created")
             else:
-                print("Admin user not found, skipping sample portfolio creation")
+                if not _QUIET: print("Admin user not found, skipping sample portfolio creation")
         else:
-            print("Sample portfolio already exists")
+            if not _QUIET: print("Sample portfolio already exists")
     except Exception as e:
-        print(f"Error creating sample portfolios: {e}")
+        if not _QUIET: print(f"Error creating sample portfolios: {e}")
         db.rollback()
     finally:
         db.close()
@@ -191,16 +194,16 @@ def create_default_config():
                 db.add(config_entry)
         
         db.commit()
-        print("Default configuration entries created")
+        if not _QUIET: print("Default configuration entries created")
     except Exception as e:
-        print(f"Error creating default config: {e}")
+        if not _QUIET: print(f"Error creating default config: {e}")
         db.rollback()
     finally:
         db.close()
 
 def main():
     """Initialize the database"""
-    print("Initializing LTS Database...")
+    if not _QUIET: print("Initializing LTS Database...")
     
     # Create tables
     init_db()
@@ -214,7 +217,7 @@ def main():
     # Create sample portfolios
     create_sample_portfolios()
     
-    print("Database initialization completed successfully!")
+    if not _QUIET: print("Database initialization completed successfully!")
 
 if __name__ == "__main__":
     main()

@@ -4,6 +4,9 @@
 Config handler: loads/merges config from CLI, file, remote, with precedence and integrity checks.
 """
 
+import os as _os
+_QUIET = _os.environ.get('LTS_QUIET', '0') == '1'
+
 import json
 import hashlib
 import sys
@@ -113,7 +116,7 @@ def compose_config(config):
                 config_to_save[k] = v
     
     # prints config_to_save
-    print(f"Actual config_to_save: {config_to_save}")
+    if not _QUIET: print(f"Actual config_to_save: {config_to_save}")
     return config_to_save
 
 def save_config(config, path='config_out.json'):
@@ -138,7 +141,7 @@ def remote_save_config(config, url, username, password):
         response.raise_for_status()
         return True
     except requests.RequestException as e:
-        print(f"Failed to save remote configuration: {e}", file=sys.stderr)
+        if not _QUIET: print(f"Failed to save remote configuration: {e}", file=sys.stderr)
         return False
     
 def remote_load_config(url, username=None, password=None):
@@ -151,7 +154,7 @@ def remote_load_config(url, username=None, password=None):
         config = response.json()
         return config
     except requests.RequestException as e:
-        print(f"Failed to load remote configuration: {e}", file=sys.stderr)
+        if not _QUIET: print(f"Failed to load remote configuration: {e}", file=sys.stderr)
         return None
 
 def remote_log(config, debug_info, url, username, password):
@@ -169,5 +172,5 @@ def remote_log(config, debug_info, url, username, password):
         response.raise_for_status()
         return True
     except requests.RequestException as e:
-        print(f"Failed to log remote information: {e}", file=sys.stderr)
+        if not _QUIET: print(f"Failed to log remote information: {e}", file=sys.stderr)
         return False

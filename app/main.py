@@ -21,6 +21,32 @@ import logging
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# ---------------------------------------------------------------------------
+# Quiet mode: suppress verbose output when LTS_QUIET=1
+# Only allows ERROR/WARN/final-metric lines through.
+# ---------------------------------------------------------------------------
+import builtins as _builtins
+_original_print = _builtins.print
+
+def _quiet_print(*args, **kwargs):
+    """Filtered print that only passes through important messages."""
+    if args:
+        msg = str(args[0])
+        _pass = any(kw in msg.upper() for kw in [
+            'ERROR', 'WARN', 'EXCEPTION', 'TRACEBACK', 'FATAL',
+            'FINAL', 'BEST VAL', 'TEST MAE', 'VAL MAE', 'RESULT',
+            'IMPROVEMENT', 'VERDICT', 'SUMMARY',
+        ])
+        if _pass:
+            _original_print(*args, **kwargs)
+        return
+    _original_print(*args, **kwargs)
+
+if os.environ.get('LTS_QUIET', '0') == '1':
+    _builtins.print = _quiet_print
+    # Also suppress verbose logging
+    logging.basicConfig(level=logging.WARNING)
+
 from app.config_handler import load_config
 from app.cli import parse_args
 from app.config import DEFAULT_VALUES

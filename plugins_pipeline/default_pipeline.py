@@ -2,6 +2,9 @@
 Default Pipeline plugin for LTS.
 Orchestrates the execution of all plugins and manages the main trading loop.
 """
+import os as _os
+_QUIET = _os.environ.get('LTS_QUIET', '0') == '1'
+
 from app.plugin_base import PipelinePluginBase
 from app.database import SessionLocal, User, Portfolio, Asset, Order, Statistics
 from datetime import datetime, timezone, timedelta
@@ -52,11 +55,11 @@ class PipelinePlugin(PipelinePluginBase):
         # Start the core plugin first
         core_plugin = self.plugins.get('core')
         if core_plugin:
-            print("Pipeline: Starting Core Plugin...")
+            if not _QUIET: print("Pipeline: Starting Core Plugin...")
             core_plugin.set_plugins(self.plugins)
             core_plugin.start()
         else:
-            print("Pipeline: Error - Core plugin not found")
+            if not _QUIET: print("Pipeline: Error - Core plugin not found")
             
     def run(self, portfolio_id: int = None, assets: list = None) -> dict:
         """Execute trading logic for portfolios"""
@@ -90,7 +93,7 @@ class PipelinePlugin(PipelinePluginBase):
                 except Exception as e:
                     error_msg = f"Error executing portfolio {portfolio.id}: {str(e)}"
                     execution_results["errors"].append(error_msg)
-                    print(f"Pipeline: {error_msg}")
+                    if not _QUIET: print(f"Pipeline: {error_msg}")
             
             # Record statistics
             if self.params["statistics_enabled"]:
@@ -99,7 +102,7 @@ class PipelinePlugin(PipelinePluginBase):
             return execution_results
             
         except Exception as e:
-            print(f"Pipeline: Critical error in run(): {str(e)}")
+            if not _QUIET: print(f"Pipeline: Critical error in run(): {str(e)}")
             return {"error": str(e), "timestamp": datetime.now(timezone.utc)}
 
     def _should_execute_portfolio(self, portfolio: Portfolio) -> bool:
@@ -145,12 +148,12 @@ class PipelinePlugin(PipelinePluginBase):
                 except Exception as e:
                     error_msg = f"Error executing asset {asset.id}: {str(e)}"
                     result["errors"].append(error_msg)
-                    print(f"Pipeline: {error_msg}")
+                    if not _QUIET: print(f"Pipeline: {error_msg}")
             
             return result
             
         except Exception as e:
-            print(f"Pipeline: Error in _execute_portfolio(): {str(e)}")
+            if not _QUIET: print(f"Pipeline: Error in _execute_portfolio(): {str(e)}")
             return {"error": str(e), "portfolio_id": portfolio.id}
 
     def _execute_asset(self, asset: Asset, portfolio: Portfolio) -> dict:
@@ -240,7 +243,7 @@ class PipelinePlugin(PipelinePluginBase):
             return result
             
         except Exception as e:
-            print(f"Pipeline: Error in _execute_asset(): {str(e)}")
+            if not _QUIET: print(f"Pipeline: Error in _execute_asset(): {str(e)}")
             return {"error": str(e), "asset_id": asset.id}
 
     def _record_statistics(self, execution_results: dict):
@@ -263,4 +266,4 @@ class PipelinePlugin(PipelinePluginBase):
             self.db.commit()
             
         except Exception as e:
-            print(f"Pipeline: Error recording statistics: {str(e)}")
+            if not _QUIET: print(f"Pipeline: Error recording statistics: {str(e)}")

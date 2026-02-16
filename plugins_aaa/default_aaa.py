@@ -2,6 +2,9 @@
 Default AAA (Authentication, Authorization, Accounting) plugin for LTS.
 Implements user authentication, role management, and audit logging.
 """
+import os as _os
+_QUIET = _os.environ.get('LTS_QUIET', '0') == '1'
+
 from app.plugin_base import AAAPluginBase
 from app.database import SyncSessionLocal as SessionLocal, User, Session, AuditLog
 from datetime import datetime, timezone, timedelta
@@ -83,7 +86,7 @@ class DefaultAAA(AAAPluginBase):
             
         except Exception as e:
             self.db.rollback()
-            print(f"Registration error: {e}")
+            if not _QUIET: print(f"Registration error: {e}")
             return False
 
     def authorize_user(self, user_roles: list, required_role: str) -> bool:
@@ -110,7 +113,7 @@ class DefaultAAA(AAAPluginBase):
             self.db.commit()
         except Exception as e:
             self.db.rollback()
-            print(f"Audit log error: {e}")
+            if not _QUIET: print(f"Audit log error: {e}")
 
     def login(self, username: str, password: str) -> dict:
         """Authenticate user and create session"""
@@ -148,7 +151,7 @@ class DefaultAAA(AAAPluginBase):
             
         except Exception as e:
             self.db.rollback()
-            print(f"Login error: {e}")
+            if not _QUIET: print(f"Login error: {e}")
             return {"success": False, "message": "An error occurred"}
 
     def assign_role(self, username: str, role: str) -> bool:
@@ -169,7 +172,7 @@ class DefaultAAA(AAAPluginBase):
             
         except Exception as e:
             self.db.rollback()
-            print(f"Role assignment error: {e}")
+            if not _QUIET: print(f"Role assignment error: {e}")
             return False
 
     def create_session(self, user_id: int) -> str:
@@ -194,7 +197,7 @@ class DefaultAAA(AAAPluginBase):
             
         except Exception as e:
             self.db.rollback()
-            print(f"Session creation error: {e}")
+            if not _QUIET: print(f"Session creation error: {e}")
             return None
 
     def validate_session(self, token: str) -> dict:
@@ -218,7 +221,7 @@ class DefaultAAA(AAAPluginBase):
             }
             
         except Exception as e:
-            print(f"Session validation error: {e}")
+            if not _QUIET: print(f"Session validation error: {e}")
             return {"valid": False, "message": "Validation failed"}
 
     def authenticate(self, username, password):

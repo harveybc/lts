@@ -5,6 +5,9 @@ This is a dummy strategy plugin for testing purposes that alternates between
 opening and closing orders based on the current position status.
 """
 
+import os as _os
+_QUIET = _os.environ.get('LTS_QUIET', '0') == '1'
+
 from app.plugin_base import PluginBase
 from app.database import SyncSessionLocal as SessionLocal, Order, Position
 import random
@@ -100,7 +103,7 @@ class DefaultStrategy(PluginBase):
                 }
                 
         except Exception as e:
-            print(f"Error in strategy processing: {e}")
+            if not _QUIET: print(f"Error in strategy processing: {e}")
             return {
                 "action": "none",
                 "parameters": {},

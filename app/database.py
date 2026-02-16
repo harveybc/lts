@@ -11,6 +11,9 @@ The system is portfolio-centric where:
 - Assets have strategy/broker/pipeline plugins and JSON configs
 - Orders and positions track trading activity
 """
+import os as _os
+_QUIET = _os.environ.get('LTS_QUIET', '0') == '1'
+
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text, JSON, Numeric, text
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -277,4 +280,4 @@ def get_db():
 def init_db():
     """Initialize the database with tables"""
     create_tables()
-    print("Database initialized with complete LTS schema")
+    if not _QUIET: print("Database initialized with complete LTS schema")
