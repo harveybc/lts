@@ -140,3 +140,7 @@ secrets.py
 credentials.ini
 *.pyc
 *.db
+*.db-wal
+*.db-shm
+*.keras
+node_modules/
