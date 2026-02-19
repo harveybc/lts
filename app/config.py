@@ -15,7 +15,7 @@ DEFAULT_VALUES = {
     "load_config": None,
     "quiet_mode": False,
     "debug_mode": False,
-    "log_level": "INFO",
+    "log_level": "WARNING",
     
     # Core Plugin Configuration
     "core_plugin": "default_core",
