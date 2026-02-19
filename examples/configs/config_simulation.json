@@ -1,0 +1,58 @@
+{
+    "_comment": "LTS Configuration — Backtesting with BacktraderSimulationBroker",
+    "_comment2": "Simulates forex trading with realistic costs on historical CSV data",
+
+    "quiet_mode": false,
+    "debug_mode": false,
+    "log_level": "INFO",
+
+    "core_plugin": "default_core",
+    "aaa_plugin": "default_aaa",
+    "pipeline_plugin": "default_pipeline",
+    "strategy_plugin": "default_strategy",
+    "broker_plugin": "backtrader_simulation_broker",
+    "portfolio_plugin": "default_portfolio",
+
+    "global_latency": 1,
+    "api_host": "0.0.0.0",
+    "api_port": 8000,
+    "enable_api": true,
+
+    "database_url": "sqlite:///./lts_trading.db",
+
+    "default_position_size": 0.02,
+    "default_max_open_positions": 1,
+    "default_stop_loss": 0.0080,
+    "default_take_profit": 0.0100,
+    "default_trailing_stop": 0.0050,
+
+    "_broker_comment": "BacktraderSimulationBroker parameters — stored per-asset in assets.broker_config",
+    "_broker_config_example": {
+        "initial_cash": 10000.0,
+        "leverage": 100,
+        "spread_pips": 2.0,
+        "commission_per_lot": 7.0,
+        "slippage_pips": 1.0,
+        "swap_per_lot_day": 10.0,
+        "pip_value": 0.0001,
+        "lot_size": 100000,
+        "instrument": "EUR_USD",
+        "csv_file": "examples/data/phase_3/base_d6.csv",
+        "datetime_column": "DATE_TIME",
+        "datetime_format": "%Y-%m-%d %H:%M:%S",
+        "open_col": "OPEN",
+        "high_col": "HIGH",
+        "low_col": "LOW",
+        "close_col": "CLOSE"
+    },
+
+    "_strategy_comment": "DefaultStrategy parameters — stored per-asset in assets.strategy_config",
+    "_strategy_config_example": {
+        "position_size": 0.02,
+        "max_risk_per_trade": 0.02,
+        "prediction_threshold": 0.6,
+        "stop_loss_pips": 80,
+        "take_profit_pips": 100,
+        "order_type": "market"
+    }
+}

@@ -1,409 +1,485 @@
-# REFERENCE_plugins.md
-**LTS (Live Trading System) - Detailed Plugin Design Document**
+# LTS Plugin Reference
 
-Este documento describe de forma extensa, precisa y estructurada los **tipos de plugins requeridos en el sistema LTS**, especificando para cada tipo de plugin su funcionalidad exacta, los métodos clave y los parámetros que debe manejar. Todas las clases de plugins deben heredar de `BasePlugin` y seguir la estructura exacta definida.
+This document provides the complete interface specification and usage guide for all LTS plugin types.
 
 ---
 
 ## Plugin Base Structure
 
-All plugins must inherit from `BasePlugin` and follow this exact structure:
+All plugins inherit from `PluginBase` (defined in `app/plugin_base.py`) and **must** follow this exact structure:
 
 ```python
-from app.plugin_base import BasePlugin
+from app.plugin_base import PluginBase
 
-class PluginName(BasePlugin):
+class MyPlugin(PluginBase):
     plugin_params = {
-        # Plugin-specific parameters with default values
+        "param1": "default_value",
+        "param2": 42,
     }
-    plugin_debug_vars = ["param1", "param2"]  # Parameters to include in debug info
-    
+    plugin_debug_vars = ["param1", "param2"]
+
     def __init__(self, config=None):
         super().__init__(config)
         # Plugin-specific initialization
-    
-    # Plugin-specific methods
-    def main_method(self, parameters):
-        # Main plugin functionality
-        pass
+
+    def set_params(self, **kwargs):
+        super().set_params(**kwargs)
+
+    def get_debug_info(self):
+        return super().get_debug_info()
+
+    def add_debug_info(self, debug_info):
+        super().add_debug_info(debug_info)
 ```
+
+### Required Attributes
+
+| Attribute | Type | Description |
+|---|---|---|
+| `plugin_params` | `dict` | Default parameter values. Keys become configurable parameters. |
+| `plugin_debug_vars` | `list[str]` | Parameter names to include in debug info export. |
+
+### Required Methods
+
+| Method | Description |
+|---|---|
+| `__init__(self, config=None)` | Initialize with optional config dict. Must call `super().__init__(config)`. |
+| `set_params(self, **kwargs)` | Update parameters. Must call `super().set_params(**kwargs)`. |
+| `get_debug_info(self)` | Return dict of debug variable values. |
+| `add_debug_info(self, debug_info)` | Merge debug info into provided dict. |
+
+### Plugin Registration
+
+Plugins are registered via entry points in `setup.py`:
+
+```python
+entry_points={
+    'plugins_broker': [
+        'my_broker=plugins_broker.my_broker:MyBrokerPlugin',
+    ],
+}
+```
+
+After adding an entry point, reinstall: `pip install -e .`
+
+### Plugin Loading
+
+Plugins are loaded dynamically by `app/plugin_loader.py`:
+
+```python
+from app.plugin_loader import load_plugin
+plugin_class, required_params = load_plugin('plugins_broker', 'oanda_broker')
+instance = plugin_class(config)
+```
+
+### Configuration
+
+Each plugin receives configuration through:
+1. `plugin_params` — built-in defaults (lowest priority)
+2. File config — loaded via `--load_config`
+3. CLI arguments — highest priority
+
+The `config_merger.py` handles the merge: `plugin_params < DEFAULT_VALUES < file_config < CLI_args`.
 
 ---
 
-## 1. AAA (Authentication, Authorization, Accounting) Plugins
+## 1. AAA Plugins
 
-### 1.1 Objetivo
-Proporcionan autenticación, autorización y contabilidad (auditoría) para todo el sistema.
+**Base class**: `AAAPluginBase` (inherits `PluginBase`)
 
-### 1.2 Métodos específicos
-- `authenticate(username, password) -> dict`: Autentica usuario y devuelve token
-- `authorize(token, action) -> bool`: Verifica si el token tiene autorización para la acción
-- `audit_log(user_id, action, details) -> None`: Registra acción en audit log
+### Interface
 
-### 1.3 Parámetros relevantes
-- `session_timeout`: Tiempo de vida de sesión en minutos
-- `max_login_attempts`: Intentos máximos de login antes de bloqueo
-- `token_secret`: Secreto para generar tokens JWT
+```python
+class AAAPluginBase(PluginBase):
+    def register(self, username: str, email: str, password: str, role: str) -> bool: ...
+    def login(self, username: str, password: str) -> dict: ...
+    def assign_role(self, username: str, role: str) -> bool: ...
+    def audit(self, user_id: int, action: str, details: str = None) -> None: ...
+    def create_session(self, user_id: int) -> str: ...
+```
+
+### Available Plugin: `default_aaa`
+
+**File**: `plugins_aaa/default_aaa.py`  
+**Class**: `DefaultAAA`
+
+**Parameters**:
+| Parameter | Default | Description |
+|---|---|---|
+| `session_timeout_hours` | `24` | Session lifetime in hours |
+| `password_min_length` | `8` | Minimum password length |
+| `max_login_attempts` | `5` | Failed attempts before lockout |
+| `lockout_duration_minutes` | `30` | Lockout duration |
+| `audit_enabled` | `True` | Enable audit logging |
+| `default_role` | `"user"` | Role for new registrations |
+| `admin_role` | `"admin"` | Admin role name |
+| `token_length` | `32` | Session token length |
+| `jwt_secret` | env `LTS_JWT_SECRET` | JWT signing secret |
+| `jwt_algorithm` | `"HS256"` | JWT algorithm |
+| `jwt_access_expire_minutes` | `30` | Access token lifetime |
+| `jwt_refresh_expire_days` | `7` | Refresh token lifetime |
+| `password_require_uppercase` | `True` | Require uppercase in password |
+| `password_require_digit` | `True` | Require digit in password |
+| `google_client_id` | env `LTS_GOOGLE_CLIENT_ID` | Google OAuth client ID |
+| `google_client_secret` | env `LTS_GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
+
+**Key methods**:
+- `register(username, email, password, role)` → `bool` — Creates user with bcrypt-hashed password
+- `login(username, password, ip=None)` → `dict` — Returns `{success, access_token, refresh_token, session_token, user_id, role}`
+- `google_oauth_login(id_token_data)` → `dict` — OAuth login, auto-creates user if needed
+- `validate_jwt(token)` → `dict` — Validates JWT, returns `{valid, user_id, username, role}`
+- `refresh_access_token(refresh_token)` → `dict` — Returns new access token
+- `authorize_user(user_roles, required_role)` → `bool`
+- `audit_action(user_id, action, details)` — Logs to `audit_logs` table
 
 ---
 
 ## 2. Core Plugins
 
-### 2.1 Objetivo
-Ejecutan el bucle principal del sistema de trading y manejan el servidor API.
+**Base class**: `CorePluginBase` (inherits `PluginBase`)
 
-### 2.2 Métodos específicos
-- `start() -> None`: Inicia el servidor API y el bucle principal
-- `stop() -> None`: Detiene el servidor y limpia recursos
-- `execute_trading_loop() -> None`: Ejecuta un ciclo completo de trading
+### Interface
 
-### 2.3 Parámetros relevantes
-- `global_latency`: Minutos entre ejecuciones del bucle principal
-- `api_host`: Host del servidor API
-- `api_port`: Puerto del servidor API
+```python
+class CorePluginBase(PluginBase):
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+    def set_plugins(self, plugins: dict) -> None: ...
+```
+
+### Available Plugin: `default_core`
+
+**File**: `plugins_core/default_core.py`  
+**Class**: `CorePlugin`
+
+Responsibilities:
+- Creates FastAPI application with all API routes
+- Manages plugin references
+- Provides REST endpoints for portfolios, assets, orders, users, strategies, predictions
+- Adds security middleware (headers, request size limits)
+- Failure simulation endpoints for testing
+
+**Key methods**:
+- `initialize(plugins, config, database, get_db)` — Set up plugin references and database
+- `create_app()` — Factory function returning configured FastAPI app
 
 ---
 
 ## 3. Pipeline Plugins
 
-### 3.1 Objetivo
-Orquestan el flujo de trading para cada portfolio, coordinando strategy, broker y portfolio plugins.
+**Base class**: `PipelinePluginBase` (inherits `PluginBase`)
 
-### 3.2 Métodos específicos
-- `execute_portfolio(portfolio, assets) -> None`: Ejecuta el pipeline completo para un portfolio
-- `process_asset(asset, strategy_plugin, broker_plugin) -> dict`: Procesa un asset individual
+### Interface
 
-### 3.3 Parámetros relevantes
-- `max_parallel_assets`: Máximo número de assets procesados en paralelo
-- `error_retry_count`: Número de reintentos en caso de error
+```python
+class PipelinePluginBase(PluginBase):
+    def run(self, portfolio_id: int, assets: list) -> dict: ...
+    def start(self, plugins: dict) -> None: ...
+```
+
+### Available Plugin: `default_pipeline`
+
+**File**: `plugins_pipeline/default_pipeline.py`  
+**Class**: `PipelinePlugin`
+
+**Parameters**:
+| Parameter | Default | Description |
+|---|---|---|
+| `global_latency` | `5` | Minutes between execution cycles |
+| `max_concurrent_portfolios` | `10` | Max portfolios per cycle |
+| `execution_timeout` | `300` | Seconds timeout per execution |
+| `error_retry_count` | `3` | Retries on error |
+| `error_retry_delay` | `60` | Seconds between retries |
+| `statistics_enabled` | `True` | Record execution statistics |
+
+**Execution flow**:
+1. `start(plugins)` — Stores plugin references, starts Core Plugin
+2. `run()` — Iterates active portfolios, checks latency, executes each
+3. `_execute_portfolio(portfolio)` — Runs portfolio allocation, then each asset
+4. `_execute_asset(asset, portfolio)` — Strategy decides → Broker executes → DB records
 
 ---
 
 ## 4. Strategy Plugins
 
-### 4.1 Objetivo
-Implementan la lógica de decisión de trading basada en predicciones y datos de mercado.
+**Base class**: `StrategyPluginBase` (inherits `PluginBase`)
 
-### 4.2 Métodos específicos
-- `process(asset, market_data, predictions) -> dict`: Procesa datos y devuelve acción de trading
+### Interface
 
-### 4.3 Retorno del método process
 ```python
-{
-    "action": "open" | "close" | "none",
-    "parameters": {
-        "order_type": "market" | "limit",
-        "side": "buy" | "sell",
-        "quantity": float,
-        "price": float,  # Para órdenes limit
-        "stop_loss": float,
-        "take_profit": float
-    }
-}
+class StrategyPluginBase(PluginBase):
+    def decide(self, asset_data: dict, market_data: dict) -> dict: ...
 ```
 
-### 4.4 Parámetros relevantes
-- `position_size`: Tamaño base de posición
-- `max_risk_per_trade`: Riesgo máximo por operación
-- `prediction_threshold`: Umbral de predicción para abrir posiciones
+### Available Plugin: `default_strategy`
+
+**File**: `plugins_strategy/default_strategy.py`  
+**Class**: `DefaultStrategy`
+
+A dummy strategy that alternates buy/sell orders. Used for testing.
+
+**Parameters**:
+| Parameter | Default | Description |
+|---|---|---|
+| `position_size` | `0.02` | Position size (fraction of capital) |
+| `max_risk_per_trade` | `0.02` | Max risk per trade |
+| `prediction_threshold` | `0.6` | Signal confidence threshold |
+| `stop_loss_pips` | `80` | Stop loss in pips |
+| `take_profit_pips` | `100` | Take profit in pips |
+| `order_type` | `"market"` | Order type |
+
+**Returns**: `{"action": "open"|"close"|"none", "parameters": {...}}`
+
+### Available Plugin: `prediction_strategy`
+
+**File**: `plugins_strategy/prediction_strategy.py`  
+**Class**: `PredictionBasedStrategy`
+
+ML prediction-based strategy using `PredictionProviderClient`.
+
+**Parameters**:
+| Parameter | Default | Description |
+|---|---|---|
+| `short_term_weight` | `0.6` | Weight for short-term (1-6h) predictions |
+| `long_term_weight` | `0.4` | Weight for long-term (1-6d) predictions |
+| `confidence_threshold` | `0.7` | Minimum confidence to trade |
+| `uncertainty_threshold` | `0.05` | Maximum allowed prediction uncertainty |
+| `position_size_base` | `0.02` | Base position size |
+| `trend_alignment_required` | `True` | Require short+long term trend agreement |
+
+**Key methods**:
+- `async generate_signal(symbol, current_price, historical_data, portfolio_context)` → `TradingSignal`
+- `async backtest_signal(symbol, datetime_str, historical_data)` → `TradingSignal`
+- `get_strategy_parameters()` → `dict`
+- `update_parameters(new_params)` — Runtime parameter update
+
+**TradingSignal dataclass**:
+```python
+@dataclass
+class TradingSignal:
+    action: str          # 'buy', 'sell', 'hold'
+    confidence: float    # 0.0 to 1.0
+    quantity: float
+    reasoning: str
+    timestamp: datetime
+    short_term_predictions: List[float]
+    long_term_predictions: List[float]
+    uncertainties: Dict[str, List[float]]
+```
 
 ---
 
 ## 5. Broker Plugins
 
-### 5.1 Objetivo
-Manejan la comunicación con brokers para ejecutar órdenes.
+**Base class**: `BrokerPluginBase` (inherits `PluginBase`)
 
-### 5.2 Métodos específicos
-- `execute(action, parameters) -> dict`: Ejecuta la acción de trading con el broker
+### Interface
 
-### 5.3 Retorno del método execute
 ```python
-{
-    "success": bool,
-    "broker_order_id": str,
-    "broker_response": dict,
-    "error_message": str  # Si success=False
-}
+class BrokerPluginBase(PluginBase):
+    def open_order(self, order_params: dict) -> dict: ...
+    def modify_order(self, order_id: str, new_params: dict) -> dict: ...
+    def close_order(self, order_id: str) -> dict: ...
+    def get_open_orders(self) -> list: ...
 ```
 
-### 5.4 Parámetros relevantes
-- `broker_api_url`: URL del API del broker
-- `api_key`: Clave de API del broker
-- `account_id`: ID de cuenta del broker
-- `timeout`: Timeout para requests al broker
+All broker plugins also implement a compatibility method:
+```python
+def execute_order(self, action: str, parameters: dict) -> dict:
+    # action: "open" or "close"
+    # Delegates to open_order/close_order
+```
+
+### Available Plugin: `default_broker`
+
+**File**: `plugins_broker/default_broker.py`  
+**Class**: `DefaultBroker`
+
+Simulated broker for testing. 95% success rate on opens, 98% on closes.
+
+**Parameters**:
+| Parameter | Default | Description |
+|---|---|---|
+| `broker_api_url` | `"https://api.oanda.com/v3"` | (unused in simulation) |
+| `api_key` | `"dummy_api_key"` | (unused) |
+| `account_id` | `"dummy_account"` | Account identifier |
+| `timeout` | `30` | Request timeout |
+| `spread` | `0.0002` | Bid-ask spread |
+| `execution_delay` | `0.1` | Simulated delay |
+
+### Available Plugin: `backtrader_simulation_broker`
+
+**File**: `plugins_broker/backtrader_simulation_broker.py`  
+**Class**: `BacktraderSimulationBroker`
+
+Standalone simulation with realistic forex costs. **Does not require backtrader cerebro**.
+
+**Parameters**:
+| Parameter | Default | Description |
+|---|---|---|
+| `initial_cash` | `10000.0` | Starting capital |
+| `leverage` | `100` | Leverage ratio |
+| `spread_pips` | `2.0` | Spread in pips |
+| `commission_per_lot` | `7.0` | USD round-turn commission per lot |
+| `slippage_pips` | `1.0` | Slippage in pips |
+| `swap_per_lot_day` | `10.0` | Overnight swap USD/lot/day |
+| `pip_value` | `0.0001` | Pip value (EUR/USD style) |
+| `lot_size` | `100000` | Standard lot size |
+| `instrument` | `"EUR_USD"` | Default instrument |
+| `csv_file` | `""` | Path to OHLC CSV |
+| `datetime_column` | `"DATE_TIME"` | CSV datetime column name |
+| `datetime_format` | `"%Y-%m-%d %H:%M:%S"` | Datetime parse format |
+| `open_col` / `high_col` / `low_col` / `close_col` | `"OPEN"` etc. | CSV column names |
+
+**Key methods**:
+- `load_csv(path)` — Load OHLC data
+- `open_order(instrument, direction, volume, tp, sl, price, timestamp)` → `dict`
+- `close_order(order_id, price, reason, timestamp)` → `dict`
+- `tick(bar_index)` — Advance one bar, check TP/SL
+- `run_simulation(strategy_fn)` — Full backtest loop, returns performance summary
+- `get_account_summary()` → `{balance, equity, margin, unrealized_pnl}`
+- `get_trade_history(count)` → list of closed trades
+
+### Available Plugin: `backtrader_broker`
+
+**File**: `plugins_broker/backtrader_broker.py`  
+**Class**: `BacktraderBroker`
+
+Extends `backtrader.brokers.BackBroker`. Requires backtrader cerebro environment.
+
+**Parameters**:
+| Parameter | Default | Description |
+|---|---|---|
+| `initial_cash` | `10000.0` | Starting capital |
+| `commission` | `0.001` | Commission rate |
+| `prediction_source` | `"csv"` | `"csv"` or `"api"` |
+| `csv_file` | `"examples/data/phase_3/base_d6.csv"` | CSV for ideal predictions |
+| `api_url` | `"http://localhost:8001"` | Prediction API URL |
+| `prediction_horizons` | `["1h", "1d"]` | Prediction horizons |
+| `symbol` | `"EURUSD"` | Trading symbol |
+| `slippage` | `0.0001` | Slippage value |
+
+**Key methods**:
+- `get_predictions(timestamp, symbol)` → predictions from CSV or API
+- `switch_prediction_source(new_source, config_updates)` — Runtime source switch
+- `get_performance_metrics()` → full performance report
+- `get_broker_info()` → broker state
+
+### Available Plugin: `oanda_broker`
+
+**File**: `plugins_broker/oanda_broker.py`  
+**Class**: `OandaBroker`
+
+Live/practice broker via OANDA v20 REST API (`oandapyV20`).
+
+**Parameters**:
+| Parameter | Default | Description |
+|---|---|---|
+| `account_id` | `""` | OANDA account ID |
+| `access_token` | `""` | OANDA API token |
+| `environment` | `"practice"` | `"practice"` or `"live"` |
+| `instrument` | `"EUR_USD"` | Default instrument |
+| `max_retries` | `3` | Request retry count |
+| `retry_backoff` | `1.0` | Initial backoff seconds (doubles) |
+
+**Key methods**:
+- `open_order(instrument, direction, volume, tp, sl)` → `{success, order_id, trade_id, fill_price}`
+- `close_order(order_id)` → `{success, response}`
+- `modify_order(order_id, tp, sl)` → `{success, response}`
+- `get_open_trades()` → list of open trades
+- `get_account_summary()` → `{balance, equity, margin, unrealized_pnl, currency}`
+- `get_trade_history(count)` → list of closed trades
+- `get_current_price(instrument)` → `{bid, ask, spread, instrument, time}`
 
 ---
 
 ## 6. Portfolio Plugins
 
-### 6.1 Objetivo
-Gestionan la asignación de capital entre assets de un portfolio.
+**Base class**: `PortfolioPluginBase` (inherits `PluginBase`)
 
-### 6.2 Métodos específicos
-- `allocate_capital(portfolio, assets) -> dict`: Asigna capital a cada asset
+### Interface
 
-### 6.3 Retorno del método allocate_capital
 ```python
+class PortfolioPluginBase(PluginBase):
+    def allocate(self, portfolio_id: int, assets: list) -> dict: ...
+    def update(self, portfolio_id: int, operation_result: dict) -> None: ...
+```
+
+### Available Plugin: `default_portfolio`
+
+**File**: `plugins_portfolio/default_portfolio.py`  
+**Class**: `DefaultPortfolio`
+
+Minimal implementation (stub). Methods `rebalance()` and `get_allocations()` return empty results.
+
+**Parameters**: None defined (uses base defaults).
+
+---
+
+## Creating a Custom Plugin
+
+### Step 1: Create the Plugin File
+
+Create `plugins_broker/my_broker.py`:
+
+```python
+from app.plugin_base import BrokerPluginBase
+
+class MyBroker(BrokerPluginBase):
+    plugin_params = {
+        "api_url": "https://my-broker.com/api",
+        "api_key": "",
+        "timeout": 30,
+    }
+    plugin_debug_vars = ["api_url", "timeout"]
+
+    def __init__(self, config=None):
+        super().__init__(config)
+
+    def open_order(self, order_params):
+        # Implement order execution
+        return {"success": True, "order_id": "123"}
+
+    def close_order(self, order_id):
+        return {"success": True}
+
+    def modify_order(self, order_id, new_params):
+        return {"success": True}
+
+    def get_open_orders(self):
+        return []
+```
+
+### Step 2: Register in `setup.py`
+
+```python
+'plugins_broker': [
+    'default_broker=plugins_broker.default_broker:DefaultBroker',
+    'my_broker=plugins_broker.my_broker:MyBroker',
+],
+```
+
+### Step 3: Reinstall and Configure
+
+```bash
+pip install -e .
+```
+
+Then use in config:
+```json
 {
-    "asset_id": float,  # Capital asignado por asset_id
-    "asset_id2": float,
-    # ...
+    "broker_plugin": "my_broker"
 }
 ```
 
-### 6.4 Parámetros relevantes
-- `allocation_method`: Método de asignación (equal_weight, risk_parity, etc.)
-- `max_allocation_per_asset`: Máximo porcentaje por asset
-- `rebalance_threshold`: Umbral para rebalanceo
+Or per-asset in the `assets.broker_config` JSON column.
 
 ---
 
-## 7. Database Integration
-
-All plugins must use the SQLAlchemy ORM models for database operations:
-
-- **User**: Usuario system
-- **Session**: Sesiones de usuario
-- **AuditLog**: Registro de auditoría
-- **Config**: Configuración del sistema
-- **Statistics**: Estadísticas del sistema
-- **Portfolio**: Portfolios de usuario
-- **Asset**: Assets dentro de portfolios
-- **Order**: Órdenes de trading
-- **Position**: Posiciones abiertas
-
----
-
-## 8. Plugin Configuration
-
-Each plugin receives configuration through:
-1. `plugin_params`: Valores por defecto
-2. `config` parameter in `__init__`: Configuración global merged
-3. JSON configuration stored in database (for portfolios/assets)
-
----
-
-## 9. Error Handling
+## Error Handling
 
 All plugins must:
-- Handle exceptions gracefully
-- Log errors to the audit system
-- Return structured error responses
-- Not crash the main system
-
----
-
-## 10. Testing
-
-All plugins must have:
-- Unit tests for individual methods
-- Integration tests with database
-- Mock tests for external APIs
-- Performance tests for critical paths
-
----
-
-## 6. CSV Data Plugins (Prediction Provider Integration)
-
-### 6.1 CSV Feeder Plugin
-
-#### Objetivo
-Proporciona datos desde archivos CSV con manejo configurable de columnas datetime y filtrado basado en horizonte temporal.
-
-#### Métodos específicos
-- `load_data(horizon_periods=None) -> pandas.DataFrame`: Carga datos del CSV con filtrado temporal opcional
-- `get_ohlc_data(start_time, end_time) -> pandas.DataFrame`: Obtiene datos OHLC para rango temporal específico
-- `validate_data_format() -> bool`: Valida que el CSV tenga el formato esperado
-
-#### Parámetros específicos
-```python
-plugin_params = {
-    "csv_file": "path/to/data.csv",  # Ruta al archivo CSV
-    "datetime_column": "DATE_TIME",  # Nombre de columna datetime
-    "datetime_format": "%Y-%m-%d %H:%M:%S",  # Formato de parsing datetime
-    "horizon_periods": 24,  # Número de períodos a incluir hacia atrás
-    "data_columns": ["OPEN", "HIGH", "LOW", "CLOSE"]  # Columnas OHLC
-}
-```
-
-#### Formato de salida
-Retorna pandas DataFrame con:
-- Índice datetime
-- Columnas OHLC (OPEN, HIGH, LOW, CLOSE)
-- Filtrado a los últimos N períodos según horizon_periods
-
-### 6.2 CSV Predictor Plugin
-
-#### Objetivo
-Genera predicciones ideales de precios de cierre leyendo valores futuros del CSV, simulando predicciones perfectas para backtesting y evaluación de estrategias.
-
-#### Métodos específicos
-- `generate_predictions(current_time, horizons) -> dict`: Genera predicciones para múltiples horizontes
-- `get_future_close_return(current_time, horizon) -> float`: Calcula retorno de cierre futuro para horizonte específico
-- `validate_prediction_availability(current_time, horizons) -> bool`: Verifica disponibilidad de datos futuros
-
-#### Parámetros específicos
-```python
-plugin_params = {
-    "csv_file": "path/to/data.csv",  # Ruta al archivo CSV
-    "datetime_column": "DATE_TIME",  # Nombre de columna datetime
-    "prediction_horizons": ["1h", "1d"],  # Horizontes a predecir
-    "close_column": "CLOSE"  # Nombre de columna de precio de cierre
-}
-```
-
-#### Formato de salida
-```json
-{
-    "predictions": [
-        {
-            "horizon": "1h",
-            "prediction": 0.0025,  # retorno de cierre sobre 1h
-            "timestamp": "2024-01-01T12:00:00Z"
-        },
-        {
-            "horizon": "1d", 
-            "prediction": 0.0150,  # retorno de cierre sobre 1d
-            "timestamp": "2024-01-01T12:00:00Z"
-        }
-    ]
-}
-```
-
-### 6.3 Backtrader Broker Plugin
-
-#### Objetivo
-Integra con el framework backtrader para habilitar backtesting de estrategias con predicciones tanto ideales como reales.
-
-#### Métodos específicos
-- `buy(size, price=None) -> Order`: Ejecuta orden de compra
-- `sell(size, price=None) -> Order`: Ejecuta orden de venta
-- `get_portfolio_value() -> float`: Obtiene valor actual del portfolio
-- `get_cash() -> float`: Obtiene efectivo disponible
-- `get_position(symbol) -> Position`: Obtiene posición actual para símbolo
-- `switch_prediction_source(source_type) -> None`: Cambia entre fuente CSV e API en tiempo de ejecución
-
-#### Parámetros específicos
-```python
-plugin_params = {
-    "initial_cash": 10000.0,  # Capital inicial
-    "commission": 0.001,  # Comisión por operación
-    "prediction_source": "csv",  # "csv" para ideal, "api" para real
-    "csv_file": "path/to/data.csv",  # Archivo CSV para predicciones ideales
-    "api_url": "http://localhost:8001"  # URL del prediction_provider para predicciones reales
-}
-```
-
-#### Puntos de integración
-- Se conecta al servicio prediction_provider para predicciones reales
-- Usa CSV predictor para predicciones ideales
-- Interfaz con API de broker de backtrader
-- Rastrea posiciones, órdenes y valor del portfolio
-
-### 6.4 Flexibilidad y cambio de modos
-
-#### Cambio entre fuentes de datos
-- **Modo CSV**: Lee desde archivos CSV históricos
-- **Modo API**: Se conecta al servicio de predicciones en vivo
-
-#### Cambio entre tipos de predicción
-- **Ideal**: Usa datos futuros del CSV (predicciones perfectas)
-- **Real**: Usa predicciones reales del modelo ML via API
-
-#### Ejemplos de configuración
-
-##### Modo CSV (Predicciones ideales)
-```json
-{
-    "feeder_plugin": "csv_feeder",
-    "feeder_params": {
-        "csv_file": "examples/data/phase_3/base_d6.csv",
-        "datetime_column": "DATE_TIME",
-        "horizon_periods": 168
-    },
-    "predictor_plugin": "csv_predictor",
-    "predictor_params": {
-        "csv_file": "examples/data/phase_3/base_d6.csv",
-        "prediction_horizons": ["1h", "1d"]
-    }
-}
-```
-
-##### Modo API (Predicciones reales)
-```json
-{
-    "feeder_plugin": "api_feeder",
-    "feeder_params": {
-        "api_url": "http://localhost:8001",
-        "symbol": "EURUSD"
-    },
-    "predictor_plugin": "api_predictor", 
-    "predictor_params": {
-        "api_url": "http://localhost:8001",
-        "prediction_horizons": ["1h", "1d"]
-    }
-}
-```
-
----
-
-## 7. Database Plugin and ORM Integration
-
-All plugins and core modules interact with the database exclusively via SQLAlchemy ORM. The database engine is SQLite by default, but can be swapped for any SQLAlchemy-supported backend. The following tables are required:
-
-### User Table
-| Column         | Type        | Description                       |
-|---------------|------------|-----------------------------------|
-| id            | Integer PK | Unique user ID                    |
-| username      | String     | Unique username                   |
-| email         | String     | Unique email                      |
-| password_hash | String     | Hashed password                   |
-| role          | String     | User role (admin, user, etc.)     |
-| is_active     | Boolean    | Account active flag               |
-| created_at    | DateTime   | Account creation timestamp        |
-
-### Session Table
-| Column         | Type        | Description                       |
-|---------------|------------|-----------------------------------|
-| id            | Integer PK | Unique session ID                 |
-| user_id       | Integer FK | Linked user                       |
-| token         | String     | Session token (JWT or random)     |
-| created_at    | DateTime   | Session creation timestamp        |
-| expires_at    | DateTime   | Session expiration                |
-
-### AuditLog Table
-| Column         | Type        | Description                       |
-|---------------|------------|-----------------------------------|
-| id            | Integer PK | Unique log entry                  |
-| user_id       | Integer FK | Linked user                       |
-| action        | String     | Action performed                  |
-| timestamp     | DateTime   | When action occurred              |
-| details       | String     | Additional context                |
-
-### Config Table
-| Column         | Type        | Description                       |
-|---------------|------------|-----------------------------------|
-| id            | Integer PK | Unique config entry               |
-| key           | String     | Config key                        |
-| value         | String     | Config value (JSON/text)          |
-| updated_at    | DateTime   | Last update timestamp             |
-
-### Statistics Table
-| Column         | Type        | Description                       |
-|---------------|------------|-----------------------------------|
-| id            | Integer PK | Unique stat entry                 |
-| key           | String     | Stat key                          |
-| value         | Float      | Stat value                        |
-| timestamp     | DateTime   | When stat was recorded            |
-
-All plugin types (AAA, core, pipeline, strategy, broker, portfolio) must use the ORM models for all persistent data. Plugins must not access the database directly except via SQLAlchemy ORM.
-
----
-
-## 8. Consideraciones generales
-    Todas las clases de plugins deben inicializarse obligatoriamente con config: dict para garantizar coherencia con el sistema de configuración global de la aplicación.
-    El portfolio_manager debe gestionar todas las instancias de instrumentos activas y ser el punto único de decisión sobre asignación de capital.
-    Cada ejecución del daemon LTS debe orquestar el ciclo completo: asignación → predicción → pipeline → estrategia → ejecución en broker, en todos los instrumentos configurados.
-    La arquitectura debe soportar ejecución paralela de instrumentos para minimizar la latencia en ciclos con decenas de instrumentos simultáneos.
-    Cada plugin debe validar en __init__ la configuración requerida, lanzando excepciones claras si faltan parámetros obligatorios.
+- Handle exceptions gracefully without crashing the main system
+- Log errors (use `logging` or print with `_QUIET` check)
+- Return structured error responses (e.g., `{"success": False, "error": "message"}`)
+- Validate required configuration in `__init__`

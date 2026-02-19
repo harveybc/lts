@@ -1,0 +1,74 @@
+{
+    "_comment": "LTS Configuration — Live/Practice Trading with OANDA Broker",
+    "_comment2": "Uses prediction_strategy with prediction_provider for ML-based signals",
+
+    "quiet_mode": false,
+    "debug_mode": false,
+    "log_level": "INFO",
+
+    "core_plugin": "default_core",
+    "aaa_plugin": "default_aaa",
+    "pipeline_plugin": "default_pipeline",
+    "strategy_plugin": "prediction_strategy",
+    "broker_plugin": "oanda_broker",
+    "portfolio_plugin": "default_portfolio",
+
+    "global_latency": 60,
+    "api_host": "0.0.0.0",
+    "api_port": 8000,
+    "enable_api": true,
+
+    "database_url": "sqlite:///./lts_trading.db",
+
+    "prediction_provider_url": "http://localhost:8000",
+    "prediction_provider_api_key": null,
+    "prediction_provider_timeout": 300,
+    "prediction_provider_retries": 3,
+    "prediction_provider_retry_delay": 5,
+
+    "csv_test_mode": false,
+
+    "short_term_model": {
+        "predictor_plugin": "transformer",
+        "window_size": 144,
+        "batch_size": 128,
+        "prediction_horizon": 6,
+        "interval": "1h",
+        "lookback_ticks": 1000,
+        "model_config": "phase_3_1/phase_3_1_transformer_1h_config.json"
+    },
+
+    "long_term_model": {
+        "predictor_plugin": "cnn",
+        "window_size": 256,
+        "batch_size": 128,
+        "prediction_horizon": 6,
+        "interval": "1d",
+        "lookback_ticks": 1000,
+        "model_config": "phase_3_1_daily/phase_3_1_cnn_1d_config.json"
+    },
+
+    "max_drawdown": 0.20,
+    "max_daily_loss": 0.05,
+    "max_positions_per_user": 50,
+
+    "_oanda_broker_comment": "Per-asset broker_config stored in assets.broker_config JSON column",
+    "_oanda_broker_config_example": {
+        "account_id": "101-001-12345678-001",
+        "access_token": "your-oanda-api-token-here",
+        "environment": "practice",
+        "instrument": "EUR_USD",
+        "max_retries": 3,
+        "retry_backoff": 1.0
+    },
+
+    "_prediction_strategy_comment": "Per-asset strategy_config stored in assets.strategy_config",
+    "_prediction_strategy_config_example": {
+        "short_term_weight": 0.6,
+        "long_term_weight": 0.4,
+        "confidence_threshold": 0.7,
+        "uncertainty_threshold": 0.05,
+        "position_size_base": 0.02,
+        "trend_alignment_required": true
+    }
+}

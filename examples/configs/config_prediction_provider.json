@@ -1,0 +1,65 @@
+{
+    "_comment": "LTS Configuration — Prediction Provider Integration",
+    "_comment2": "Demonstrates both API mode (real predictions) and CSV test mode (perfect predictions)",
+
+    "quiet_mode": false,
+    "debug_mode": true,
+    "log_level": "DEBUG",
+
+    "core_plugin": "default_core",
+    "aaa_plugin": "default_aaa",
+    "pipeline_plugin": "default_pipeline",
+    "strategy_plugin": "prediction_strategy",
+    "broker_plugin": "default_broker",
+    "portfolio_plugin": "default_portfolio",
+
+    "global_latency": 5,
+    "api_host": "0.0.0.0",
+    "api_port": 8000,
+
+    "_section_api_mode": "=== API Mode: Real ML predictions from prediction_provider ===",
+    "prediction_provider_url": "http://localhost:8000",
+    "prediction_provider_api_key": null,
+    "prediction_provider_timeout": 300,
+    "prediction_provider_retries": 3,
+    "prediction_provider_retry_delay": 5,
+
+    "_section_csv_mode": "=== CSV Test Mode: Perfect predictions from historical data ===",
+    "_csv_mode_comment": "Set csv_test_mode=true to use CSV data instead of the API",
+    "csv_test_mode": false,
+    "csv_test_data_path": "examples/data/phase_3/base_d1.csv",
+    "csv_test_lookahead": true,
+
+    "_section_models": "=== Model Configuration ===",
+    "short_term_model": {
+        "_comment": "1h Transformer for 1-6 hour predictions",
+        "predictor_plugin": "transformer",
+        "window_size": 144,
+        "batch_size": 128,
+        "prediction_horizon": 6,
+        "interval": "1h",
+        "lookback_ticks": 1000,
+        "model_config": "phase_3_1/phase_3_1_transformer_1h_config.json"
+    },
+
+    "long_term_model": {
+        "_comment": "1d CNN for 1-6 day predictions",
+        "predictor_plugin": "cnn",
+        "window_size": 256,
+        "batch_size": 128,
+        "prediction_horizon": 6,
+        "interval": "1d",
+        "lookback_ticks": 1000,
+        "model_config": "phase_3_1_daily/phase_3_1_cnn_1d_config.json"
+    },
+
+    "_section_strategy": "=== Prediction Strategy Parameters ===",
+    "_strategy_config_example": {
+        "short_term_weight": 0.6,
+        "long_term_weight": 0.4,
+        "confidence_threshold": 0.7,
+        "uncertainty_threshold": 0.05,
+        "position_size_base": 0.02,
+        "trend_alignment_required": true
+    }
+}

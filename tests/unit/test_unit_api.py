@@ -10,6 +10,7 @@ from unittest.mock import patch, MagicMock
 
 # Import the singleton instance of the core plugin and its data model
 from plugins_core.default_core import core_plugin_instance, DataItem, CorePlugin, get_current_user, create_app
+from app.database import get_db
 
 @pytest.fixture(scope="function")
 def client():
@@ -21,7 +22,7 @@ def client():
 
     # Mock the database dependency for all tests in this module
     mock_db_session = MagicMock()
-    app.dependency_overrides[CorePlugin.get_db] = lambda: mock_db_session
+    app.dependency_overrides[get_db] = lambda: mock_db_session
 
     # Initialize the core plugin with a mock AAA plugin
     core_plugin_instance.initialize(plugins={'aaa': MagicMock()})

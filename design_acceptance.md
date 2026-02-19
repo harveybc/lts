@@ -1,131 +1,73 @@
-# LTS (Live Trading System) - Acceptance-Level Design Document
+# LTS — Acceptance-Level Design Document
 
-This document details the acceptance-level (user requirements) design for the LTS project, including AAA (Authentication, Authorization, Accounting), plugin architecture, secure API, and database requirements. All requirements are mapped to user stories and referenced in the acceptance test plan for full traceability.
+## 1. User Stories and Requirements
 
-## 1. User Stories and Acceptance Requirements
+### 1.1 Trader (User Role)
 
-### 1.1 Trader Requirements
-| Req ID | User Story / Requirement | Description | Source |
-|--------|-------------------------|-------------|--------|
-| R1     | Trader: Secure user authentication and session management | The system must provide secure authentication, registration, password reset, and session management via AAA plugins, with all data stored in the database (SQLite/SQLAlchemy). | README.md, plugins_aaa/, database.py |
-| R2     | Trader: Portfolio management via web dashboard/API | Users must be able to view, activate/deactivate, edit, or remove their portfolios via the web dashboard or API. | README.md, web.py, database.py |
-| R3     | Trader: Asset management within portfolios | Users must be able to view and edit the asset list, plugin assignments, and allocations for each portfolio. | README.md, web.py, database.py |
-| R4     | Trader: Plugin configuration and asset parameters | Users must be able to edit asset-level parameters, change strategy/broker/pipeline plugins, and add/remove assets. | README.md, web.py, REFERENCE_plugins.md |
-| R5     | Trader: Trading analytics and performance metrics | Users must be able to view analytics, including best/worst performers, plots, and metrics. | README.md, web.py, database.py |
-| R6     | Trader: Order and position tracking | Users must be able to view order history, current positions, and trade execution details. | README.md, web.py, database.py |
+| ID | Story | Implemented |
+|---|---|---|
+| R1 | As a trader, I can register with username/email/password and log in securely via JWT | ✅ `web.py` `/api/auth/register`, `/api/auth/login` |
+| R2 | As a trader, I can log in via Google OAuth 2.0 | ✅ `default_aaa.py` `google_oauth_login()` |
+| R3 | As a trader, I can view my portfolios and their status | ✅ `GET /api/portfolios` filtered by user |
+| R4 | As a trader, I can create, activate, and deactivate portfolios | ✅ `POST /api/portfolios`, `PATCH .../activate`, `PATCH .../deactivate` |
+| R5 | As a trader, I can add assets to a portfolio with independent strategy/broker/pipeline configs | ✅ `POST /portfolios/{id}/assets`, `PATCH /assets/{id}/strategy` etc. |
+| R6 | As a trader, I can view my orders and positions | ✅ `GET /api/orders`, `GET /api/positions` |
+| R7 | As a trader, I can view my billing records | ✅ `GET /api/billing/me` |
+| R8 | As a trader, I can manually trigger a trade execution for an asset | ✅ `POST /trading/execute` |
+| R9 | As a trader, I can configure strategy parameters per asset | ✅ `PATCH /assets/{id}/strategy`, stored in `assets.strategy_config` JSON |
+| R10 | As a trader, I can use prediction-based strategies with ML model predictions | ✅ `prediction_strategy` plugin + `PredictionProviderClient` |
 
-### 1.2 Developer Requirements
-| Req ID | User Story / Requirement | Description | Source |
-|--------|-------------------------|-------------|--------|
-| R7     | Developer: Plugin development and registration | Developers must be able to create/register new plugins (pipeline, strategy, broker, portfolio, AAA) by following the required interface and structure. | README.md, REFERENCE_plugins.md, plugin_base.py |
-| R8     | Developer: Plugin testing and validation | Plugins must be testable both in isolation and as part of a full trading pipeline. | README.md, plugin_base.py |
-| R9     | Developer: Configuration override and debugging | CLI/API parameters must override config file and global defaults for all supported options. | README.md, main.py, config_handler.py |
-| R10    | Developer: Debug information access | The system must support exporting debug metrics and plugin information for analysis. | README.md, plugin_base.py |
+### 1.2 Admin
 
-### 1.3 Operator Requirements
-| Req ID | User Story / Requirement | Description | Source |
-|--------|-------------------------|-------------|--------|
-| R11    | Operator: User and role management | Operators must be able to manage users and roles, and audit all actions via dashboard/API, with all actions logged in the database. | README.md, plugins_aaa/, web.py |
-| R12    | Operator: System monitoring and error handling | The system must validate plugin configuration at startup and runtime, log errors, and disable only faulty plugins without crashing. | README.md, main.py |
-| R13    | Operator: Parallel execution and resource management | The system must support parallel execution for multiple assets, with correct resource management and isolation. | README.md, main.py |
-| R14    | Operator: Data integrity and auditability | All AAA, config, and statistics must be stored in a secure, auditable database (SQLite/SQLAlchemy), and all database operations must be covered by tests at every level. | README.md, database.py, all tests |
+| ID | Story | Implemented |
+|---|---|---|
+| R11 | As an admin, I can view all users and manage roles | ✅ `GET /api/users` (admin only) |
+| R12 | As an admin, I can view all portfolios across all users | ✅ `GET /api/portfolios` returns all for admin |
+| R13 | As an admin, I can view audit logs of all actions | ✅ `GET /api/audit-logs` (admin only) |
+| R14 | As an admin, I can view system configuration | ✅ `GET /api/config` (admin only) |
+| R15 | As an admin, I can view billing records for all users | ✅ `GET /api/billing` (admin only) |
 
-## 2. System Architecture Requirements
+### 1.3 Developer
 
-### 2.1 Database Schema Requirements
-- **Users**: Secure authentication with password hashing, roles, and session management
-- **Portfolios**: Portfolio-centric architecture with plugin configurations and capital management
-- **Assets**: Asset-level plugin assignments and configurations within portfolios
-- **Orders**: Complete order lifecycle tracking with status and execution details
-- **Positions**: Real-time position tracking with profit/loss calculations
-- **Audit Logs**: Complete audit trail for all user actions and system events
-- **Configuration**: System-wide configuration storage and management
-- **Statistics**: Performance metrics and analytics storage
+| ID | Story | Implemented |
+|---|---|---|
+| R16 | As a developer, I can create a custom plugin by inheriting from the appropriate base class and registering in setup.py | ✅ `plugin_base.py`, `setup.py` entry points |
+| R17 | As a developer, I can override config parameters via CLI or config file | ✅ `config_merger.py` multi-source merge |
+| R18 | As a developer, I can access debug info from all plugins | ✅ `get_debug_info()`, `/plugins/{name}/debug` |
+| R19 | As a developer, I can use the simulation broker to backtest strategies with realistic costs | ✅ `backtrader_simulation_broker` |
+| R20 | As a developer, I can switch between CSV (ideal) and API (real) prediction sources | ✅ `backtrader_broker.switch_prediction_source()` |
 
-### 2.2 Plugin Architecture Requirements
-- **Plugin Base Structure**: All plugins must inherit from base plugin class and implement required methods
-- **Plugin Parameters**: Standardized parameter handling with `plugin_params` dictionary
-- **Debug Information**: Debug variable tracking via `plugin_debug_vars` and related methods
-- **Configuration Merging**: Multi-pass configuration merging with plugin-specific parameters
-- **Plugin Types**: Support for AAA, Core, Pipeline, Strategy, Broker, and Portfolio plugins
+### 1.4 Operator
 
-## 3. Security and Compliance Requirements
+| ID | Story | Implemented |
+|---|---|---|
+| R21 | As an operator, I can initialize the database with default data | ✅ `python app/init_db.py` |
+| R22 | As an operator, I can start the system with a config file | ✅ `python app/main.py --load_config config.json` |
+| R23 | As an operator, the system handles plugin failures without crashing | ✅ `main.py` catches plugin load errors, `pipeline` catches per-asset errors |
+| R24 | As an operator, all actions are audit-logged for compliance | ✅ `AuditLog` table, `audit()` calls throughout |
 
-### 3.1 Authentication, Authorization, and Accounting (AAA)
-- All AAA functionality must be implemented as plugins with secure password handling
-- Session management with secure token generation and expiration
-- Role-based access control for all web/API endpoints
-- Complete audit logging of all user actions and system events
+## 2. Security Requirements
 
-### 3.2 Data Security and Privacy
-- All sensitive data must be stored securely in the database with appropriate encryption
-- Error messages must be sanitized to prevent information leakage
-- All remote operations must use secure protocols (HTTPS)
-- Input validation and sanitization for all user inputs
+- All API endpoints require JWT authentication (except `/health`, `/api/auth/login`, `/api/auth/register`)
+- RBAC enforced: admin-only endpoints check role
+- bcrypt password hashing with complexity requirements
+- Account lockout after 5 failed attempts (30 min)
+- Rate limiting: 60 requests/minute per IP
+- Security headers: X-Content-Type-Options, X-Frame-Options, HSTS, CSP, Referrer-Policy
+- Request size limit: 1MB
+- Input validation and SQL injection prevention via SQLAlchemy ORM
+- CORS restricted to configured origins
 
-### 3.3 System Security
-- Resource usage limits to prevent DoS attacks
-- Plugin sandboxing and validation
-- Secure configuration management with environment variables
-- Regular security scanning of dependencies
+## 3. Database Requirements
+
+All persistent data stored in SQLite via SQLAlchemy ORM. See README.md for full schema.
 
 ## 4. Design Constraints
 
-### 4.1 Technical Constraints
-- All AAA functionality must be implemented as plugins
-- All web/API actions must be authenticated and authorized
-- All user actions must be possible via web dashboard and/or API
-- All actions must be logged for audit and traceability
-- Plugins must follow the exact required structure (see REFERENCE_plugins.md)
-- Config merging must follow the order: global defaults < file < CLI/API
-- System must not crash on plugin or config errors
-
-### 4.2 Quality Constraints
-- All database models, migrations, and queries must be covered by tests
-- Debug information must be available for all plugins
-- System must provide graceful error handling and recovery
-- All persistent data must be stored via SQLAlchemy ORM
-
-## 5. Design Decisions
-
-### 5.1 Architecture Decisions
-- Use Python's built-in plugin system with dynamic import
-- Portfolio-centric database design with plugin configurations
-- FastAPI for web API with secure authentication
-- SQLAlchemy ORM for all database operations
-- Centralized error handling and logging
-
-### 5.2 Implementation Decisions
-- All plugins implement standardized base structure with required methods
-- Configuration merging with two-pass approach for plugin parameters
-- Secure session management with token-based authentication
-- Complete audit logging for all trading actions and config changes
-- Plugin-specific debug information collection and export
-
-## 6. Database Schema Reference
-
-The complete database schema is implemented in `database.py` and includes:
-- User management with secure authentication
-- Portfolio-centric trading structure
-- Asset management with plugin configurations
-- Order and position tracking
-- Audit logging and statistics
-- System configuration management
-
-See `README.md` and `show_schema.py` for detailed schema documentation.
-
-## 7. Traceability
-
-All requirements are mapped to:
-- Implementation files and modules
-- Database models and relationships
-- Plugin interfaces and structures
-- Test cases at all levels (unit, integration, system, acceptance)
-
-This document serves as the foundation for all design documents and test plans, ensuring full traceability from user requirements to implementation and testing.
+- All plugins must inherit from `PluginBase` and implement the exact `plugin_params` / `plugin_debug_vars` / `set_params` / `get_debug_info` / `add_debug_info` structure
+- Config merge order: plugin_params < DEFAULT_VALUES < file_config < CLI_args
+- System must not crash on individual plugin or asset errors
 
 ---
 
-*Document Version: 1.0*
-*Last Updated: 2025*
-*Status: Active*
+*Status: Reflects as-built system (2025-02)*

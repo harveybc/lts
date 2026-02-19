@@ -22,12 +22,14 @@ from app.plugin_base import PluginBase
 from app.database import get_db, User, Portfolio, AuditLog, Asset
 
 # Define the dependency function outside the class
-async def get_current_user(security: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+async def get_current_user(security: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False))):
     """
     Dependency to get the current user from a token.
     This is a simplified placeholder.
     """
-    if security and security.credentials == "valid_token":
+    if not security:
+        raise HTTPException(status_code=403, detail="Not authenticated")
+    if security.credentials == "valid_token":
         # For testing, return a trader user by default (non-admin)
         return {"username": "trader_user", "role": "trader"}
     else:
@@ -87,8 +89,10 @@ class PluginConfigAcceptance(BaseModel):
     parameters: dict
 
 class CorePlugin(PluginBase):
-    # Expose get_db as a class-level attribute for dependency override in tests
-    get_db = staticmethod(get_db)
+    # Note: get_db is imported at module level from app.database
+    # Do NOT shadow it as a class attribute, or Depends(get_db) in methods
+    # will capture the class attribute instead of the module-level function,
+    # breaking FastAPI dependency overrides in tests.
 
     def __init__(self):
         super().__init__()

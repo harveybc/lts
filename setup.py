@@ -28,7 +28,9 @@ setup(
         # Broker plugins - Connection and execution with brokers
         'plugins_broker': [
             'default_broker=plugins_broker.default_broker:DefaultBroker',
-            'backtrader_broker=plugins_broker.backtrader_broker:BacktraderBroker'
+            'backtrader_broker=plugins_broker.backtrader_broker:BacktraderBroker',
+            'backtrader_simulation_broker=plugins_broker.backtrader_simulation_broker:BacktraderSimulationBroker',
+            'oanda_broker=plugins_broker.oanda_broker:OandaBroker'
         ],
         # Portfolio plugins - Capital allocation management
         'plugins_portfolio': [
@@ -56,7 +58,8 @@ setup(
         'matplotlib',
         'seaborn',
         'backtrader',  # For broker simulation
-        'python-dateutil'  # For datetime parsing
+        'python-dateutil',  # For datetime parsing
+        'oandapyV20'  # OANDA v20 REST API client
     ],
     author='LTS Development Team',
     author_email='lts@example.com',

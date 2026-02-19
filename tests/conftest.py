@@ -27,6 +27,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 @pytest.fixture(scope="function")
 def app(fresh_db, mock_config):
     """Create a FastAPI app for testing, with a fresh database."""
+    import sys as _sys
+    print(f"\n[DEBUG] fresh_db type: {type(fresh_db)}, db_url: {getattr(fresh_db, 'db_url', 'N/A')}", file=_sys.stderr)
     
     core_plugin = CorePlugin()
     
@@ -85,23 +87,26 @@ def client(app):
     with TestClient(app) as c:
         yield c
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create an instance of the default event loop for the test session."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+# Note: event_loop fixture is provided by pytest-asyncio.
+# Do not override it — the deprecated redefinition was removed.
 
 @pytest.fixture(scope="function")
-async def fresh_db():
+def fresh_db():
     """Create a fresh database for each test function."""
+    import asyncio
     with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as temp_file:
         db_path = temp_file.name
     
     db = Database(db_path=db_path)
-    await db.initialize()
+    
+    # Initialize synchronously using the sync engine
+    from sqlalchemy import create_engine as _ce
+    _sync_url = db.db_url.replace('+aiosqlite', '')
+    _engine = _ce(_sync_url, connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=_engine)
+    _engine.dispose()
+    
     yield db
-    await db.cleanup()
     
     try:
         os.unlink(db_path)

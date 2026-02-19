@@ -111,11 +111,15 @@ class User(Base):
     updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), 
                        onupdate=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
     
+    failed_login_attempts = Column(Integer, default=0, nullable=False)
+    locked_until = Column(DateTime, nullable=True)
+    
     # Relationships
     sessions = relationship("Session", back_populates="user")
     audit_logs = relationship("AuditLog", back_populates="user")
     portfolios = relationship("Portfolio", back_populates="user")
     orders = relationship("Order", back_populates="user")
+    billing_records = relationship("BillingRecord", back_populates="user")
 
 class Session(Base):
     """Session table for user session management"""
@@ -139,9 +143,26 @@ class AuditLog(Base):
     action = Column(String(100), nullable=False)
     timestamp = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
     details = Column(Text, nullable=True)
+    ip_address = Column(String(45), nullable=True)
     
     # Relationships
     user = relationship("User", back_populates="audit_logs")
+
+class BillingRecord(Base):
+    """Billing records for per-trade or subscription billing"""
+    __tablename__ = 'billing_records'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    action_type = Column(String(50), nullable=False)  # "trade", "subscription", "strategy_execution"
+    reference_id = Column(Integer, nullable=True)  # order_id, portfolio_id, etc.
+    amount = Column(Numeric(15, 2), nullable=False, default=0.0)
+    currency = Column(String(3), nullable=False, default="USD")
+    description = Column(Text, nullable=True)
+    timestamp = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="billing_records")
 
 class Config(Base):
     """Configuration table for system settings"""
