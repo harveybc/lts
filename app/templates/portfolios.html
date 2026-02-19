@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Portfolios{% endblock %}
+{% block nav_portfolios %}active{% endblock %}
+{% block page_title %}Portfolios{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h3 class="card-title">My Portfolios</h3>
+    <div class="card-tools">
+      <button class="btn btn-primary btn-sm" data-toggle="modal" data-target="#createModal"><i class="fas fa-plus"></i> New Portfolio</button>
+    </div>
+  </div>
+  <div class="card-body p-0">
+    <table class="table table-striped">
+      <thead><tr><th>Name</th><th>Capital</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody id="portfolio-list"><tr><td colspan="4" class="text-center text-muted">Loading...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Create Modal -->
+<div class="modal fade" id="createModal">
+  <div class="modal-dialog"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title">Create Portfolio</h5><button type="button" class="close" data-dismiss="modal">&times;</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label>Name</label><input type="text" id="pf-name" class="form-control" required></div>
+      <div class="form-group"><label>Description</label><input type="text" id="pf-desc" class="form-control"></div>
+      <div class="form-group"><label>Total Capital</label><input type="number" id="pf-capital" class="form-control" value="10000" step="0.01"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" onclick="createPortfolio()">Create</button>
+    </div>
+  </div></div>
+</div>
+{% endblock %}
+{% block extra_js %}
+<script>
+async function pageInit() { await loadPortfolios(); }
+
+async function loadPortfolios() {
+  var r = await apiFetch('/api/portfolios');
+  if (!r || !r.ok) return;
+  var data = await r.json();
+  var tb = document.getElementById('portfolio-list');
+  if (!data.length) { tb.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No portfolios</td></tr>'; return; }
+  tb.innerHTML = '';
+  data.forEach(function(p){
+    tb.innerHTML += '<tr><td><a href="/portfolios/'+p.id+'">'+p.name+'</a></td><td>$'+(p.total_capital||0).toFixed(2)+'</td><td><span class="badge badge-'+(p.is_active?'success':'secondary')+'">'+(p.is_active?'Active':'Inactive')+'</span></td><td><a href="/portfolios/'+p.id+'" class="btn btn-xs btn-info"><i class="fas fa-eye"></i></a></td></tr>';
+  });
+}
+
+async function createPortfolio() {
+  var r = await apiFetch('/api/portfolios', {
+    method:'POST',
+    body: JSON.stringify({name: document.getElementById('pf-name').value, description: document.getElementById('pf-desc').value, total_capital: parseFloat(document.getElementById('pf-capital').value)||0})
+  });
+  if (r && r.ok) { $('#createModal').modal('hide'); flash('Portfolio created','success'); await loadPortfolios(); }
+  else { var d = await r.json(); flash(d.detail || 'Error','error'); }
+}
+</script>
+{% endblock %}

@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}LTS{% endblock %} | Live Trading System</title>
+  <!-- Font Awesome -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+  <!-- AdminLTE -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/admin-lte@3.2/dist/css/adminlte.min.css">
+  <!-- Google Font -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Source+Sans+Pro:300,400,400i,700&display=fallback">
+  {% block extra_css %}{% endblock %}
+</head>
+<body class="hold-transition sidebar-mini layout-fixed">
+<div class="wrapper">
+
+  <!-- Navbar -->
+  <nav class="main-header navbar navbar-expand navbar-white navbar-light">
+    <ul class="navbar-nav">
+      <li class="nav-item">
+        <a class="nav-link" data-widget="pushmenu" href="#" role="button"><i class="fas fa-bars"></i></a>
+      </li>
+    </ul>
+    <ul class="navbar-nav ml-auto">
+      <li class="nav-item dropdown">
+        <a class="nav-link" data-toggle="dropdown" href="#">
+          <i class="fas fa-user"></i> <span id="nav-username"></span>
+        </a>
+        <div class="dropdown-menu dropdown-menu-right">
+          <a class="dropdown-item" href="#" onclick="logout()"><i class="fas fa-sign-out-alt mr-2"></i>Logout</a>
+        </div>
+      </li>
+    </ul>
+  </nav>
+
+  <!-- Main Sidebar -->
+  <aside class="main-sidebar sidebar-dark-primary elevation-4">
+    <a href="/dashboard" class="brand-link">
+      <span class="brand-text font-weight-light ml-3"><b>LTS</b> Trading</span>
+    </a>
+    <div class="sidebar">
+      <nav class="mt-2">
+        <ul class="nav nav-pills nav-sidebar flex-column" data-widget="treeview" role="menu">
+          <li class="nav-item">
+            <a href="/dashboard" class="nav-link {% block nav_dashboard %}{% endblock %}">
+              <i class="nav-icon fas fa-tachometer-alt"></i><p>Dashboard</p>
+            </a>
+          </li>
+          <li class="nav-item">
+            <a href="/portfolios" class="nav-link {% block nav_portfolios %}{% endblock %}">
+              <i class="nav-icon fas fa-briefcase"></i><p>Portfolios</p>
+            </a>
+          </li>
+          <li class="nav-item">
+            <a href="/trades" class="nav-link {% block nav_trades %}{% endblock %}">
+              <i class="nav-icon fas fa-exchange-alt"></i><p>Trades</p>
+            </a>
+          </li>
+          <li class="nav-item">
+            <a href="/analytics" class="nav-link {% block nav_analytics %}{% endblock %}">
+              <i class="nav-icon fas fa-chart-line"></i><p>Analytics</p>
+            </a>
+          </li>
+          <li class="nav-item nav-admin" style="display:none;">
+            <a href="#" class="nav-link">
+              <i class="nav-icon fas fa-cogs"></i>
+              <p>Admin<i class="right fas fa-angle-left"></i></p>
+            </a>
+            <ul class="nav nav-treeview">
+              <li class="nav-item">
+                <a href="/admin/users" class="nav-link {% block nav_admin_users %}{% endblock %}">
+                  <i class="far fa-circle nav-icon"></i><p>Users</p>
+                </a>
+              </li>
+              <li class="nav-item">
+                <a href="/admin/system" class="nav-link {% block nav_admin_system %}{% endblock %}">
+                  <i class="far fa-circle nav-icon"></i><p>System</p>
+                </a>
+              </li>
+            </ul>
+          </li>
+        </ul>
+      </nav>
+    </div>
+  </aside>
+
+  <!-- Content Wrapper -->
+  <div class="content-wrapper">
+    <div class="content-header">
+      <div class="container-fluid">
+        <div class="row mb-2">
+          <div class="col-sm-6"><h1 class="m-0">{% block page_title %}{% endblock %}</h1></div>
+        </div>
+      </div>
+    </div>
+    <!-- Flash messages -->
+    <div class="container-fluid">
+      <div id="flash-messages"></div>
+    </div>
+    <section class="content">
+      <div class="container-fluid">
+        {% block content %}{% endblock %}
+      </div>
+    </section>
+  </div>
+
+  <footer class="main-footer">
+    <strong>LTS</strong> &mdash; Live Trading System
+  </footer>
+</div>
+
+<!-- jQuery -->
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<!-- Bootstrap 4 -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/js/bootstrap.bundle.min.js"></script>
+<!-- AdminLTE -->
+<script src="https://cdn.jsdelivr.net/npm/admin-lte@3.2/dist/js/adminlte.min.js"></script>
+
+<script>
+// --- Auth helpers ---
+function getToken() { return localStorage.getItem('access_token'); }
+function getRefreshToken() { return localStorage.getItem('refresh_token'); }
+function getUserInfo() { try { return JSON.parse(localStorage.getItem('user_info') || '{}'); } catch(e){ return {}; } }
+
+function authHeaders() { return { 'Authorization': 'Bearer ' + getToken(), 'Content-Type': 'application/json' }; }
+
+function logout() {
+  localStorage.removeItem('access_token');
+  localStorage.removeItem('refresh_token');
+  localStorage.removeItem('user_info');
+  window.location.href = '/login';
+}
+
+function flash(msg, type) {
+  type = type || 'info';
+  var cls = {'error':'danger','success':'success','warning':'warning'}[type] || 'info';
+  $('#flash-messages').append('<div class="alert alert-'+cls+' alert-dismissible fade show"><button type="button" class="close" data-dismiss="alert">&times;</button>'+msg+'</div>');
+}
+
+async function apiFetch(url, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign(authHeaders(), opts.headers || {});
+  var resp = await fetch(url, opts);
+  if (resp.status === 401) {
+    // try refresh
+    var rr = await fetch('/api/auth/refresh', { method:'POST', headers:{'Authorization':'Bearer '+getRefreshToken(),'Content-Type':'application/json'} });
+    if (rr.ok) {
+      var data = await rr.json();
+      localStorage.setItem('access_token', data.access_token);
+      opts.headers['Authorization'] = 'Bearer ' + data.access_token;
+      resp = await fetch(url, opts);
+    } else { logout(); return null; }
+  }
+  return resp;
+}
+
+// On page load: check auth, set user info, show admin nav
+document.addEventListener('DOMContentLoaded', function() {
+  var token = getToken();
+  var isAuthPage = ['/login','/register'].includes(window.location.pathname);
+  if (!token && !isAuthPage) { window.location.href = '/login'; return; }
+  if (token && isAuthPage) { window.location.href = '/dashboard'; return; }
+  var u = getUserInfo();
+  document.getElementById('nav-username') && (document.getElementById('nav-username').textContent = u.username || '');
+  if (u.role === 'admin') { document.querySelectorAll('.nav-admin').forEach(function(el){ el.style.display='block'; }); }
+  if (typeof pageInit === 'function') pageInit();
+});
+</script>
+{% block extra_js %}{% endblock %}
+</body>
+</html>

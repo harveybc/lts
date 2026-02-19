@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Admin - System{% endblock %}
+{% block nav_admin_system %}active{% endblock %}
+{% block page_title %}System Status{% endblock %}
+{% block content %}
+<div class="row">
+  <div class="col-md-6">
+    <div class="card card-primary">
+      <div class="card-header"><h3 class="card-title">Heartbeat Status</h3></div>
+      <div class="card-body">
+        <p><strong>Last Heartbeat:</strong> <span id="last-heartbeat">-</span></p>
+        <p><strong>Status:</strong> <span id="heartbeat-status">-</span></p>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card card-info">
+      <div class="card-header"><h3 class="card-title">System Config</h3></div>
+      <div class="card-body p-0">
+        <table class="table table-sm">
+          <thead><tr><th>Key</th><th>Value</th></tr></thead>
+          <tbody id="config-list"><tr><td colspan="2" class="text-center text-muted">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block extra_js %}
+<script>
+async function pageInit() {
+  var u = getUserInfo();
+  if (u.role !== 'admin') { flash('Admin access required','error'); return; }
+  var r = await apiFetch('/api/config');
+  if (!r || !r.ok) return;
+  var data = await r.json();
+  var tb = document.getElementById('config-list');
+  tb.innerHTML = '';
+  data.forEach(function(c){
+    tb.innerHTML += '<tr><td>'+c.key+'</td><td>'+c.value+'</td></tr>';
+    if (c.key === 'last_heartbeat') document.getElementById('last-heartbeat').textContent = c.value;
+    if (c.key === 'heartbeat_status') document.getElementById('heartbeat-status').textContent = c.value;
+  });
+}
+</script>
+{% endblock %}

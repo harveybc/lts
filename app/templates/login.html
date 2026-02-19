@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Login | LTS</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/admin-lte@3.2/dist/css/adminlte.min.css">
+</head>
+<body class="hold-transition login-page">
+<div class="login-box">
+  <div class="card card-outline card-primary">
+    <div class="card-header text-center"><h1><b>LTS</b> Trading</h1></div>
+    <div class="card-body">
+      <p class="login-box-msg">Sign in to start trading</p>
+      <div id="login-error" class="alert alert-danger" style="display:none;"></div>
+      <form id="login-form">
+        <div class="input-group mb-3">
+          <input type="text" id="username" class="form-control" placeholder="Username" required>
+          <div class="input-group-append"><div class="input-group-text"><span class="fas fa-user"></span></div></div>
+        </div>
+        <div class="input-group mb-3">
+          <input type="password" id="password" class="form-control" placeholder="Password" required>
+          <div class="input-group-append"><div class="input-group-text"><span class="fas fa-lock"></span></div></div>
+        </div>
+        <div class="row">
+          <div class="col-8"></div>
+          <div class="col-4"><button type="submit" class="btn btn-primary btn-block">Sign In</button></div>
+        </div>
+      </form>
+      <div class="social-auth-links text-center mt-2 mb-3">
+        <button class="btn btn-block btn-danger" onclick="googleLogin()">
+          <i class="fab fa-google mr-2"></i> Sign in with Google
+        </button>
+      </div>
+      <p class="mb-0"><a href="/register">Register a new account</a></p>
+    </div>
+  </div>
+</div>
+<script>
+document.getElementById('login-form').addEventListener('submit', async function(e){
+  e.preventDefault();
+  var errEl = document.getElementById('login-error');
+  errEl.style.display = 'none';
+  try {
+    var resp = await fetch('/api/auth/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username: document.getElementById('username').value, password: document.getElementById('password').value})
+    });
+    var data = await resp.json();
+    if (!resp.ok) { errEl.textContent = data.detail || 'Login failed'; errEl.style.display='block'; return; }
+    localStorage.setItem('access_token', data.access_token);
+    localStorage.setItem('refresh_token', data.refresh_token);
+    // Fetch user info
+    var ur = await fetch('/api/users/me', {headers:{'Authorization':'Bearer '+data.access_token}});
+    if (ur.ok) { var ui = await ur.json(); localStorage.setItem('user_info', JSON.stringify(ui)); }
+    window.location.href = '/dashboard';
+  } catch(err) { errEl.textContent = 'Connection error'; errEl.style.display='block'; }
+});
+function googleLogin() { alert('Google OAuth requires server-side configuration. Set LTS_GOOGLE_CLIENT_ID env var.'); }
+</script>
+</body>
+</html>

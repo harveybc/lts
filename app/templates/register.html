@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Register | LTS</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/admin-lte@3.2/dist/css/adminlte.min.css">
+</head>
+<body class="hold-transition register-page">
+<div class="register-box">
+  <div class="card card-outline card-primary">
+    <div class="card-header text-center"><h1><b>LTS</b> Trading</h1></div>
+    <div class="card-body">
+      <p class="login-box-msg">Register a new account</p>
+      <div id="reg-error" class="alert alert-danger" style="display:none;"></div>
+      <div id="reg-success" class="alert alert-success" style="display:none;"></div>
+      <form id="register-form">
+        <div class="input-group mb-3">
+          <input type="text" id="username" class="form-control" placeholder="Username" required minlength="3">
+          <div class="input-group-append"><div class="input-group-text"><span class="fas fa-user"></span></div></div>
+        </div>
+        <div class="input-group mb-3">
+          <input type="email" id="email" class="form-control" placeholder="Email" required>
+          <div class="input-group-append"><div class="input-group-text"><span class="fas fa-envelope"></span></div></div>
+        </div>
+        <div class="input-group mb-3">
+          <input type="password" id="password" class="form-control" placeholder="Password (min 8 chars, 1 upper, 1 digit)" required minlength="8">
+          <div class="input-group-append"><div class="input-group-text"><span class="fas fa-lock"></span></div></div>
+        </div>
+        <div class="row">
+          <div class="col-8"></div>
+          <div class="col-4"><button type="submit" class="btn btn-primary btn-block">Register</button></div>
+        </div>
+      </form>
+      <p class="mt-2"><a href="/login">Already have an account? Sign in</a></p>
+    </div>
+  </div>
+</div>
+<script>
+document.getElementById('register-form').addEventListener('submit', async function(e){
+  e.preventDefault();
+  var errEl = document.getElementById('reg-error');
+  var okEl = document.getElementById('reg-success');
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  try {
+    var resp = await fetch('/api/auth/register', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('username').value,
+        email: document.getElementById('email').value,
+        password: document.getElementById('password').value
+      })
+    });
+    var data = await resp.json();
+    if (!resp.ok) { errEl.textContent = data.detail || 'Registration failed'; errEl.style.display='block'; return; }
+    okEl.textContent = 'Registration successful! Redirecting to login...'; okEl.style.display='block';
+    setTimeout(function(){ window.location.href = '/login'; }, 2000);
+  } catch(err) { errEl.textContent = 'Connection error'; errEl.style.display='block'; }
+});
+</script>
+</body>
+</html>

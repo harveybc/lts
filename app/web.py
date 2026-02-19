@@ -50,9 +50,11 @@ app.add_middleware(
 )
 
 # Setup templates and static files
-templates = Jinja2Templates(directory="templates")
-if os.path.exists("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+_templates_dir = os.path.join(os.path.dirname(__file__), "templates")
+templates = Jinja2Templates(directory=_templates_dir)
+_static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
+if os.path.exists(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 
 # --- Security Utilities ---
 
@@ -171,12 +173,24 @@ async def limit_request_size(request: Request, call_next):
 # --- Public Pages ---
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def root_page(request: Request):
     return templates.TemplateResponse("dashboard.html", {"request": request})
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
     return templates.TemplateResponse("login.html", {"request": request})
+
+@app.get("/register", response_class=HTMLResponse)
+async def register_page(request: Request):
+    return templates.TemplateResponse("register.html", {"request": request})
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page(request: Request):
+    return templates.TemplateResponse("dashboard.html", {"request": request})
+
+@app.get("/trades", response_class=HTMLResponse)
+async def trades_page(request: Request):
+    return templates.TemplateResponse("trades.html", {"request": request})
 
 @app.get("/health")
 async def health_check():
@@ -351,6 +365,22 @@ async def users_page(request: Request):
 @app.get("/analytics", response_class=HTMLResponse)
 async def analytics_page(request: Request):
     return templates.TemplateResponse("analytics.html", {"request": request})
+
+@app.get("/portfolios/{portfolio_id}", response_class=HTMLResponse)
+async def portfolio_detail_page(request: Request, portfolio_id: int):
+    return templates.TemplateResponse("portfolio_detail.html", {"request": request})
+
+@app.get("/assets/{asset_id}", response_class=HTMLResponse)
+async def asset_detail_page(request: Request, asset_id: int):
+    return templates.TemplateResponse("asset_detail.html", {"request": request})
+
+@app.get("/admin/users", response_class=HTMLResponse)
+async def admin_users_page(request: Request):
+    return templates.TemplateResponse("admin_users.html", {"request": request})
+
+@app.get("/admin/system", response_class=HTMLResponse)
+async def admin_system_page(request: Request):
+    return templates.TemplateResponse("admin_system.html", {"request": request})
 
 if __name__ == "__main__":
     import uvicorn

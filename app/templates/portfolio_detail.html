@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}Portfolio Detail{% endblock %}
+{% block nav_portfolios %}active{% endblock %}
+{% block page_title %}Portfolio Detail{% endblock %}
+{% block content %}
+<div class="row">
+  <div class="col-md-4">
+    <div class="card card-primary">
+      <div class="card-header"><h3 class="card-title">Portfolio Info</h3></div>
+      <div class="card-body">
+        <p><strong>Name:</strong> <span id="pf-name"></span></p>
+        <p><strong>Capital:</strong> $<span id="pf-capital"></span></p>
+        <p><strong>Status:</strong> <span id="pf-status"></span></p>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-8">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Assets</h3>
+        <div class="card-tools">
+          <button class="btn btn-primary btn-sm" data-toggle="modal" data-target="#addAssetModal"><i class="fas fa-plus"></i> Add Asset</button>
+        </div>
+      </div>
+      <div class="card-body p-0">
+        <table class="table table-striped">
+          <thead><tr><th>Symbol</th><th>Capital</th><th>Strategy</th><th>Broker</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody id="asset-list"><tr><td colspan="6" class="text-center text-muted">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Add Asset Modal -->
+<div class="modal fade" id="addAssetModal">
+  <div class="modal-dialog"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title">Add Asset</h5><button type="button" class="close" data-dismiss="modal">&times;</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label>Symbol</label><input type="text" id="asset-symbol" class="form-control" placeholder="e.g. EUR/USD"></div>
+      <div class="form-group"><label>Allocated Capital</label><input type="number" id="asset-capital" class="form-control" value="1000" step="0.01"></div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-primary" onclick="addAsset()">Add</button></div>
+  </div></div>
+</div>
+{% endblock %}
+{% block extra_js %}
+<script>
+var portfolioId = window.location.pathname.split('/').pop();
+
+async function pageInit() {
+  // Fetch portfolio info via the existing core plugin route
+  var r = await apiFetch('/portfolios/' + portfolioId);
+  if (r && r.ok) {
+    var p = await r.json();
+    document.getElementById('pf-name').textContent = p.name;
+    document.getElementById('pf-capital').textContent = (p.total_capital||0).toFixed(2);
+    document.getElementById('pf-status').innerHTML = '<span class="badge badge-'+(p.is_active?'success':'secondary')+'">'+(p.is_active?'Active':'Inactive')+'</span>';
+  }
+  await loadAssets();
+}
+
+async function loadAssets() {
+  var r = await apiFetch('/portfolios/' + portfolioId + '/assets');
+  if (!r || !r.ok) return;
+  var data = await r.json();
+  var tb = document.getElementById('asset-list');
+  if (!data.length) { tb.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No assets</td></tr>'; return; }
+  tb.innerHTML = '';
+  data.forEach(function(a){
+    tb.innerHTML += '<tr><td><a href="/assets/'+a.id+'">'+a.symbol+'</a></td><td>$'+(a.allocated_capital||0).toFixed(2)+'</td><td>'+a.strategy_plugin+'</td><td>'+a.broker_plugin+'</td><td><span class="badge badge-'+(a.is_active?'success':'secondary')+'">'+(a.is_active?'Active':'Inactive')+'</span></td><td><a href="/assets/'+a.id+'" class="btn btn-xs btn-info"><i class="fas fa-cog"></i></a></td></tr>';
+  });
+}
+
+async function addAsset() {
+  var r = await apiFetch('/portfolios/' + portfolioId + '/assets', {
+    method:'POST',
+    body: JSON.stringify({symbol: document.getElementById('asset-symbol').value, allocated_capital: parseFloat(document.getElementById('asset-capital').value)||0})
+  });
+  if (r && r.ok) { $('#addAssetModal').modal('hide'); flash('Asset added','success'); await loadAssets(); }
+  else { var d = await r.json(); flash(d.detail || 'Error','error'); }
+}
+</script>
+{% endblock %}

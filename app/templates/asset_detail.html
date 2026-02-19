@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Asset Config{% endblock %}
+{% block nav_portfolios %}active{% endblock %}
+{% block page_title %}Asset Configuration{% endblock %}
+{% block content %}
+<div class="row">
+  <div class="col-md-6">
+    <div class="card card-primary">
+      <div class="card-header"><h3 class="card-title">Asset Info</h3></div>
+      <div class="card-body">
+        <p><strong>Symbol:</strong> <span id="asset-symbol"></span></p>
+        <p><strong>Status:</strong> <span id="asset-status"></span></p>
+        <div class="form-group">
+          <label>Allocated Capital</label>
+          <input type="number" id="asset-capital" class="form-control" step="0.01">
+        </div>
+        <button class="btn btn-primary" onclick="updateAllocation()">Update Capital</button>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card card-info">
+      <div class="card-header"><h3 class="card-title">Strategy Configuration</h3></div>
+      <div class="card-body">
+        <div class="form-group">
+          <label>Strategy Plugin</label>
+          <select id="strategy-plugin" class="form-control">
+            <option value="default_strategy">Default Strategy</option>
+            <option value="prediction_strategy">Prediction Strategy</option>
+            <option value="heuristic_strategy">Heuristic Strategy</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Exit Variant</label>
+          <select id="exit-variant" class="form-control">
+            <option value="A">A - min(hourly+daily) vs SL</option>
+            <option value="B">B - Long-term only exit</option>
+            <option value="C">C - Short-term only exit</option>
+            <option value="D">D - Both must agree</option>
+            <option value="E" selected>E - Weighted 0.6*hourly + 0.4*daily</option>
+            <option value="F">F - Short-term with buffer</option>
+            <option value="G">G - No early close (TP only)</option>
+          </select>
+        </div>
+        <div class="form-group"><label>Leverage</label><input type="number" id="leverage" class="form-control" value="100"></div>
+        <button class="btn btn-info" onclick="updateStrategy()">Update Strategy</button>
+      </div>
+    </div>
+    <div class="card card-warning">
+      <div class="card-header"><h3 class="card-title">Broker Configuration</h3></div>
+      <div class="card-body">
+        <div class="form-group">
+          <label>Broker Plugin</label>
+          <select id="broker-plugin" class="form-control">
+            <option value="default_broker">Default Broker</option>
+            <option value="oanda_broker">OANDA Broker</option>
+            <option value="backtrader_broker">Backtrader Broker</option>
+          </select>
+        </div>
+        <button class="btn btn-warning" onclick="updateBroker()">Update Broker</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block extra_js %}
+<script>
+var assetId = window.location.pathname.split('/').pop();
+
+async function pageInit() {
+  // Load asset info via positions/orders as proxy
+  document.getElementById('asset-symbol').textContent = 'Asset #' + assetId;
+  document.getElementById('asset-status').innerHTML = '<span class="badge badge-success">Active</span>';
+}
+
+async function updateAllocation() {
+  var r = await apiFetch('/assets/' + assetId + '/allocation', {method:'PATCH', body:JSON.stringify({allocated_capital: parseFloat(document.getElementById('asset-capital').value)})});
+  if (r && r.ok) flash('Allocation updated','success'); else flash('Error','error');
+}
+async function updateStrategy() {
+  var r = await apiFetch('/assets/' + assetId + '/strategy', {method:'PATCH', body:JSON.stringify({strategy_plugin: document.getElementById('strategy-plugin').value, exit_variant: document.getElementById('exit-variant').value, leverage: parseInt(document.getElementById('leverage').value)})});
+  if (r && r.ok) flash('Strategy updated','success'); else flash('Error','error');
+}
+async function updateBroker() {
+  var r = await apiFetch('/assets/' + assetId + '/broker', {method:'PATCH', body:JSON.stringify({broker_plugin: document.getElementById('broker-plugin').value})});
+  if (r && r.ok) flash('Broker updated','success'); else flash('Error','error');
+}
+</script>
+{% endblock %}

@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Analytics{% endblock %}
+{% block nav_analytics %}active{% endblock %}
+{% block page_title %}Performance Analytics{% endblock %}
+{% block content %}
+<div class="row">
+  <div class="col-lg-3 col-6">
+    <div class="small-box bg-info"><div class="inner"><h3 id="total-return">-</h3><p>Total Return</p></div><div class="icon"><i class="fas fa-percentage"></i></div></div>
+  </div>
+  <div class="col-lg-3 col-6">
+    <div class="small-box bg-success"><div class="inner"><h3 id="win-rate">-</h3><p>Win Rate</p></div><div class="icon"><i class="fas fa-trophy"></i></div></div>
+  </div>
+  <div class="col-lg-3 col-6">
+    <div class="small-box bg-warning"><div class="inner"><h3 id="sharpe">-</h3><p>Sharpe Ratio</p></div><div class="icon"><i class="fas fa-balance-scale"></i></div></div>
+  </div>
+  <div class="col-lg-3 col-6">
+    <div class="small-box bg-danger"><div class="inner"><h3 id="max-dd">-</h3><p>Max Drawdown</p></div><div class="icon"><i class="fas fa-arrow-down"></i></div></div>
+  </div>
+</div>
+<div class="card">
+  <div class="card-header"><h3 class="card-title">Equity Curve</h3></div>
+  <div class="card-body"><canvas id="equity-chart" height="200"></canvas><p class="text-muted text-center mt-2">Equity curve will render with sufficient trade data</p></div>
+</div>
+{% endblock %}
+{% block extra_js %}
+<script>
+async function pageInit() {
+  var r = await apiFetch('/api/statistics');
+  if (!r || !r.ok) return;
+  var stats = await r.json();
+  stats.forEach(function(s){
+    if (s.key === 'total_return') document.getElementById('total-return').textContent = s.value + '%';
+    if (s.key === 'win_rate') document.getElementById('win-rate').textContent = s.value + '%';
+    if (s.key === 'sharpe_ratio') document.getElementById('sharpe').textContent = parseFloat(s.value).toFixed(2);
+    if (s.key === 'max_drawdown') document.getElementById('max-dd').textContent = s.value + '%';
+  });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block nav_dashboard %}active{% endblock %}
+{% block page_title %}Dashboard{% endblock %}
+{% block content %}
+<div class="row">
+  <div class="col-lg-3 col-6">
+    <div class="small-box bg-info">
+      <div class="inner"><h3 id="total-balance">$0</h3><p>Total Balance</p></div>
+      <div class="icon"><i class="fas fa-dollar-sign"></i></div>
+    </div>
+  </div>
+  <div class="col-lg-3 col-6">
+    <div class="small-box bg-success">
+      <div class="inner"><h3 id="active-portfolios">0</h3><p>Active Portfolios</p></div>
+      <div class="icon"><i class="fas fa-briefcase"></i></div>
+    </div>
+  </div>
+  <div class="col-lg-3 col-6">
+    <div class="small-box bg-warning">
+      <div class="inner"><h3 id="open-positions">0</h3><p>Open Positions</p></div>
+      <div class="icon"><i class="fas fa-chart-bar"></i></div>
+    </div>
+  </div>
+  <div class="col-lg-3 col-6">
+    <div class="small-box bg-danger">
+      <div class="inner"><h3 id="total-pnl">$0</h3><p>Total P&amp;L</p></div>
+      <div class="icon"><i class="fas fa-chart-line"></i></div>
+    </div>
+  </div>
+</div>
+<div class="row">
+  <div class="col-md-8">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">P&amp;L Chart</h3></div>
+      <div class="card-body"><canvas id="pnl-chart" height="200"></canvas><p class="text-muted text-center mt-2">Chart loads with trade data</p></div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Recent Trades</h3></div>
+      <div class="card-body p-0">
+        <table class="table table-sm table-striped">
+          <thead><tr><th>Symbol</th><th>Type</th><th>Status</th></tr></thead>
+          <tbody id="recent-trades"><tr><td colspan="3" class="text-center text-muted">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block extra_js %}
+<script>
+async function pageInit() {
+  // Portfolios
+  var pr = await apiFetch('/api/portfolios');
+  if (pr && pr.ok) {
+    var portfolios = await pr.json();
+    var active = portfolios.filter(function(p){ return p.is_active; });
+    var totalCap = portfolios.reduce(function(s,p){ return s + (p.total_capital||0); }, 0);
+    document.getElementById('active-portfolios').textContent = active.length;
+    document.getElementById('total-balance').textContent = '$' + totalCap.toFixed(2);
+  }
+  // Positions
+  var posr = await apiFetch('/api/positions');
+  if (posr && posr.ok) {
+    var positions = await posr.json();
+    document.getElementById('open-positions').textContent = positions.length;
+    var pnl = positions.reduce(function(s,p){ return s + (p.unrealized_pnl||0); }, 0);
+    document.getElementById('total-pnl').textContent = '$' + pnl.toFixed(2);
+  }
+  // Recent orders
+  var or_ = await apiFetch('/api/orders');
+  if (or_ && or_.ok) {
+    var orders = await or_.json();
+    var tbody = document.getElementById('recent-trades');
+    if (orders.length === 0) { tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">No trades yet</td></tr>'; }
+    else {
+      tbody.innerHTML = '';
+      orders.slice(0, 10).forEach(function(o){
+        tbody.innerHTML += '<tr><td>'+o.symbol+'</td><td>'+o.order_type+'</td><td><span class="badge badge-'+(o.status==='filled'?'success':'secondary')+'">'+o.status+'</span></td></tr>';
+      });
+    }
+  }
+}
+</script>
+{% endblock %}
