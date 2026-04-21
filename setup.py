@@ -23,7 +23,10 @@ setup(
         # Strategy plugins - Trading decision logic
         'plugins_strategy': [
             'default_strategy=plugins_strategy.default_strategy:DefaultStrategy',
-            'prediction_strategy=plugins_strategy.prediction_strategy:PredictionBasedStrategy'
+            'prediction_strategy=plugins_strategy.prediction_strategy:PredictionBasedStrategy',
+            'eurusd_mr_strategy=plugins_strategy.eurusd_mr_strategy:EurUsdMrStrategy',
+            'usdjpy_tsmom_strategy=plugins_strategy.usdjpy_tsmom_strategy:UsdJpyTsmomStrategy',
+            'usdjpy_dual_momentum_strategy=plugins_strategy.usdjpy_dual_momentum_strategy:UsdJpyDualMomentumStrategy'
         ],
         # Broker plugins - Connection and execution with brokers
         'plugins_broker': [
