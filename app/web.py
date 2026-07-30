@@ -174,23 +174,23 @@ async def limit_request_size(request: Request, call_next):
 
 @app.get("/", response_class=HTMLResponse)
 async def root_page(request: Request):
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+    return templates.TemplateResponse(request, "dashboard.html")
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request})
+    return templates.TemplateResponse(request, "login.html")
 
 @app.get("/register", response_class=HTMLResponse)
 async def register_page(request: Request):
-    return templates.TemplateResponse("register.html", {"request": request})
+    return templates.TemplateResponse(request, "register.html")
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+    return templates.TemplateResponse(request, "dashboard.html")
 
 @app.get("/trades", response_class=HTMLResponse)
 async def trades_page(request: Request):
-    return templates.TemplateResponse("trades.html", {"request": request})
+    return templates.TemplateResponse(request, "trades.html")
 
 @app.get("/health")
 async def health_check():
@@ -352,35 +352,35 @@ async def get_my_billing(current_user: User = Depends(get_current_user), db: DBS
 # HTML pages (require auth check in frontend)
 @app.get("/portfolios", response_class=HTMLResponse)
 async def portfolios_page(request: Request):
-    return templates.TemplateResponse("portfolios.html", {"request": request})
+    return templates.TemplateResponse(request, "portfolios.html")
 
 @app.get("/assets", response_class=HTMLResponse)
 async def assets_page(request: Request):
-    return templates.TemplateResponse("assets.html", {"request": request})
+    return templates.TemplateResponse(request, "assets.html")
 
 @app.get("/users", response_class=HTMLResponse)
 async def users_page(request: Request):
-    return templates.TemplateResponse("users.html", {"request": request})
+    return templates.TemplateResponse(request, "users.html")
 
 @app.get("/analytics", response_class=HTMLResponse)
 async def analytics_page(request: Request):
-    return templates.TemplateResponse("analytics.html", {"request": request})
+    return templates.TemplateResponse(request, "analytics.html")
 
 @app.get("/portfolios/{portfolio_id}", response_class=HTMLResponse)
 async def portfolio_detail_page(request: Request, portfolio_id: int):
-    return templates.TemplateResponse("portfolio_detail.html", {"request": request})
+    return templates.TemplateResponse(request, "portfolio_detail.html")
 
 @app.get("/assets/{asset_id}", response_class=HTMLResponse)
 async def asset_detail_page(request: Request, asset_id: int):
-    return templates.TemplateResponse("asset_detail.html", {"request": request})
+    return templates.TemplateResponse(request, "asset_detail.html")
 
 @app.get("/admin/users", response_class=HTMLResponse)
 async def admin_users_page(request: Request):
-    return templates.TemplateResponse("admin_users.html", {"request": request})
+    return templates.TemplateResponse(request, "admin_users.html")
 
 @app.get("/admin/system", response_class=HTMLResponse)
 async def admin_system_page(request: Request):
-    return templates.TemplateResponse("admin_system.html", {"request": request})
+    return templates.TemplateResponse(request, "admin_system.html")
 
 if __name__ == "__main__":
     import uvicorn

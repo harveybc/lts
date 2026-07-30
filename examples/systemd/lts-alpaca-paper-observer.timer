@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the LTS Alpaca Paper observer every five minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=lts-alpaca-paper-observer.service
+
+[Install]
+WantedBy=timers.target

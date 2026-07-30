@@ -1,0 +1,12 @@
+[Unit]
+Description=Check IBKR TWS Paper availability every five minutes
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=lts-ibkr-paper-observer.service
+
+[Install]
+WantedBy=timers.target

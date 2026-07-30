@@ -1,0 +1,17 @@
+[Unit]
+Description=LTS Paper/Shadow execution watchdog and Telegram reporter
+After=network-online.target lts-alpaca-paper-observer.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/GitHub/lts
+ExecStart=%h/anaconda3/envs/trading-stack/bin/python %h/Documents/GitHub/lts/tools/paper_execution_watchdog.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/lts
+
+[Install]
+WantedBy=default.target

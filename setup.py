@@ -7,7 +7,9 @@ setup(
     entry_points={
         'console_scripts': [
             'lts=app.main:main',
-            'lts-oanda-practice=app.oanda_practice_cli:main'
+            'lts-oanda-practice=app.oanda_practice_cli:main',
+            'lts-alpaca-paper=app.alpaca_paper_cli:main',
+            'lts-ibkr-paper=app.ibkr_paper_cli:main'
         ],
         # AAA plugins - Authentication, Authorization, Accounting
         'plugins_aaa': [
@@ -34,7 +36,9 @@ setup(
             'default_broker=plugins_broker.default_broker:DefaultBroker',
             'backtrader_broker=plugins_broker.backtrader_broker:BacktraderBroker',
             'backtrader_simulation_broker=plugins_broker.backtrader_simulation_broker:BacktraderSimulationBroker',
-            'oanda_broker=plugins_broker.oanda_broker:OandaBroker'
+            'oanda_broker=plugins_broker.oanda_broker:OandaBroker',
+            'alpaca_paper_broker=plugins_broker.alpaca_paper_broker:AlpacaPaperBroker',
+            'ibkr_paper_broker=plugins_broker.ibkr_paper_broker:IbkrPaperBroker'
         ],
         # Portfolio plugins - Capital allocation management
         'plugins_portfolio': [
@@ -61,9 +65,9 @@ setup(
         'schedule',
         'matplotlib',
         'seaborn',
-        'backtrader',  # For broker simulation
         'python-dateutil',  # For datetime parsing
-        'oandapyV20'  # OANDA v20 REST API client
+        'oandapyV20',  # OANDA v20 REST API client
+        'ib_async==2.1.0'  # Current maintained TWS API client wrapper
     ],
     author='LTS Development Team',
     author_email='lts@example.com',

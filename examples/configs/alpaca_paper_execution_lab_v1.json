@@ -1,0 +1,90 @@
+{
+  "schema": "lts.alpaca.paper_lab_config.v1",
+  "environment": "paper",
+  "trading_base_url": "https://paper-api.alpaca.markets",
+  "data_base_url": "https://data.alpaca.markets",
+  "data_location": "us",
+  "timeout_seconds": 20,
+  "database_path": "~/.local/state/lts/alpaca-paper-lab.sqlite",
+  "secrets": {
+    "api_key_env": "ALPACA_PAPER_API_KEY_ID",
+    "api_secret_env": "ALPACA_PAPER_API_SECRET_KEY"
+  },
+  "orders": {
+    "enabled": false
+  },
+  "instruments": [
+    {
+      "cell_id": "solusdt_1h",
+      "canonical_asset": "solusdt",
+      "alpaca_symbol": "SOL/USD",
+      "asset_class": "crypto",
+      "role": "short_horizon",
+      "timeframe": "1h",
+      "priority": 1
+    },
+    {
+      "cell_id": "btcusdt_1h",
+      "canonical_asset": "btcusdt",
+      "alpaca_symbol": "BTC/USD",
+      "asset_class": "crypto",
+      "role": "short_horizon",
+      "timeframe": "1h",
+      "priority": 2
+    },
+    {
+      "cell_id": "adausdt_1h",
+      "canonical_asset": "adausdt",
+      "alpaca_symbol": "ADA/USD",
+      "asset_class": "crypto",
+      "role": "short_horizon",
+      "timeframe": "1h",
+      "priority": 3
+    },
+    {
+      "cell_id": "xrpusdt_1h",
+      "canonical_asset": "xrpusdt",
+      "alpaca_symbol": "XRP/USD",
+      "asset_class": "crypto",
+      "role": "short_horizon_alternate",
+      "timeframe": "1h",
+      "priority": 4
+    },
+    {
+      "cell_id": "ethusdt_1h",
+      "canonical_asset": "ethusdt",
+      "alpaca_symbol": "ETH/USD",
+      "asset_class": "crypto",
+      "role": "short_horizon_alternate",
+      "timeframe": "1h",
+      "priority": 5
+    },
+    {
+      "cell_id": "solusdt_4h",
+      "canonical_asset": "solusdt",
+      "alpaca_symbol": "SOL/USD",
+      "asset_class": "crypto",
+      "role": "medium_long_horizon",
+      "timeframe": "4h",
+      "priority": 6
+    },
+    {
+      "cell_id": "dogeusdt_4h",
+      "canonical_asset": "dogeusdt",
+      "alpaca_symbol": "DOGE/USD",
+      "asset_class": "crypto",
+      "role": "medium_long_horizon",
+      "timeframe": "4h",
+      "priority": 7
+    },
+    {
+      "cell_id": "ethusdt_4h",
+      "canonical_asset": "ethusdt",
+      "alpaca_symbol": "ETH/USD",
+      "asset_class": "crypto",
+      "role": "medium_long_horizon",
+      "timeframe": "4h",
+      "priority": 8
+    }
+  ]
+}

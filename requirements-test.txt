@@ -1,3 +1,6 @@
 fastapi
 starlette
 httpx
+pytest
+pytest-asyncio
+pytest-mock

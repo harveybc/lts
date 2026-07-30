@@ -1,6 +1,6 @@
 # Multi-Venue Paper Execution
 
-Status: specified; account credentials not yet provisioned to LTS
+Status: Alpaca observation active; IBKR observer waiting for TWS Paper; OANDA not configured
 Date: 2026-07-29
 
 ## Account State
@@ -10,7 +10,11 @@ User-reported:
 - Alpaca Trading API account: created and verified;
 - IBKR Individual Margin account: created and verified;
 - OANDA Global Markets live account: compliance review pending;
-- OANDA Global Markets MT5 demo: still requires local creation/credentials.
+- OANDA Global Markets MT5 demo: still requires local creation/credentials;
+- Alpaca Paper credentials: provisioned locally and verified by the read-only
+  preflight;
+- IBKR TWS Paper: local observer installed, currently waiting for TWS on
+  `127.0.0.1:7497`.
 
 Never commit or paste credentials, raw account IDs or recovery information.
 
@@ -74,12 +78,74 @@ inside the MT5 Strategy Tester.
 6. Run a seven-day consolidated paper portfolio with one synthetic NAV.
 7. Require explicit approval before any real-capital pilot.
 
+## Active Observation Runtime
+
+Omega currently runs three five-minute user timers:
+
+- `lts-alpaca-paper-observer.timer` records account/instrument capabilities,
+  quotes, endpoint latency and reconciliation facts;
+- `lts-ibkr-paper-observer.timer` waits without failing while TWS is closed and
+  runs the read-only contract preflight when Paper port `7497` is available;
+- `lts-paper-execution-watchdog.timer` checks freshness, endpoint failures,
+  missing quotes, unexpected exposure and venue availability.
+
+The watchdog writes restart-safe state under `~/.local/state/lts`, records
+event transitions in SQLite and sends deduplicated Telegram alerts through the
+existing Hermes bot configuration. It also emits a sanitized discussion packet
+for Hermes. A bounded DeepSeek review runs every 12 hours with only the `todo`
+toolset and cannot place orders, change risk, enqueue jobs or promote models.
+Interesting one-hour and four-hour moves are discussion candidates, never
+automatic trading signals.
+
+## Alpaca Paper Credentials
+
+Generate credentials while the Alpaca dashboard is in Paper Trading mode, then
+store them locally with one interactive command:
+
+```bash
+./examples/scripts/configure_alpaca_paper.sh
+```
+
+The script hides the secret while it is entered and writes
+`~/.config/lts/alpaca-paper.env` with mode `600`. Credentials never belong in
+Git, documentation, command arguments or chat.
+
+## IBKR Paper Startup
+
+IBKR has no API key/secret pair. Start TWS for Linux in Paper mode, authenticate
+interactively with 2FA, enable socket clients, retain Read-Only API and use
+port `7497`. Then run:
+
+```bash
+./examples/scripts/enable_ibkr_paper_observer.sh
+```
+
+IB Gateway Paper may later use port `4002`, but the initial laboratory is
+intentionally pinned to local TWS Paper `7497`.
+
+## OANDA Credential Boundaries
+
+If the account division supplies a REST-v20 Practice account ID and token:
+
+```bash
+./examples/scripts/configure_oanda_practice.sh
+```
+
+OANDA Global Markets MT5 credentials are different: login, password and
+`OANDA_Global-Demo-1` are entered inside MT5 Desktop and must not be stored by
+the Linux observer. MT5 Web Trader cannot run Expert Advisors. The preferred
+host is a dedicated Windows VM on a Linux machine so the Linux worker remains
+available; native dual boot is acceptable but removes that worker while
+Windows is running. Wine is a compatibility fallback, not the first unattended
+execution host.
+
 ## Required Next Inputs
 
-- Alpaca Paper key ID and secret stored locally, never in chat/Git;
-- IBKR Paper username and TWS login/API availability;
-- OANDA MT5 demo login, password and `OANDA_Global-Demo-1` server;
-- Windows host selected for the OANDA MT5 terminal and EA.
+- start IBKR TWS in Paper mode on Omega and confirm port `7497`;
+- create the OANDA Global Markets MT5 demo and retain its credentials locally;
+- select and provision the Windows VM for the MT5 terminal and EA bridge;
+- obtain REST-v20 Practice credentials only if the OANDA division exposes that
+  API; MT5 credentials cannot be used with REST v20.
 
 The complete architecture, OLAP contract and social-trading boundary are in:
 

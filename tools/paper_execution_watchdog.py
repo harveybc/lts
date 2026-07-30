@@ -1,0 +1,823 @@
+#!/usr/bin/env python3
+"""Monitor Paper/Shadow execution facts and notify the Hermes Telegram group."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import math
+import os
+import socket
+import sqlite3
+import statistics
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
+
+
+STATE_SCHEMA = "lts.paper_execution_watchdog.v1"
+EXPECTED_ALPACA_SYMBOLS = {
+    "ADA/USD",
+    "BTC/USD",
+    "DOGE/USD",
+    "ETH/USD",
+    "SOL/USD",
+    "XRP/USD",
+}
+DEFAULT_ALPACA_DB = Path.home() / ".local/state/lts/alpaca-paper-lab.sqlite"
+DEFAULT_OANDA_DB = Path.home() / ".local/state/lts/oanda-practice-lab.sqlite"
+DEFAULT_OANDA_ENV = Path.home() / ".config/lts/oanda-practice.env"
+DEFAULT_STATE = Path.home() / ".local/state/lts/paper-execution-watchdog/state.json"
+DEFAULT_LATEST = Path.home() / ".local/state/lts/paper-execution-watchdog/latest.json"
+DEFAULT_DISCUSSION = Path.home() / ".local/state/lts/hermes/live-trading-discussion.json"
+DEFAULT_MONITOR_DB = Path.home() / ".local/state/lts/paper-execution-monitor.sqlite"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_time(value: Any) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() not in os.environ:
+            os.environ[key.strip()] = value.strip().strip('"').strip("'")
+
+
+def _load_notification_environment() -> None:
+    _load_env_file(Path.home() / ".hermes/.env")
+    _load_env_file(
+        Path.home() / "Documents/GitHub/financial-data/_metadata/.env"
+    )
+
+
+def _split_message(text: str, limit: int = 3800) -> list[str]:
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _send_telegram(text: str) -> None:
+    _load_notification_environment()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = (
+        os.environ.get("PROJECT3_TELEGRAM_CHAT_ID", "").strip()
+        or os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
+    )
+    if not token or not chat_id:
+        raise RuntimeError("Hermes Telegram bot or home channel is not configured")
+    endpoint = f"https://api.telegram.org/bot{token}/sendMessage"
+    for chunk in _split_message(text):
+        body = urllib.parse.urlencode(
+            {
+                "chat_id": chat_id,
+                "text": chunk,
+                "disable_web_page_preview": "true",
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(endpoint, data=body, method="POST")
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                if not result.get("ok"):
+                    raise RuntimeError("Telegram rejected the notification")
+                break
+            except (urllib.error.URLError, ConnectionError, TimeoutError):
+                if attempt == 2:
+                    raise
+                time.sleep(2**attempt)
+
+
+def _percentile(values: Sequence[float], percentile: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = (len(ordered) - 1) * percentile
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    if lower == upper:
+        return ordered[lower]
+    weight = index - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _event(
+    key: str,
+    title: str,
+    detail: str,
+    *,
+    severity: str,
+    category: str,
+    discussion: bool = False,
+) -> dict[str, Any]:
+    return {
+        "key": key,
+        "title": title,
+        "detail": detail,
+        "severity": severity,
+        "category": category,
+        "discussion": discussion,
+    }
+
+
+def read_alpaca_snapshot(path: Path, now: float) -> dict[str, Any]:
+    if not path.exists():
+        return {"available": False, "reason": "database_missing"}
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        latest = connection.execute(
+            """
+            SELECT session_id,status,started_at,ended_at,detail_json
+            FROM lab_sessions ORDER BY started_at DESC LIMIT 1
+            """
+        ).fetchone()
+        if latest is None:
+            return {"available": False, "reason": "no_sessions"}
+        detail = json.loads(latest["detail_json"])
+        probes = connection.execute(
+            """
+            SELECT endpoint,latency_ms,http_status,success,error_kind
+            FROM endpoint_probes WHERE session_id=? ORDER BY id
+            """,
+            (latest["session_id"],),
+        ).fetchall()
+        quotes = connection.execute(
+            """
+            SELECT symbol,observed_at,broker_time,mid,spread_bps
+            FROM quote_observations WHERE session_id=? ORDER BY symbol
+            """,
+            (latest["session_id"],),
+        ).fetchall()
+        sessions = connection.execute(
+            "SELECT COUNT(*) FROM lab_sessions WHERE status='complete'"
+        ).fetchone()[0]
+        history = connection.execute(
+            """
+            SELECT symbol,observed_at,mid,spread_bps
+            FROM quote_observations
+            WHERE observed_at >= ?
+            ORDER BY symbol,observed_at
+            """,
+            (
+                datetime.fromtimestamp(now - 5 * 3600, timezone.utc).isoformat(),
+            ),
+        ).fetchall()
+        return {
+            "available": True,
+            "session_id": latest["session_id"],
+            "status": latest["status"],
+            "started_at": latest["started_at"],
+            "ended_at": latest["ended_at"],
+            "detail": detail,
+            "probes": [dict(row) for row in probes],
+            "quotes": [dict(row) for row in quotes],
+            "history": [dict(row) for row in history],
+            "complete_sessions": sessions,
+        }
+    finally:
+        connection.close()
+
+
+def read_ibkr_socket(host: str, port: int, timeout: float = 1.0) -> dict[str, Any]:
+    started = time.perf_counter()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+    return {
+        "available": result == 0,
+        "host": host,
+        "port": port,
+        "latency_ms": (time.perf_counter() - started) * 1000.0,
+        "connect_errno": result,
+    }
+
+
+def read_oanda_snapshot(
+    path: Path,
+    environment_path: Path,
+) -> dict[str, Any]:
+    configured = environment_path.exists()
+    if not path.exists():
+        return {
+            "available": False,
+            "configured": configured,
+            "reason": "database_missing" if configured else "not_configured",
+        }
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        latest_session = connection.execute(
+            """
+            SELECT session_id,phase,status,started_at,ended_at
+            FROM lab_sessions ORDER BY started_at DESC LIMIT 1
+            """
+        ).fetchone()
+        latest_price = connection.execute(
+            """
+            SELECT observed_at,broker_time,instrument,spread_bps
+            FROM price_observations ORDER BY observed_at DESC LIMIT 1
+            """
+        ).fetchone()
+        latest_account = connection.execute(
+            """
+            SELECT observed_at,nav,open_trade_count,open_position_count,
+                   pending_order_count
+            FROM account_snapshots ORDER BY observed_at DESC LIMIT 1
+            """
+        ).fetchone()
+        price_count = connection.execute(
+            "SELECT COUNT(*) FROM price_observations"
+        ).fetchone()[0]
+        return {
+            "available": latest_session is not None,
+            "configured": configured,
+            "reason": None if latest_session is not None else "no_sessions",
+            "latest_session": (
+                dict(latest_session) if latest_session is not None else None
+            ),
+            "latest_price": dict(latest_price) if latest_price is not None else None,
+            "latest_account": (
+                dict(latest_account) if latest_account is not None else None
+            ),
+            "price_observations": int(price_count),
+        }
+    finally:
+        connection.close()
+
+
+def _return_over_horizon(
+    rows: Sequence[Mapping[str, Any]],
+    now: float,
+    horizon_seconds: float,
+) -> Optional[float]:
+    usable = [
+        row
+        for row in rows
+        if row.get("mid") not in (None, 0) and _parse_time(row.get("observed_at"))
+    ]
+    if len(usable) < 3:
+        return None
+    latest = usable[-1]
+    latest_time = _parse_time(latest["observed_at"])
+    if latest_time is None:
+        return None
+    target = latest_time - horizon_seconds
+    eligible = [
+        row
+        for row in usable
+        if (_parse_time(row["observed_at"]) or now) <= target
+    ]
+    if not eligible:
+        return None
+    prior = max(eligible, key=lambda row: _parse_time(row["observed_at"]) or 0)
+    return float(latest["mid"]) / float(prior["mid"]) - 1.0
+
+
+def evaluate(
+    alpaca: Mapping[str, Any],
+    ibkr: Mapping[str, Any],
+    oanda: Optional[Mapping[str, Any]] = None,
+    *,
+    now: float,
+    stale_seconds: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    events: list[dict[str, Any]] = []
+    discussions: list[dict[str, Any]] = []
+    if not alpaca.get("available"):
+        events.append(
+            _event(
+                "alpaca_observer_missing",
+                "LTS PAPER ALERT: ALPACA OBSERVER HAS NO DATA",
+                f"reason: {alpaca.get('reason', 'unknown')}",
+                severity="critical",
+                category="operations",
+            )
+        )
+    else:
+        ended_at = _parse_time(alpaca.get("ended_at"))
+        if ended_at is None or now - ended_at > stale_seconds:
+            age = "unknown" if ended_at is None else f"{(now - ended_at) / 60:.1f} min"
+            events.append(
+                _event(
+                    "alpaca_observer_stale",
+                    "LTS PAPER ALERT: ALPACA OBSERVER STALE",
+                    f"latest completed observation age: {age}",
+                    severity="critical",
+                    category="operations",
+                )
+            )
+        if alpaca.get("status") != "complete":
+            events.append(
+                _event(
+                    "alpaca_session_failed",
+                    "LTS PAPER ALERT: ALPACA PREFLIGHT FAILED",
+                    f"session status: {alpaca.get('status')}",
+                    severity="critical",
+                    category="operations",
+                )
+            )
+        detail = alpaca.get("detail") or {}
+        if detail.get("account_blocked") or detail.get("trading_blocked"):
+            events.append(
+                _event(
+                    "alpaca_account_blocked",
+                    "LTS PAPER ALERT: ALPACA ACCOUNT BLOCKED",
+                    (
+                        f"account_blocked: {detail.get('account_blocked')}\n"
+                        f"trading_blocked: {detail.get('trading_blocked')}"
+                    ),
+                    severity="critical",
+                    category="broker",
+                )
+            )
+        missing = sorted(detail.get("missing_cells") or [])
+        if missing:
+            events.append(
+                _event(
+                    "alpaca_cells_missing",
+                    "LTS PAPER ALERT: ALPACA CELLS MISSING",
+                    "missing: " + ", ".join(missing),
+                    severity="warning",
+                    category="broker",
+                )
+            )
+        received = set(detail.get("quotes_received") or [])
+        missing_quotes = sorted(EXPECTED_ALPACA_SYMBOLS - received)
+        if missing_quotes:
+            events.append(
+                _event(
+                    "alpaca_quotes_missing",
+                    "LTS PAPER ALERT: ALPACA QUOTES MISSING",
+                    "missing: " + ", ".join(missing_quotes),
+                    severity="warning",
+                    category="market_data",
+                )
+            )
+        positions = int(detail.get("open_positions") or 0)
+        orders = int(detail.get("open_orders") or 0)
+        if positions or orders:
+            events.append(
+                _event(
+                    "alpaca_unexpected_exposure",
+                    "LTS PAPER ALERT: UNEXPECTED ALPACA EXPOSURE",
+                    (
+                        f"open positions: {positions}\n"
+                        f"open orders: {orders}\n"
+                        "The observer is read-only; inspect the account manually."
+                    ),
+                    severity="critical",
+                    category="reconciliation",
+                )
+            )
+        failed_endpoints = [
+            item["endpoint"]
+            for item in alpaca.get("probes") or []
+            if not item.get("success")
+        ]
+        if failed_endpoints:
+            events.append(
+                _event(
+                    "alpaca_endpoint_failure",
+                    "LTS PAPER ALERT: ALPACA API FAILURE",
+                    "failed endpoints: " + ", ".join(sorted(failed_endpoints)),
+                    severity="warning",
+                    category="operations",
+                )
+            )
+
+        history_by_symbol: dict[str, list[Mapping[str, Any]]] = {}
+        for row in alpaca.get("history") or []:
+            history_by_symbol.setdefault(str(row["symbol"]), []).append(row)
+        for symbol, rows in sorted(history_by_symbol.items()):
+            one_hour = _return_over_horizon(rows, now, 3600)
+            four_hour = _return_over_horizon(rows, now, 4 * 3600)
+            if one_hour is not None and abs(one_hour) >= 0.02:
+                discussions.append(
+                    _event(
+                        f"rush_1h:{symbol}:{int(now // 3600)}",
+                        "LTS DISCUSSION: ONE-HOUR MOVE",
+                        (
+                            f"symbol: {symbol}\n"
+                            f"one-hour mid return: {one_hour:+.2%}\n"
+                            "No order was submitted. Review as a rush/event-study candidate."
+                        ),
+                        severity="info",
+                        category="research",
+                        discussion=True,
+                    )
+                )
+            if four_hour is not None and abs(four_hour) >= 0.05:
+                discussions.append(
+                    _event(
+                        f"rush_4h:{symbol}:{int(now // (4 * 3600))}",
+                        "LTS DISCUSSION: FOUR-HOUR MOVE",
+                        (
+                            f"symbol: {symbol}\n"
+                            f"four-hour mid return: {four_hour:+.2%}\n"
+                            "No order was submitted. Review causal/event context before queueing research."
+                        ),
+                        severity="info",
+                        category="research",
+                        discussion=True,
+                    )
+                )
+
+    if not ibkr.get("available"):
+        events.append(
+            _event(
+                "ibkr_paper_offline",
+                "LTS PAPER ACTION REQUIRED: IBKR TWS OFFLINE",
+                (
+                    f"endpoint: {ibkr.get('host')}:{ibkr.get('port')}\n"
+                    "Start TWS in Paper mode, enable socket clients and retain Read-Only API."
+                ),
+                severity="warning",
+                category="operations",
+            )
+        )
+    if oanda is not None:
+        if not oanda.get("configured"):
+            events.append(
+                _event(
+                    "oanda_practice_not_configured",
+                    "LTS PAPER ACTION REQUIRED: OANDA PRACTICE NOT CONFIGURED",
+                    (
+                        "Run examples/scripts/configure_oanda_practice.sh after "
+                        "creating the REST-v20 Practice token."
+                    ),
+                    severity="warning",
+                    category="operations",
+                )
+            )
+        elif not oanda.get("available"):
+            events.append(
+                _event(
+                    "oanda_observer_missing",
+                    "LTS PAPER ALERT: OANDA OBSERVER HAS NO DATA",
+                    f"reason: {oanda.get('reason', 'unknown')}",
+                    severity="critical",
+                    category="operations",
+                )
+            )
+        else:
+            latest_price = oanda.get("latest_price") or {}
+            latest_account = oanda.get("latest_account") or {}
+            timestamps = [
+                parsed
+                for parsed in (
+                    _parse_time(latest_price.get("observed_at")),
+                    _parse_time(latest_account.get("observed_at")),
+                )
+                if parsed is not None
+            ]
+            newest = max(timestamps) if timestamps else None
+            if newest is None or now - newest > stale_seconds:
+                age = (
+                    "unknown"
+                    if newest is None
+                    else f"{(now - newest) / 60:.1f} min"
+                )
+                events.append(
+                    _event(
+                        "oanda_observer_stale",
+                        "LTS PAPER ALERT: OANDA OBSERVER STALE",
+                        f"latest broker observation age: {age}",
+                        severity="critical",
+                        category="operations",
+                    )
+                )
+            exposure = {
+                "open trades": int(latest_account.get("open_trade_count") or 0),
+                "open positions": int(
+                    latest_account.get("open_position_count") or 0
+                ),
+                "pending orders": int(
+                    latest_account.get("pending_order_count") or 0
+                ),
+            }
+            if any(exposure.values()):
+                events.append(
+                    _event(
+                        "oanda_unexpected_exposure",
+                        "LTS PAPER ALERT: UNEXPECTED OANDA EXPOSURE",
+                        "\n".join(
+                            f"{name}: {value}" for name, value in exposure.items()
+                        ),
+                        severity="critical",
+                        category="reconciliation",
+                    )
+                )
+    return events, discussions
+
+
+def format_summary(
+    alpaca: Mapping[str, Any],
+    ibkr: Mapping[str, Any],
+    oanda: Optional[Mapping[str, Any]] = None,
+) -> str:
+    if not alpaca.get("available"):
+        alpaca_text = f"Alpaca: unavailable ({alpaca.get('reason', 'unknown')})"
+    else:
+        detail = alpaca.get("detail") or {}
+        latencies = [
+            float(item["latency_ms"])
+            for item in alpaca.get("probes") or []
+            if item.get("success")
+        ]
+        spread_rows = [
+            row for row in alpaca.get("quotes") or [] if row.get("spread_bps") is not None
+        ]
+        spreads = [float(row["spread_bps"]) for row in spread_rows]
+        alpaca_text = (
+            "Alpaca Paper: healthy\n"
+            f"observations: {alpaca.get('complete_sessions', 0)}\n"
+            f"cells: {len(detail.get('available_cells') or [])} available, "
+            f"{len(detail.get('missing_cells') or [])} missing\n"
+            f"quotes: {len(detail.get('quotes_received') or [])}/{len(EXPECTED_ALPACA_SYMBOLS)}\n"
+            f"positions/orders: {detail.get('open_positions', 0)}/"
+            f"{detail.get('open_orders', 0)}\n"
+            f"API latency p50/p95: {_percentile(latencies, 0.5) or 0:.1f}/"
+            f"{_percentile(latencies, 0.95) or 0:.1f} ms\n"
+            f"spread bps p50/p95: {_percentile(spreads, 0.5) or 0:.3f}/"
+            f"{_percentile(spreads, 0.95) or 0:.3f}"
+        )
+    ibkr_text = (
+        f"IBKR Paper TWS: {'online' if ibkr.get('available') else 'offline'} "
+        f"at {ibkr.get('host')}:{ibkr.get('port')}"
+    )
+    if oanda is None:
+        oanda_text = "OANDA Practice: not monitored"
+    elif not oanda.get("configured"):
+        oanda_text = "OANDA Practice: credentials not configured"
+    elif not oanda.get("available"):
+        oanda_text = (
+            f"OANDA Practice: unavailable ({oanda.get('reason', 'unknown')})"
+        )
+    else:
+        session = oanda.get("latest_session") or {}
+        oanda_text = (
+            f"OANDA Practice: {session.get('status', 'unknown')}\n"
+            f"phase: {session.get('phase', 'unknown')}\n"
+            f"price observations: {oanda.get('price_observations', 0)}"
+        )
+    return (
+        "LTS PAPER/SHADOW STATUS\n\n"
+        + alpaca_text
+        + "\n\n"
+        + ibkr_text
+        + "\n\n"
+        + oanda_text
+    )
+
+
+class MonitorStore:
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(path)
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS monitor_events (
+                event_id TEXT PRIMARY KEY,
+                event_key TEXT NOT NULL,
+                transition TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                discussion INTEGER NOT NULL,
+                observed_at TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.commit()
+
+    def record(self, event: Mapping[str, Any], transition: str, now: float) -> None:
+        event_id = hashlib.sha256(
+            f"{event['key']}|{transition}|{now}".encode("utf-8")
+        ).hexdigest()
+        self.connection.execute(
+            "INSERT INTO monitor_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                event["key"],
+                transition,
+                event["severity"],
+                event["category"],
+                event["title"],
+                event["detail"],
+                int(bool(event.get("discussion"))),
+                datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            ),
+        )
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+def process_events(
+    events: Sequence[Mapping[str, Any]],
+    state: dict[str, Any],
+    store: MonitorStore,
+    *,
+    now: float,
+    repeat_seconds: float,
+) -> list[str]:
+    event_state = state.setdefault("events", {})
+    messages: list[str] = []
+    current = {str(item["key"]): item for item in events}
+    for key, item in current.items():
+        previous = event_state.get(key) or {}
+        digest = hashlib.sha256(
+            f"{item['title']}|{item['detail']}".encode("utf-8")
+        ).hexdigest()
+        due = (
+            not previous.get("active")
+            or previous.get("digest") != digest
+            or now - float(previous.get("last_sent_at", 0)) >= repeat_seconds
+        )
+        if due:
+            messages.append(f"{item['title']}\n{item['detail']}")
+            transition = "activated" if not previous.get("active") else "repeated"
+            store.record(item, transition, now)
+            previous["last_sent_at"] = now
+        previous.update(
+            {
+                "active": True,
+                "digest": digest,
+                "severity": item["severity"],
+                "category": item["category"],
+                "last_observed_at": now,
+            }
+        )
+        event_state[key] = previous
+    for key, previous in list(event_state.items()):
+        if previous.get("active") and key not in current:
+            recovery = {
+                "key": key,
+                "title": "LTS PAPER RECOVERED",
+                "detail": f"event cleared: {key}",
+                "severity": "info",
+                "category": previous.get("category", "operations"),
+                "discussion": False,
+            }
+            messages.append(f"{recovery['title']}\n{recovery['detail']}")
+            store.record(recovery, "recovered", now)
+            previous.update({"active": False, "last_sent_at": now})
+    return messages
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--alpaca-db", type=Path, default=DEFAULT_ALPACA_DB)
+    parser.add_argument("--oanda-db", type=Path, default=DEFAULT_OANDA_DB)
+    parser.add_argument("--oanda-env", type=Path, default=DEFAULT_OANDA_ENV)
+    parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--latest-file", type=Path, default=DEFAULT_LATEST)
+    parser.add_argument("--discussion-file", type=Path, default=DEFAULT_DISCUSSION)
+    parser.add_argument("--monitor-db", type=Path, default=DEFAULT_MONITOR_DB)
+    parser.add_argument("--stale-minutes", type=float, default=15.0)
+    parser.add_argument("--repeat-minutes", type=float, default=60.0)
+    parser.add_argument("--summary-hours", type=float, default=6.0)
+    parser.add_argument("--ibkr-host", default="127.0.0.1")
+    parser.add_argument("--ibkr-port", type=int, default=7497)
+    parser.add_argument("--no-telegram", action="store_true")
+    args = parser.parse_args()
+
+    args.state_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = args.state_file.with_suffix(".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        now = time.time()
+        state = _read_json(args.state_file)
+        if state.get("schema") != STATE_SCHEMA:
+            state = {"schema": STATE_SCHEMA, "events": {}}
+        alpaca = read_alpaca_snapshot(args.alpaca_db, now)
+        ibkr = read_ibkr_socket(args.ibkr_host, args.ibkr_port)
+        oanda = read_oanda_snapshot(args.oanda_db, args.oanda_env)
+        events, discussions = evaluate(
+            alpaca,
+            ibkr,
+            oanda,
+            now=now,
+            stale_seconds=args.stale_minutes * 60.0,
+        )
+        store = MonitorStore(args.monitor_db)
+        try:
+            messages = process_events(
+                [*events, *discussions],
+                state,
+                store,
+                now=now,
+                repeat_seconds=args.repeat_minutes * 60.0,
+            )
+            last_summary = float(state.get("last_summary_at", 0))
+            if now - last_summary >= args.summary_hours * 3600.0:
+                messages.append(format_summary(alpaca, ibkr, oanda))
+                state["last_summary_at"] = now
+            packet = {
+                "schema": "lts.hermes.live_trading_discussion.v1",
+                "generated_at": _utc_now(),
+                "policy": {
+                    "can_place_orders": False,
+                    "can_change_risk": False,
+                    "can_enqueue_optimization": False,
+                    "requires_human_review": True,
+                },
+                "active_events": events,
+                "research_discussions": discussions,
+                "suggested_questions": [
+                    "Is this event operational, market-wide, or asset-specific?",
+                    "Does an event-calendar or cross-asset explanation precede it?",
+                    "Is the evidence sufficient to propose a bounded offline experiment?",
+                    "What falsification test should run before queueing optimization?",
+                ],
+            }
+            latest = {
+                "schema": STATE_SCHEMA,
+                "generated_at": _utc_now(),
+                "alpaca": {
+                    key: value
+                    for key, value in alpaca.items()
+                    if key not in {"history"}
+                },
+                "ibkr": ibkr,
+                "oanda": oanda,
+                "active_event_keys": sorted(item["key"] for item in events),
+                "discussion_event_keys": sorted(item["key"] for item in discussions),
+            }
+            _atomic_json(args.discussion_file, packet)
+            _atomic_json(args.latest_file, latest)
+            if messages and not args.no_telegram:
+                _send_telegram("\n\n".join(messages))
+            state["last_run_at"] = now
+            _atomic_json(args.state_file, state)
+            print(
+                json.dumps(
+                    {
+                        "active_events": len(events),
+                        "discussion_events": len(discussions),
+                        "notifications": len(messages),
+                        "telegram_enabled": not args.no_telegram,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        finally:
+            store.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

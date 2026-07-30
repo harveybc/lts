@@ -1,0 +1,17 @@
+[Unit]
+Description=LTS Alpaca Paper read-only capability observer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/GitHub/lts
+ExecStart=%h/Documents/GitHub/lts/examples/scripts/run_alpaca_paper_preflight.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/lts
+
+[Install]
+WantedBy=default.target

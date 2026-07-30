@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the LTS Paper/Shadow watchdog every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=20s
+Persistent=true
+Unit=lts-paper-execution-watchdog.service
+
+[Install]
+WantedBy=timers.target

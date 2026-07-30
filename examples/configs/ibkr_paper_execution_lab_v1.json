@@ -1,0 +1,78 @@
+{
+  "schema": "lts.ibkr.paper_lab_config.v1",
+  "environment": "paper",
+  "read_only": true,
+  "host": "127.0.0.1",
+  "port": 7497,
+  "client_id": 7,
+  "timeout_seconds": 15,
+  "database_path": "~/.local/state/lts/ibkr-paper-lab.sqlite",
+  "contracts": [
+    {
+      "cell_id": "spy_execution_control",
+      "canonical_asset": "spy",
+      "symbol": "SPY",
+      "security_type": "STK",
+      "currency": "USD",
+      "exchange": "SMART",
+      "role": "equity_execution_control",
+      "timeframe": "1h",
+      "priority": 1
+    },
+    {
+      "cell_id": "tlt_duration_control",
+      "canonical_asset": "tlt",
+      "symbol": "TLT",
+      "security_type": "STK",
+      "currency": "USD",
+      "exchange": "SMART",
+      "role": "duration_diversifier",
+      "timeframe": "4h",
+      "priority": 2
+    },
+    {
+      "cell_id": "gld_metal_control",
+      "canonical_asset": "gld",
+      "symbol": "GLD",
+      "security_type": "STK",
+      "currency": "USD",
+      "exchange": "SMART",
+      "role": "metal_diversifier",
+      "timeframe": "4h",
+      "priority": 3
+    },
+    {
+      "cell_id": "eurusd_4h",
+      "canonical_asset": "eurusd",
+      "symbol": "EURUSD",
+      "security_type": "CASH",
+      "currency": "USD",
+      "exchange": "IDEALPRO",
+      "role": "fx_medium_long_horizon",
+      "timeframe": "4h",
+      "priority": 4
+    },
+    {
+      "cell_id": "usdjpy_1h",
+      "canonical_asset": "usdjpy",
+      "symbol": "USDJPY",
+      "security_type": "CASH",
+      "currency": "JPY",
+      "exchange": "IDEALPRO",
+      "role": "fx_short_horizon",
+      "timeframe": "1h",
+      "priority": 5
+    },
+    {
+      "cell_id": "audusd_4h",
+      "canonical_asset": "audusd",
+      "symbol": "AUDUSD",
+      "security_type": "CASH",
+      "currency": "USD",
+      "exchange": "IDEALPRO",
+      "role": "fx_medium_long_horizon",
+      "timeframe": "4h",
+      "priority": 6
+    }
+  ]
+}
