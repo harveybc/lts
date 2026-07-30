@@ -149,6 +149,21 @@ sudo ./examples/scripts/setup_mt5_vm_host.sh
 ./examples/scripts/create_mt5_windows_vm.sh /path/to/Windows11.iso
 ```
 
+Dragon can expose GNOME's system RDP login to Remmina without requiring a
+physical visit. The setup uses a dedicated TLS certificate and RDP credential,
+allows input control, and limits TCP `3389` to Dragon's local Wi-Fi subnet and
+Tailscale interface:
+
+```bash
+ssh -t dragon \
+  'cd ~/Documents/GitHub/lts && sudo ./examples/scripts/enable_dragon_remote_login.sh'
+```
+
+Use `192.168.1.235` while Omega is connected to the local Wi-Fi and
+`100.110.215.85` over Tailscale. Keep the RDP credential distinct from system,
+broker, GitHub, and email credentials. The Windows VM remains a separate
+connection; Dragon remote login is for administering the Ubuntu host.
+
 Verified runtime state on 2026-07-29:
 
 - KVM, libvirt 12.0.0, QEMU 10.2.1 and the persistent NAT network pass host
