@@ -28,7 +28,7 @@ image="${HOME}/VirtualMachines/lts-mt5-paper.qcow2"
 qemu-img create -f qcow2 "${image}" 100G
 
 os_variant="win11"
-if ! osinfo-query os short-id | grep -qx win11; then
+if ! osinfo-query os short-id | awk '{print $1}' | grep -qx win11; then
   os_variant="win10"
 fi
 
