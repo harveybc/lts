@@ -52,7 +52,11 @@ if ! virsh net-info default >/dev/null 2>&1; then
 fi
 virsh net-autostart default
 if ! virsh net-info default | grep -q 'Active:.*yes'; then
-  virsh net-start default
+  if ! virsh net-start default \
+      && ! virsh net-info default | grep -q 'Active:.*yes'; then
+    printf 'Failed to start the libvirt default network.\n' >&2
+    exit 1
+  fi
 fi
 
 install -d -o "${target_user}" -g "${target_user}" \
