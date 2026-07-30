@@ -4,8 +4,9 @@ OANDA Live Broker Plugin for LTS (Live Trading System)
 Uses OANDA v20 REST API via oandapyV20 for live/practice trading.
 """
 
-import time
 import logging
+import os
+import time
 from typing import Dict, Any, Optional, List
 from app.plugin_base import PluginBase
 
@@ -58,8 +59,12 @@ class OandaBroker(PluginBase):
 
     plugin_params = {
         "account_id": "",
+        "account_id_env": "OANDA_PRACTICE_ACCOUNT_ID",
         "access_token": "",
+        "access_token_env": "OANDA_PRACTICE_TOKEN",
         "environment": "practice",   # 'practice' or 'live'
+        "allow_live": False,
+        "require_protection": True,
         "instrument": "EUR_USD",
         "max_retries": 3,
         "retry_backoff": 1.0,        # seconds, doubles each retry
@@ -77,9 +82,16 @@ class OandaBroker(PluginBase):
 
     def _get_client(self):
         if self._client is None:
+            if self.params["environment"] != "practice" and not self.params["allow_live"]:
+                raise ValueError("OANDA live execution is disabled")
+            token = self.params.get("access_token") or os.environ.get(
+                self.params.get("access_token_env", ""), ""
+            )
+            if not token:
+                raise ValueError("OANDA access token is not configured")
             _ensure_oanda()
             self._client = _oandapyV20.API(
-                access_token=self.params["access_token"],
+                access_token=token,
                 environment=self.params["environment"],
             )
         return self._client
@@ -104,7 +116,12 @@ class OandaBroker(PluginBase):
 
     @property
     def _aid(self):
-        return self.params["account_id"]
+        account_id = self.params.get("account_id") or os.environ.get(
+            self.params.get("account_id_env", ""), ""
+        )
+        if not account_id:
+            raise ValueError("OANDA account ID is not configured")
+        return account_id
 
     # ------------------------------------------------------------------
     # Public interface (matches BrokerPluginBase + extended methods)
@@ -126,6 +143,8 @@ class OandaBroker(PluginBase):
             dict with 'success', 'order_id', 'trade_id', etc.
         """
         try:
+            if self.params.get("require_protection", True) and (tp is None or sl is None):
+                return _err("Every risk-increasing order requires both stop loss and take profit")
             _ensure_oanda()
             units = str(int(volume)) if direction == "buy" else str(-int(volume))
             order_body: Dict[str, Any] = {

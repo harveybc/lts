@@ -68,8 +68,14 @@ class TestOpenOrder(unittest.TestCase):
         mod._oanda_imported = True
         b.params["max_retries"] = 1
 
-        result = b.open_order("EUR_USD", "buy", 10000)
+        result = b.open_order("EUR_USD", "buy", 10000, tp=1.11, sl=1.09)
         self.assertFalse(result["success"])
+
+    def test_open_order_requires_stop_loss_and_take_profit(self):
+        b = _broker()
+        result = b.open_order("EUR_USD", "buy", 10000, tp=1.11)
+        self.assertFalse(result["success"])
+        self.assertIn("requires both", result["error"])
 
 
 class TestCloseOrder(unittest.TestCase):
@@ -218,7 +224,16 @@ class TestExecuteOrderCompat(unittest.TestCase):
         import plugins_broker.oanda_broker as mod
         mod._oanda_imported = True
 
-        result = b.execute_order("open", {"symbol": "EUR_USD", "side": "buy", "quantity": 1000})
+        result = b.execute_order(
+            "open",
+            {
+                "symbol": "EUR_USD",
+                "side": "buy",
+                "quantity": 1000,
+                "take_profit": 1.11,
+                "stop_loss": 1.09,
+            },
+        )
         self.assertTrue(result["success"])
 
 

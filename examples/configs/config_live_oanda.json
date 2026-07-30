@@ -54,9 +54,11 @@
 
     "_oanda_broker_comment": "Per-asset broker_config stored in assets.broker_config JSON column",
     "_oanda_broker_config_example": {
-        "account_id": "101-001-12345678-001",
-        "access_token": "your-oanda-api-token-here",
+        "account_id_env": "OANDA_PRACTICE_ACCOUNT_ID",
+        "access_token_env": "OANDA_PRACTICE_TOKEN",
         "environment": "practice",
+        "allow_live": false,
+        "require_protection": true,
         "instrument": "EUR_USD",
         "max_retries": 3,
         "retry_backoff": 1.0

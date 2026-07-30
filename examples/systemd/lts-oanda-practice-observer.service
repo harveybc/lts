@@ -1,0 +1,19 @@
+[Unit]
+Description=LTS OANDA Practice execution-observation lab
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/GitHub/lts
+EnvironmentFile=%h/.config/lts/oanda-practice.env
+ExecStart=%h/anaconda3/envs/trading-stack/bin/python -m app.oanda_practice_cli --config examples/configs/oanda_practice_execution_lab_v1.json observe --hours 24
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.local/state/lts
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,102 @@
+{
+  "schema": "lts.oanda.practice_lab_config.v1",
+  "environment": "practice",
+  "database_path": "~/.local/state/lts/oanda-practice-lab.sqlite",
+  "selection_evidence": {
+    "schema": "project3.oanda_practice_asset_selection.v1",
+    "source": "financial-data/work_plan/selection_artifacts_2026_07_29/oanda_practice_asset_selection_v1.json",
+    "policy": "validation_evidence_plus_activity_and_portfolio_role"
+  },
+  "secrets": {
+    "account_id_env": "OANDA_PRACTICE_ACCOUNT_ID",
+    "access_token_env": "OANDA_PRACTICE_TOKEN"
+  },
+  "polling": {
+    "price_seconds": 5,
+    "account_seconds": 60,
+    "transaction_seconds": 5
+  },
+  "instruments": [
+    {
+      "canonical_asset": "eurusd",
+      "oanda_instrument": "EUR_USD",
+      "role": "execution_control",
+      "timeframe": "1h",
+      "priority": 1
+    },
+    {
+      "canonical_asset": "gbpjpy",
+      "oanda_instrument": "GBP_JPY",
+      "role": "activity_diversification_shadow",
+      "timeframe": "1h",
+      "priority": 2,
+      "artifact_job_id": "e4__gbpjpy__1h__seed2701__c977321ae9c812ab"
+    },
+    {
+      "canonical_asset": "usdcad",
+      "oanda_instrument": "USD_CAD",
+      "role": "long_horizon_alpha_shadow",
+      "timeframe": "4h",
+      "priority": 3,
+      "artifact_job_id": "e4__usdcad__4h__seed2703__fdc025aaa9b531a9"
+    },
+    {
+      "canonical_asset": "usdjpy",
+      "oanda_instrument": "USD_JPY",
+      "role": "activity_alternate",
+      "timeframe": "1h",
+      "priority": 4,
+      "artifact_job_id": "e4__usdjpy__1h__seed2701__7e94950e30223142"
+    },
+    {
+      "canonical_asset": "nzdusd",
+      "oanda_instrument": "NZD_USD",
+      "role": "short_horizon_alpha_shadow",
+      "timeframe": "1h",
+      "priority": 5,
+      "artifact_job_id": "e4__nzdusd__1h__seed2701__eb64de262982b935"
+    },
+    {
+      "canonical_asset": "eurjpy",
+      "oanda_instrument": "EUR_JPY",
+      "role": "historical_positive_comparator",
+      "timeframe": "4h",
+      "priority": 6
+    }
+  ],
+  "orders": {
+    "enabled": false,
+    "required_protection": [
+      "stop_loss",
+      "take_profit"
+    ],
+    "comment": "Enable only after preflight and the 24-hour read-only observation pass."
+  },
+  "phases": {
+    "day_1": {
+      "mode": "read_only",
+      "duration_hours": 24,
+      "decision_metrics": [
+        "instrument_availability",
+        "price_observation_coverage",
+        "spread_bps_p50_p95",
+        "api_error_rate",
+        "transaction_reconciliation"
+      ]
+    },
+    "week_1": {
+      "mode": "read_only_then_protected_canary",
+      "duration_hours": 168,
+      "decision_metrics": [
+        "protected_order_acceptance_rate",
+        "sl_tp_attachment_rate",
+        "implementation_shortfall",
+        "realized_spread_cost",
+        "financing",
+        "execution_adjusted_weekly_return",
+        "execution_adjusted_weekly_rap",
+        "backtest_live_metric_drift"
+      ]
+    }
+  }
+}

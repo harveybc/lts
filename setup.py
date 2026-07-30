@@ -6,7 +6,8 @@ setup(
     packages=find_packages(),
     entry_points={
         'console_scripts': [
-            'lts=app.main:main'
+            'lts=app.main:main',
+            'lts-oanda-practice=app.oanda_practice_cli:main'
         ],
         # AAA plugins - Authentication, Authorization, Accounting
         'plugins_aaa': [
