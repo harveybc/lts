@@ -366,6 +366,75 @@ def _return_over_horizon(
     return float(latest["mid"]) / float(prior["mid"]) - 1.0
 
 
+def evaluate_mt5(
+    mt5: Mapping[str, Any],
+    *,
+    now: float,
+    stale_seconds: float,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    if not mt5.get("available"):
+        events.append(
+            _event(
+                "mt5_bridge_missing",
+                "LTS PAPER ACTION REQUIRED: MT5 BRIDGE HAS NO HEARTBEAT",
+                f"reason: {mt5.get('reason', 'unknown')}",
+                severity="warning",
+                category="operations",
+            )
+        )
+        return events
+
+    heartbeat = mt5.get("heartbeat") or {}
+    received_at = _parse_time(heartbeat.get("received_at"))
+    if received_at is None or now - received_at > stale_seconds:
+        age = (
+            "unknown"
+            if received_at is None
+            else f"{(now - received_at) / 60:.1f} min"
+        )
+        events.append(
+            _event(
+                "mt5_bridge_stale",
+                "LTS PAPER ALERT: MT5 BRIDGE HEARTBEAT STALE",
+                f"latest MT5 heartbeat age: {age}",
+                severity="critical",
+                category="operations",
+            )
+        )
+    if not heartbeat.get("connected"):
+        events.append(
+            _event(
+                "mt5_terminal_disconnected",
+                "LTS PAPER ALERT: MT5 TERMINAL DISCONNECTED",
+                (
+                    "The read-only EA reports no broker connection. "
+                    "Inspect the Windows VM and MT5 demo session."
+                ),
+                severity="critical",
+                category="broker",
+            )
+        )
+    snapshot = mt5.get("latest_snapshot") or {}
+    positions = int(snapshot.get("positions_total") or 0)
+    orders = int(snapshot.get("orders_total") or 0)
+    if positions or orders:
+        events.append(
+            _event(
+                "mt5_unexpected_exposure",
+                "LTS PAPER ALERT: UNEXPECTED MT5 EXPOSURE",
+                (
+                    f"open positions: {positions}\n"
+                    f"pending orders: {orders}\n"
+                    "The installed EA is read-only; inspect MT5 immediately."
+                ),
+                severity="critical",
+                category="reconciliation",
+            )
+        )
+    return events
+
+
 def evaluate(
     alpaca: Mapping[str, Any],
     ibkr: Mapping[str, Any],
@@ -602,64 +671,7 @@ def evaluate(
                     )
                 )
     if mt5 is not None:
-        if not mt5.get("available"):
-            events.append(
-                _event(
-                    "mt5_bridge_missing",
-                    "LTS PAPER ACTION REQUIRED: MT5 BRIDGE HAS NO HEARTBEAT",
-                    f"reason: {mt5.get('reason', 'unknown')}",
-                    severity="warning",
-                    category="operations",
-                )
-            )
-        else:
-            heartbeat = mt5.get("heartbeat") or {}
-            received_at = _parse_time(heartbeat.get("received_at"))
-            if received_at is None or now - received_at > stale_seconds:
-                age = (
-                    "unknown"
-                    if received_at is None
-                    else f"{(now - received_at) / 60:.1f} min"
-                )
-                events.append(
-                    _event(
-                        "mt5_bridge_stale",
-                        "LTS PAPER ALERT: MT5 BRIDGE HEARTBEAT STALE",
-                        f"latest MT5 heartbeat age: {age}",
-                        severity="critical",
-                        category="operations",
-                    )
-                )
-            if not heartbeat.get("connected"):
-                events.append(
-                    _event(
-                        "mt5_terminal_disconnected",
-                        "LTS PAPER ALERT: MT5 TERMINAL DISCONNECTED",
-                        (
-                            "The read-only EA reports no broker connection. "
-                            "Inspect the Windows VM and MT5 demo session."
-                        ),
-                        severity="critical",
-                        category="broker",
-                    )
-                )
-            snapshot = mt5.get("latest_snapshot") or {}
-            positions = int(snapshot.get("positions_total") or 0)
-            orders = int(snapshot.get("orders_total") or 0)
-            if positions or orders:
-                events.append(
-                    _event(
-                        "mt5_unexpected_exposure",
-                        "LTS PAPER ALERT: UNEXPECTED MT5 EXPOSURE",
-                        (
-                            f"open positions: {positions}\n"
-                            f"pending orders: {orders}\n"
-                            "The installed EA is read-only; inspect MT5 immediately."
-                        ),
-                        severity="critical",
-                        category="reconciliation",
-                    )
-                )
+        events.extend(evaluate_mt5(mt5, now=now, stale_seconds=stale_seconds))
     return events, discussions
 
 
@@ -738,6 +750,25 @@ def format_summary(
         + oanda_text
         + "\n\n"
         + mt5_text
+    )
+
+
+def format_mt5_summary(mt5: Mapping[str, Any]) -> str:
+    if not mt5.get("available"):
+        return (
+            "LTS MT5 DEMO STATUS\n\n"
+            f"unavailable ({mt5.get('reason', 'unknown')})"
+        )
+    heartbeat = mt5.get("heartbeat") or {}
+    snapshot = mt5.get("latest_snapshot") or {}
+    return (
+        "LTS MT5 DEMO STATUS\n\n"
+        f"connection: {'online' if heartbeat.get('connected') else 'offline'}\n"
+        f"terminal build: {heartbeat.get('terminal_build', 'unknown')}\n"
+        f"terminal ping: {float(heartbeat.get('terminal_ping_ms') or 0):.1f} ms\n"
+        f"symbols observed: {snapshot.get('symbols_total', 0)}\n"
+        f"positions/orders: {snapshot.get('positions_total', 0)}/"
+        f"{snapshot.get('orders_total', 0)}"
     )
 
 
@@ -853,6 +884,7 @@ def main() -> int:
     parser.add_argument("--summary-hours", type=float, default=6.0)
     parser.add_argument("--ibkr-host", default="127.0.0.1")
     parser.add_argument("--ibkr-port", type=int, default=7497)
+    parser.add_argument("--mt5-only", action="store_true")
     parser.add_argument("--no-telegram", action="store_true")
     args = parser.parse_args()
 
@@ -864,18 +896,29 @@ def main() -> int:
         state = _read_json(args.state_file)
         if state.get("schema") != STATE_SCHEMA:
             state = {"schema": STATE_SCHEMA, "events": {}}
-        alpaca = read_alpaca_snapshot(args.alpaca_db, now)
-        ibkr = read_ibkr_socket(args.ibkr_host, args.ibkr_port)
-        oanda = read_oanda_snapshot(args.oanda_db, args.oanda_env)
         mt5 = read_mt5_snapshot(args.mt5_db)
-        events, discussions = evaluate(
-            alpaca,
-            ibkr,
-            oanda,
-            mt5,
-            now=now,
-            stale_seconds=args.stale_minutes * 60.0,
-        )
+        if args.mt5_only:
+            alpaca: dict[str, Any] = {}
+            ibkr: dict[str, Any] = {}
+            oanda: Optional[dict[str, Any]] = None
+            events = evaluate_mt5(
+                mt5,
+                now=now,
+                stale_seconds=args.stale_minutes * 60.0,
+            )
+            discussions: list[dict[str, Any]] = []
+        else:
+            alpaca = read_alpaca_snapshot(args.alpaca_db, now)
+            ibkr = read_ibkr_socket(args.ibkr_host, args.ibkr_port)
+            oanda = read_oanda_snapshot(args.oanda_db, args.oanda_env)
+            events, discussions = evaluate(
+                alpaca,
+                ibkr,
+                oanda,
+                mt5,
+                now=now,
+                stale_seconds=args.stale_minutes * 60.0,
+            )
         store = MonitorStore(args.monitor_db)
         try:
             messages = process_events(
@@ -887,7 +930,10 @@ def main() -> int:
             )
             last_summary = float(state.get("last_summary_at", 0))
             if now - last_summary >= args.summary_hours * 3600.0:
-                messages.append(format_summary(alpaca, ibkr, oanda, mt5))
+                if args.mt5_only:
+                    messages.append(format_mt5_summary(mt5))
+                else:
+                    messages.append(format_summary(alpaca, ibkr, oanda, mt5))
                 state["last_summary_at"] = now
             packet = {
                 "schema": "lts.hermes.live_trading_discussion.v1",

@@ -30,8 +30,15 @@ chmod 600 "${target}"
 unit_source="${HOME}/Documents/GitHub/lts/examples/systemd/lts-mt5-bridge.service"
 unit_target="${HOME}/.config/systemd/user/lts-mt5-bridge.service"
 install -m 644 "${unit_source}" "${unit_target}"
+install -m 644 \
+  "${repository}/examples/systemd/lts-mt5-bridge-watchdog.service" \
+  "${HOME}/.config/systemd/user/lts-mt5-bridge-watchdog.service"
+install -m 644 \
+  "${repository}/examples/systemd/lts-mt5-bridge-watchdog.timer" \
+  "${HOME}/.config/systemd/user/lts-mt5-bridge-watchdog.timer"
 systemctl --user daemon-reload
 systemctl --user enable --now lts-mt5-bridge.service
+systemctl --user enable --now lts-mt5-bridge-watchdog.timer
 
 printf 'MT5 bridge secret is stored at %s (mode 600).\n' "${target}"
 printf 'The value must be entered locally in the MT5 EA; do not paste it in chat.\n'

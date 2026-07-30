@@ -100,10 +100,14 @@ Omega currently runs three five-minute user timers:
   missing quotes, unexpected exposure and venue availability. Its MT5 input
   will be pointed at Dragon's bridge facts after the first heartbeat.
 
-Dragon runs `lts-mt5-bridge.service`. The bridge listens on TCP `8766`, with
-host firewall access restricted to the libvirt NAT subnet and Tailscale. It
-stores its shared secret at `~/.config/lts/mt5-bridge.env` with mode `600`;
-that value is entered locally into the EA and is never committed or pasted.
+Dragon runs `lts-mt5-bridge.service` plus an independent five-minute
+`lts-mt5-bridge-watchdog.timer`. The bridge listens on TCP `8766`, with host
+firewall access restricted to the libvirt NAT subnet and Tailscale. Its local
+watchdog reports missing/stale heartbeats, broker disconnection and unexpected
+exposure through the existing Hermes Telegram channel even if Omega is
+offline. The shared secret lives at `~/.config/lts/mt5-bridge.env` with mode
+`600`; that value is entered locally into the EA and is never committed or
+pasted.
 
 The watchdog writes restart-safe state under `~/.local/state/lts`, records
 event transitions in SQLite and sends deduplicated Telegram alerts through the
