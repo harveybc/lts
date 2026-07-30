@@ -26,8 +26,21 @@ certificate_dir="/var/lib/${service_user}/.local/share/gnome-remote-desktop/cert
 certificate_path="${certificate_dir}/dragon-rdp.crt"
 key_path="${certificate_dir}/dragon-rdp.key"
 
-install -d -m 700 -o "${service_user}" -g "${service_group}" \
+credential_dir="/var/lib/${service_user}/.local/share/gnome-remote-desktop"
+managed_directories=(
+  "/var/lib/${service_user}"
+  "/var/lib/${service_user}/.local"
+  "/var/lib/${service_user}/.local/share"
+  "${credential_dir}"
   "${certificate_dir}"
+)
+for directory in "${managed_directories[@]}"; do
+  install -d -m 700 -o "${service_user}" -g "${service_group}" "${directory}"
+done
+
+# Older runs could have created intermediate directories as root. The service
+# home is dedicated to GNOME Remote Desktop, so repair its complete ownership.
+chown -R "${service_user}:${service_group}" "/var/lib/${service_user}"
 
 if [[ ! -s "${certificate_path}" || ! -s "${key_path}" ]]; then
   openssl req \
@@ -46,6 +59,10 @@ chown "${service_user}:${service_group}" "${certificate_path}" "${key_path}"
 chmod 644 "${certificate_path}"
 chmod 600 "${key_path}"
 
+credentials_probe="${credential_dir}/.lts-write-test"
+runuser -u "${service_user}" -- touch "${credentials_probe}"
+rm -f "${credentials_probe}"
+
 grdctl --system rdp set-port "${rdp_port}"
 grdctl --system rdp disable-port-negotiation
 grdctl --system rdp set-auth-methods credentials
@@ -63,6 +80,7 @@ ufw allow in on wlp0s20f3 from 192.168.1.0/24 \
 ufw allow in on tailscale0 from 100.64.0.0/10 \
   to any port "${rdp_port}" proto tcp comment 'Dragon RDP Tailscale'
 
+systemctl reset-failed gnome-remote-desktop.service || true
 systemctl enable --now gnome-remote-desktop.service
 
 printf '\nDragon remote login configuration:\n'
