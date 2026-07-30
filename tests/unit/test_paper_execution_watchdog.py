@@ -3,7 +3,12 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from tools.paper_execution_watchdog import MonitorStore, evaluate, process_events
+from tools.paper_execution_watchdog import (
+    MonitorStore,
+    evaluate,
+    process_events,
+    read_mt5_snapshot,
+)
 
 
 def _healthy_alpaca(now: float) -> dict:
@@ -72,6 +77,44 @@ def test_evaluate_reports_unconfigured_oanda() -> None:
         "oanda_practice_not_configured"
     ]
     assert discussions == []
+
+
+def test_evaluate_reports_stale_disconnected_mt5_with_exposure() -> None:
+    events, discussions = evaluate(
+        _healthy_alpaca(1785384300.0),
+        {"available": True, "host": "127.0.0.1", "port": 7497},
+        None,
+        {
+            "available": True,
+            "heartbeat": {
+                "connected": False,
+                "received_at": "2026-07-30T03:00:00+00:00",
+            },
+            "latest_snapshot": {
+                "positions_total": 1,
+                "orders_total": 2,
+            },
+        },
+        now=1785384300.0,
+        stale_seconds=900,
+    )
+
+    assert {event["key"] for event in events} == {
+        "mt5_bridge_stale",
+        "mt5_terminal_disconnected",
+        "mt5_unexpected_exposure",
+    }
+    assert discussions == []
+
+
+def test_read_mt5_snapshot_handles_missing_schema(tmp_path: Path) -> None:
+    path = tmp_path / "empty.sqlite"
+    sqlite3.connect(path).close()
+
+    snapshot = read_mt5_snapshot(path)
+
+    assert snapshot["available"] is False
+    assert snapshot["reason"] == "schema_unavailable"
 
 
 def test_process_events_deduplicates_and_records_recovery(tmp_path: Path) -> None:

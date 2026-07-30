@@ -1,0 +1,20 @@
+[Unit]
+Description=LTS authenticated MT5 demo bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/GitHub/lts
+EnvironmentFile=%h/.config/lts/mt5-bridge.env
+ExecStart=%h/anaconda3/envs/trading-stack/bin/python -m app.mt5_bridge_cli --config examples/configs/mt5_bridge_demo_v1.json serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/lts
+
+[Install]
+WantedBy=default.target

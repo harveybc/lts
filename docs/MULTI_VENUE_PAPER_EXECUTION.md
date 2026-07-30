@@ -1,7 +1,7 @@
 # Multi-Venue Paper Execution
 
-Status: Alpaca and IBKR Paper observation active; OANDA not configured
-Date: 2026-07-29
+Status: Alpaca and IBKR Paper observation active; MT5 VM and read-only bridge in commissioning
+Date: 2026-07-30
 
 ## Account State
 
@@ -10,7 +10,8 @@ User-reported:
 - Alpaca Trading API account: created and verified;
 - IBKR Individual Margin account: created and verified;
 - OANDA Global Markets live account: compliance review pending;
-- OANDA Global Markets MT5 demo: still requires local creation/credentials;
+- OANDA Global Markets MT5 demo: credentials remain user-owned and must be
+  entered only inside MT5 Desktop;
 - Alpaca Paper credentials: provisioned locally and verified by the read-only
   preflight;
 - IBKR TWS Paper: authenticated read-only observer active on
@@ -55,18 +56,26 @@ Client-side polling is not accepted as the sole stop-loss mechanism.
 
 ## OANDA MT5 Bridge
 
-The preferred adapter is a thin Expert Advisor:
+The first implemented capability is intentionally read-only:
 
-1. `OnTimer` polls a signed, allowlisted LTS command endpoint.
-2. It validates nonce, expiry, idempotency, account, symbol, volume, margin,
-   order type, SL and TP.
-3. `OrderCheck` precedes `OrderSend`.
-4. `OnTradeTransaction` reports acknowledgements and state transitions.
-5. Periodic full snapshots repair missed events.
+1. `LtsMt5ReadOnlyBridge.mq5` refuses non-demo accounts and refuses to start
+   when its read-only switch is disabled.
+2. `OnTimer` posts authenticated heartbeats and full account, position, order,
+   symbol, quote, spread and volume-constraint snapshots.
+3. `OnTradeTransaction` reports idempotent event facts.
+4. Requests use HMAC-SHA256, timestamp bounds and persistent nonce replay
+   protection.
+5. The Linux bridge persists restart-safe SQLite OLAP facts and exposes no
+   executable command.
+6. The broker plugin fails every mutation closed until protected canaries are
+   explicitly enabled.
 
-The EA performs no model inference, portfolio allocation or global risk
-calculation. `WebRequest` is transport for demo/live MT5 and is not available
-inside the MT5 Strategy Tester.
+The later execution-capable EA must validate nonce, expiry, idempotency,
+account, symbol, volume, margin, order type, SL and TP. `OrderCheck` must
+precede `OrderSend`, and entry without both accepted broker-side protection
+legs is forbidden. The EA performs no model inference, portfolio allocation
+or global risk calculation. `WebRequest` is transport for demo/live MT5 and is
+not available inside the MT5 Strategy Tester.
 
 ## Activation Sequence
 
@@ -88,7 +97,13 @@ Omega currently runs three five-minute user timers:
 - `lts-ibkr-paper-observer.timer` waits without failing while TWS is closed and
   runs the read-only contract preflight when Paper port `7497` is available;
 - `lts-paper-execution-watchdog.timer` checks freshness, endpoint failures,
-  missing quotes, unexpected exposure and venue availability.
+  missing quotes, unexpected exposure and venue availability. Its MT5 input
+  will be pointed at Dragon's bridge facts after the first heartbeat.
+
+Dragon runs `lts-mt5-bridge.service`. The bridge listens on TCP `8766`, with
+host firewall access restricted to the libvirt NAT subnet and Tailscale. It
+stores its shared secret at `~/.config/lts/mt5-bridge.env` with mode `600`;
+that value is entered locally into the EA and is never committed or pasted.
 
 The watchdog writes restart-safe state under `~/.local/state/lts`, records
 event transitions in SQLite and sends deduplicated Telegram alerts through the
@@ -181,11 +196,47 @@ Verified runtime state on 2026-07-29:
 - Windows Setup has booted and awaits the user's interactive language,
   licensing, edition and account choices. MT5 is not installed yet.
 
+Implemented and tested on 2026-07-30:
+
+- authenticated FastAPI bridge, SQLite OLAP and fail-closed broker plugin;
+- read-only MT5 EA source under `mt5/MQL5/Experts`;
+- HMAC timestamp/nonce replay tests, snapshot/event persistence tests and MT5
+  watchdog tests;
+- pinned bridge-only Python dependencies matching the validated Omega
+  `trading-stack` environment;
+- reproducible Dragon service and firewall scripts.
+
+The EA source is not accepted as operational until MetaEditor compiles it with
+zero errors inside the installed terminal.
+
+## Dragon Bridge Setup
+
+After pulling the matching LTS commit on Dragon:
+
+```bash
+./examples/scripts/configure_mt5_bridge.sh
+sudo ./examples/scripts/enable_mt5_bridge_host_firewall.sh
+curl http://192.168.122.1:8766/health
+```
+
+Inside MT5:
+
+1. log in to the OANDA demo locally;
+2. add `http://192.168.122.1:8766` to
+   **Tools > Options > Expert Advisors > Allow WebRequest for listed URL**;
+3. copy `mt5/MQL5/Experts/LtsMt5ReadOnlyBridge.mq5` into the terminal data
+   folder's `MQL5/Experts` directory;
+4. compile it in MetaEditor and require `0 errors`;
+5. attach it to one chart, keep `InpReadOnly=true`, set the bridge URL and
+   enter the locally displayed bridge secret;
+6. verify heartbeats and snapshots before beginning the 24-hour clock.
+
 ## Required Next Inputs
 
-- create the OANDA Global Markets MT5 demo and retain its credentials locally;
 - complete Windows Setup in the verified Dragon VM, then install MT5 Desktop
   and enter the demo credentials only inside the terminal;
+- compile the read-only EA with zero errors and verify an authenticated
+  heartbeat plus full snapshot;
 - obtain REST-v20 Practice credentials only if the OANDA division exposes that
   API; MT5 credentials cannot be used with REST v20.
 

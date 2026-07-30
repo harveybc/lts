@@ -8,7 +8,7 @@ LTS is a **multi-user, multi-portfolio live trading system** built in Python. It
 
 - **Multi-user, multi-portfolio** — each user owns multiple portfolios, each portfolio holds multiple assets with independent strategy/broker/pipeline configurations.
 - **Plugin architecture** — six plugin types (AAA, Core, Pipeline, Strategy, Broker, Portfolio) loaded dynamically via Python entry points.
-- **Broker plugins** — simulated backtesting via `BacktraderSimulationBroker`; the existing `OandaBroker` is an OANDA REST-v20 prototype and is not compatible with OANDA Global Markets.
+- **Broker plugins** — simulated backtesting via `BacktraderSimulationBroker`; fail-closed Paper observers for Alpaca, IBKR and OANDA Global Markets MT5; the existing `OandaBroker` is an OANDA REST-v20 prototype and is not compatible with OANDA Global Markets.
 - **Multi-venue direction** — LTS owns one global portfolio above replaceable OANDA MT5, Alpaca and IBKR adapters; broker terminals never own allocation.
 - **Prediction-based strategy** — `PredictionBasedStrategy` integrates with an external `prediction_provider` service for ML-based short-term (1–6h transformer) and long-term (1–6d CNN) predictions.
 - **FastAPI + AdminLTE web interface** — secure REST API with JWT authentication, RBAC (admin/user), rate limiting, and CORS.

@@ -33,6 +33,7 @@ EXPECTED_ALPACA_SYMBOLS = {
 DEFAULT_ALPACA_DB = Path.home() / ".local/state/lts/alpaca-paper-lab.sqlite"
 DEFAULT_OANDA_DB = Path.home() / ".local/state/lts/oanda-practice-lab.sqlite"
 DEFAULT_OANDA_ENV = Path.home() / ".config/lts/oanda-practice.env"
+DEFAULT_MT5_DB = Path.home() / ".local/state/lts/mt5-bridge.sqlite"
 DEFAULT_STATE = Path.home() / ".local/state/lts/paper-execution-watchdog/state.json"
 DEFAULT_LATEST = Path.home() / ".local/state/lts/paper-execution-watchdog/latest.json"
 DEFAULT_DISCUSSION = Path.home() / ".local/state/lts/hermes/live-trading-discussion.json"
@@ -296,6 +297,47 @@ def read_oanda_snapshot(
         connection.close()
 
 
+def read_mt5_snapshot(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"available": False, "reason": "database_missing"}
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        heartbeat = connection.execute(
+            """
+            SELECT account_fingerprint,server_fingerprint,environment,connected,
+                   trade_allowed,terminal_build,terminal_ping_ms,received_at
+            FROM heartbeats ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        snapshot = connection.execute(
+            """
+            SELECT account_fingerprint,received_at,currency,balance,equity,
+                   margin,free_margin,positions_total,orders_total,symbols_total
+            FROM account_snapshots ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        if heartbeat is None:
+            return {
+                "available": False,
+                "reason": "no_heartbeat",
+                "latest_snapshot": dict(snapshot) if snapshot is not None else None,
+            }
+        return {
+            "available": True,
+            "heartbeat": dict(heartbeat),
+            "latest_snapshot": dict(snapshot) if snapshot is not None else None,
+        }
+    except sqlite3.OperationalError as exc:
+        return {
+            "available": False,
+            "reason": "schema_unavailable",
+            "detail": str(exc),
+        }
+    finally:
+        connection.close()
+
+
 def _return_over_horizon(
     rows: Sequence[Mapping[str, Any]],
     now: float,
@@ -328,6 +370,7 @@ def evaluate(
     alpaca: Mapping[str, Any],
     ibkr: Mapping[str, Any],
     oanda: Optional[Mapping[str, Any]] = None,
+    mt5: Optional[Mapping[str, Any]] = None,
     *,
     now: float,
     stale_seconds: float,
@@ -558,6 +601,65 @@ def evaluate(
                         category="reconciliation",
                     )
                 )
+    if mt5 is not None:
+        if not mt5.get("available"):
+            events.append(
+                _event(
+                    "mt5_bridge_missing",
+                    "LTS PAPER ACTION REQUIRED: MT5 BRIDGE HAS NO HEARTBEAT",
+                    f"reason: {mt5.get('reason', 'unknown')}",
+                    severity="warning",
+                    category="operations",
+                )
+            )
+        else:
+            heartbeat = mt5.get("heartbeat") or {}
+            received_at = _parse_time(heartbeat.get("received_at"))
+            if received_at is None or now - received_at > stale_seconds:
+                age = (
+                    "unknown"
+                    if received_at is None
+                    else f"{(now - received_at) / 60:.1f} min"
+                )
+                events.append(
+                    _event(
+                        "mt5_bridge_stale",
+                        "LTS PAPER ALERT: MT5 BRIDGE HEARTBEAT STALE",
+                        f"latest MT5 heartbeat age: {age}",
+                        severity="critical",
+                        category="operations",
+                    )
+                )
+            if not heartbeat.get("connected"):
+                events.append(
+                    _event(
+                        "mt5_terminal_disconnected",
+                        "LTS PAPER ALERT: MT5 TERMINAL DISCONNECTED",
+                        (
+                            "The read-only EA reports no broker connection. "
+                            "Inspect the Windows VM and MT5 demo session."
+                        ),
+                        severity="critical",
+                        category="broker",
+                    )
+                )
+            snapshot = mt5.get("latest_snapshot") or {}
+            positions = int(snapshot.get("positions_total") or 0)
+            orders = int(snapshot.get("orders_total") or 0)
+            if positions or orders:
+                events.append(
+                    _event(
+                        "mt5_unexpected_exposure",
+                        "LTS PAPER ALERT: UNEXPECTED MT5 EXPOSURE",
+                        (
+                            f"open positions: {positions}\n"
+                            f"pending orders: {orders}\n"
+                            "The installed EA is read-only; inspect MT5 immediately."
+                        ),
+                        severity="critical",
+                        category="reconciliation",
+                    )
+                )
     return events, discussions
 
 
@@ -565,6 +667,7 @@ def format_summary(
     alpaca: Mapping[str, Any],
     ibkr: Mapping[str, Any],
     oanda: Optional[Mapping[str, Any]] = None,
+    mt5: Optional[Mapping[str, Any]] = None,
 ) -> str:
     if not alpaca.get("available"):
         alpaca_text = f"Alpaca: unavailable ({alpaca.get('reason', 'unknown')})"
@@ -611,6 +714,21 @@ def format_summary(
             f"phase: {session.get('phase', 'unknown')}\n"
             f"price observations: {oanda.get('price_observations', 0)}"
         )
+    if mt5 is None:
+        mt5_text = "MT5 Demo: not monitored"
+    elif not mt5.get("available"):
+        mt5_text = f"MT5 Demo: unavailable ({mt5.get('reason', 'unknown')})"
+    else:
+        heartbeat = mt5.get("heartbeat") or {}
+        snapshot = mt5.get("latest_snapshot") or {}
+        mt5_text = (
+            f"MT5 Demo: {'connected' if heartbeat.get('connected') else 'disconnected'}\n"
+            f"terminal build/ping: {heartbeat.get('terminal_build', 'unknown')}/"
+            f"{float(heartbeat.get('terminal_ping_ms') or 0):.1f} ms\n"
+            f"symbols observed: {snapshot.get('symbols_total', 0)}\n"
+            f"positions/orders: {snapshot.get('positions_total', 0)}/"
+            f"{snapshot.get('orders_total', 0)}"
+        )
     return (
         "LTS PAPER/SHADOW STATUS\n\n"
         + alpaca_text
@@ -618,6 +736,8 @@ def format_summary(
         + ibkr_text
         + "\n\n"
         + oanda_text
+        + "\n\n"
+        + mt5_text
     )
 
 
@@ -723,6 +843,7 @@ def main() -> int:
     parser.add_argument("--alpaca-db", type=Path, default=DEFAULT_ALPACA_DB)
     parser.add_argument("--oanda-db", type=Path, default=DEFAULT_OANDA_DB)
     parser.add_argument("--oanda-env", type=Path, default=DEFAULT_OANDA_ENV)
+    parser.add_argument("--mt5-db", type=Path, default=DEFAULT_MT5_DB)
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--latest-file", type=Path, default=DEFAULT_LATEST)
     parser.add_argument("--discussion-file", type=Path, default=DEFAULT_DISCUSSION)
@@ -746,10 +867,12 @@ def main() -> int:
         alpaca = read_alpaca_snapshot(args.alpaca_db, now)
         ibkr = read_ibkr_socket(args.ibkr_host, args.ibkr_port)
         oanda = read_oanda_snapshot(args.oanda_db, args.oanda_env)
+        mt5 = read_mt5_snapshot(args.mt5_db)
         events, discussions = evaluate(
             alpaca,
             ibkr,
             oanda,
+            mt5,
             now=now,
             stale_seconds=args.stale_minutes * 60.0,
         )
@@ -764,7 +887,7 @@ def main() -> int:
             )
             last_summary = float(state.get("last_summary_at", 0))
             if now - last_summary >= args.summary_hours * 3600.0:
-                messages.append(format_summary(alpaca, ibkr, oanda))
+                messages.append(format_summary(alpaca, ibkr, oanda, mt5))
                 state["last_summary_at"] = now
             packet = {
                 "schema": "lts.hermes.live_trading_discussion.v1",
@@ -794,6 +917,7 @@ def main() -> int:
                 },
                 "ibkr": ibkr,
                 "oanda": oanda,
+                "mt5": mt5,
                 "active_event_keys": sorted(item["key"] for item in events),
                 "discussion_event_keys": sorted(item["key"] for item in discussions),
             }
