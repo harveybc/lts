@@ -164,6 +164,11 @@ Use `192.168.1.235` while Omega is connected to the local Wi-Fi and
 broker, GitHub, and email credentials. The Windows VM remains a separate
 connection; Dragon remote login is for administering the Ubuntu host.
 
+In Remmina's RDP profile, set **Colour depth** to **Automatic (32 bpp)** and
+**Network connection type** to **Auto-detect**. Quick Connect can persist
+`32 bpp` plus `None`; that combination does not advertise the Graphics Pipeline
+required by GNOME Remote Login.
+
 Verified runtime state on 2026-07-29:
 
 - KVM, libvirt 12.0.0, QEMU 10.2.1 and the persistent NAT network pass host
