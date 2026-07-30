@@ -20,7 +20,7 @@ fi
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  qemu-kvm \
+  qemu-system-x86 \
   qemu-utils \
   libvirt-daemon-system \
   libvirt-clients \
