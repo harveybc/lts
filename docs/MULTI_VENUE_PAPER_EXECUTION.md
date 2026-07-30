@@ -1,6 +1,6 @@
 # Multi-Venue Paper Execution
 
-Status: Alpaca observation active; IBKR observer waiting for TWS Paper; OANDA not configured
+Status: Alpaca and IBKR Paper observation active; OANDA not configured
 Date: 2026-07-29
 
 ## Account State
@@ -13,8 +13,9 @@ User-reported:
 - OANDA Global Markets MT5 demo: still requires local creation/credentials;
 - Alpaca Paper credentials: provisioned locally and verified by the read-only
   preflight;
-- IBKR TWS Paper: local observer installed, currently waiting for TWS on
-  `127.0.0.1:7497`.
+- IBKR TWS Paper: authenticated read-only observer active on
+  `127.0.0.1:7497`; all six initial contracts qualified with zero positions
+  and zero orders.
 
 Never commit or paste credentials, raw account IDs or recovery information.
 
