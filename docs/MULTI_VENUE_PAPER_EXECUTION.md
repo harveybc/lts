@@ -135,10 +135,19 @@ If the account division supplies a REST-v20 Practice account ID and token:
 OANDA Global Markets MT5 credentials are different: login, password and
 `OANDA_Global-Demo-1` are entered inside MT5 Desktop and must not be stored by
 the Linux observer. MT5 Web Trader cannot run Expert Advisors. The preferred
-host is a dedicated Windows VM on a Linux machine so the Linux worker remains
-available; native dual boot is acceptable but removes that worker while
-Windows is running. Wine is a compatibility fallback, not the first unattended
-execution host.
+host is `dragon`: it has 30 GiB RAM, 32 CPU threads, KVM and substantially more
+free disk than `gamma`, while remaining stationary. The VM uses 8 GiB RAM,
+4 vCPU, a 100 GiB sparse disk, NAT, UEFI and TPM 2.0. Gamma is excluded because
+it has 14 GiB RAM, limited free disk and owns both the internal 5070 Ti and
+external 5090. Omega is excluded because it travels. Native dual boot removes a
+Linux worker; Wine remains a compatibility fallback.
+
+Host and VM creation are reproducible:
+
+```bash
+sudo ./examples/scripts/setup_mt5_vm_host.sh
+./examples/scripts/create_mt5_windows_vm.sh /path/to/Windows11.iso
+```
 
 ## Required Next Inputs
 
