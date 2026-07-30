@@ -19,12 +19,18 @@ if ! id -nG | tr ' ' '\n' | grep -qx libvirt; then
   printf 'Log out and back in so the libvirt group is active.\n' >&2
   exit 2
 fi
-if virsh dominfo lts-mt5-paper >/dev/null 2>&1; then
+libvirt_uri="qemu:///system"
+if virsh --connect "${libvirt_uri}" dominfo lts-mt5-paper >/dev/null 2>&1; then
   printf 'VM lts-mt5-paper already exists; refusing to duplicate it.\n' >&2
   exit 2
 fi
 
 image="${HOME}/VirtualMachines/lts-mt5-paper.qcow2"
+if [[ -e "${image}" ]]; then
+  printf 'VM disk already exists; refusing to overwrite it: %s\n' \
+    "${image}" >&2
+  exit 2
+fi
 qemu-img create -f qcow2 "${image}" 100G
 
 os_variant="win11"
@@ -33,6 +39,7 @@ if ! osinfo-query os short-id | awk '{print $1}' | grep -qx win11; then
 fi
 
 virt-install \
+  --connect "${libvirt_uri}" \
   --name lts-mt5-paper \
   --description "OANDA MT5 Paper execution adapter; no portfolio ownership" \
   --memory 8192 \
