@@ -1,5 +1,11 @@
 # OANDA Practice Execution Lab
 
+> Compatibility notice: this implementation targets OANDA REST v20. OANDA
+> Global Markets does not expose REST v20, so it cannot be used with the
+> Colombian account. Keep it for compatible OANDA divisions only. The active
+> Global Markets design is the MT5 adapter in
+> [`MULTI_VENUE_PAPER_EXECUTION.md`](MULTI_VENUE_PAPER_EXECUTION.md).
+
 This laboratory measures the broker contract before LTS is allowed to submit
 portfolio orders. It is independent of model optimization and is restricted in
 code to `https://api-fxpractice.oanda.com`.
@@ -30,8 +36,9 @@ instruments rather than silently replacing them.
 
 ## Local Preparation
 
-Create a Practice account and token in OANDA, then place the secrets in a local
-file that is never committed:
+For a REST-v20-compatible OANDA division, create a Practice account and token,
+then place the secrets in a local file that is never committed. Do not try to
+obtain or use these credentials for an OANDA Global Markets account:
 
 ```bash
 install -m 700 -d ~/.config/lts

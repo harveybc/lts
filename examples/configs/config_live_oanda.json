@@ -1,6 +1,6 @@
 {
-    "_comment": "LTS Configuration — Live/Practice Trading with OANDA Broker",
-    "_comment2": "Uses prediction_strategy with prediction_provider for ML-based signals",
+    "_comment": "Legacy LTS configuration for an OANDA REST-v20-compatible account only",
+    "_comment2": "Not compatible with OANDA Global Markets; use the planned MT5 adapter",
 
     "quiet_mode": false,
     "debug_mode": false,

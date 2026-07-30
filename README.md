@@ -8,7 +8,8 @@ LTS is a **multi-user, multi-portfolio live trading system** built in Python. It
 
 - **Multi-user, multi-portfolio** — each user owns multiple portfolios, each portfolio holds multiple assets with independent strategy/broker/pipeline configurations.
 - **Plugin architecture** — six plugin types (AAA, Core, Pipeline, Strategy, Broker, Portfolio) loaded dynamically via Python entry points.
-- **Broker plugins** — simulated backtesting via `BacktraderSimulationBroker` with realistic costs, and live trading via `OandaBroker` (OANDA v20 REST API).
+- **Broker plugins** — simulated backtesting via `BacktraderSimulationBroker`; the existing `OandaBroker` is an OANDA REST-v20 prototype and is not compatible with OANDA Global Markets.
+- **Multi-venue direction** — LTS owns one global portfolio above replaceable OANDA MT5, Alpaca and IBKR adapters; broker terminals never own allocation.
 - **Prediction-based strategy** — `PredictionBasedStrategy` integrates with an external `prediction_provider` service for ML-based short-term (1–6h transformer) and long-term (1–6d CNN) predictions.
 - **FastAPI + AdminLTE web interface** — secure REST API with JWT authentication, RBAC (admin/user), rate limiting, and CORS.
 - **Google OAuth 2.0** — users can authenticate via Google in addition to username/password.
@@ -134,8 +135,8 @@ Extends `backtrader.brokers.BackBroker` for use within a backtrader cerebro. Sup
 - API predictions (real ML) via HTTP POST to `prediction_provider`
 - Runtime switching between prediction sources
 
-### `oanda_broker` — OANDA v20 Live Trading
-Production live/practice broker using `oandapyV20`:
+### `oanda_broker` — OANDA REST-v20 Prototype
+Practice/live prototype using `oandapyV20`:
 - Market orders with TP/SL
 - Trade management (close, modify TP/SL)
 - Account summary (balance, equity, margin)
@@ -144,6 +145,11 @@ Production live/practice broker using `oandapyV20`:
 - Retry with exponential backoff (3 retries default)
 
 **Key parameters**: `account_id`, `access_token`, `environment` (practice/live), `instrument`, `max_retries=3`
+
+This plugin must not be configured for OANDA Global Markets, whose active
+automation path is MT5. See
+[`docs/MULTI_VENUE_PAPER_EXECUTION.md`](docs/MULTI_VENUE_PAPER_EXECUTION.md)
+for the account/adapter plan and protection gates.
 
 ---
 
@@ -266,7 +272,11 @@ Run:
 python app/main.py --load_config my_config.json
 ```
 
-### 2. Configure Live Trading with OANDA
+### 2. Configure an OANDA REST-v20-Compatible Account
+
+This legacy example is not valid for OANDA Global Markets. Use it only after
+the account-division preflight confirms REST v20; use the planned MT5 adapter
+for Global Markets.
 
 ```json
 {
@@ -280,8 +290,8 @@ python app/main.py --load_config my_config.json
 Asset-level broker config (stored in `assets.broker_config` JSON column):
 ```json
 {
-    "account_id": "101-001-12345678-001",
-    "access_token": "your-oanda-api-token",
+    "account_id_env": "OANDA_PRACTICE_ACCOUNT_ID",
+    "access_token_env": "OANDA_PRACTICE_TOKEN",
     "environment": "practice",
     "instrument": "EUR_USD"
 }
