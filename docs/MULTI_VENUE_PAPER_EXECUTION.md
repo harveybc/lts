@@ -149,11 +149,23 @@ sudo ./examples/scripts/setup_mt5_vm_host.sh
 ./examples/scripts/create_mt5_windows_vm.sh /path/to/Windows11.iso
 ```
 
+Verified runtime state on 2026-07-29:
+
+- KVM, libvirt 12.0.0, QEMU 10.2.1 and the persistent NAT network pass host
+  validation on Dragon;
+- the official Windows 11 25H2 English International x64 ISO matches
+  Microsoft's published SHA-256
+  `66b7b4b71763ed6f9b2ce29326ed9284544da6f5283d00329921540c01aaaeea`;
+- `lts-mt5-paper` is defined and running with the declared resources, UEFI,
+  Secure Boot and TPM 2.0;
+- Windows Setup has booted and awaits the user's interactive language,
+  licensing, edition and account choices. MT5 is not installed yet.
+
 ## Required Next Inputs
 
-- start IBKR TWS in Paper mode on Omega and confirm port `7497`;
 - create the OANDA Global Markets MT5 demo and retain its credentials locally;
-- select and provision the Windows VM for the MT5 terminal and EA bridge;
+- complete Windows Setup in the verified Dragon VM, then install MT5 Desktop
+  and enter the demo credentials only inside the terminal;
 - obtain REST-v20 Practice credentials only if the OANDA division exposes that
   API; MT5 credentials cannot be used with REST v20.
 
