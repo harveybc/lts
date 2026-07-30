@@ -31,10 +31,28 @@ if [[ -e "${image}" ]]; then
     "${image}" >&2
   exit 2
 fi
+hypervisor_user="libvirt-qemu"
+if ! getent passwd "${hypervisor_user}" >/dev/null; then
+  printf 'Missing libvirt QEMU service account: %s\n' \
+    "${hypervisor_user}" >&2
+  exit 2
+fi
+if ! command -v setfacl >/dev/null; then
+  printf 'Missing setfacl; rerun setup_mt5_vm_host.sh.\n' >&2
+  exit 2
+fi
+setfacl -m "u:${hypervisor_user}:x" "${HOME}"
+setfacl -m "u:${hypervisor_user}:rx" \
+  "${HOME}/VirtualMachines" \
+  "${HOME}/VirtualMachines/iso"
+setfacl -m "u:${hypervisor_user}:r" "${iso}"
+
 qemu-img create -f qcow2 "${image}" 100G
+setfacl -m "u:${hypervisor_user}:rw" "${image}"
 
 os_variant="win11"
-if ! osinfo-query os short-id | awk '{print $1}' | grep -qx win11; then
+if ! osinfo-query os --fields=short-id | awk '{print $1}' \
+    | grep -qx win11; then
   os_variant="win10"
 fi
 

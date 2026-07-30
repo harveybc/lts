@@ -27,6 +27,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
   virtinst \
   virt-manager \
   libosinfo-bin \
+  acl \
   ovmf \
   swtpm \
   swtpm-tools \
