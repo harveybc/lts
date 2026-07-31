@@ -1,0 +1,37 @@
+name: Tier A
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  execution-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - name: Record dependency identity
+        run: sha256sum setup.py pyproject.toml requirements-ci.txt
+      - name: Install hash-locked dependencies
+        run: python -m pip install --require-hashes -r requirements-ci.txt
+      - name: Compile focused production modules
+        run: |
+          python -m compileall -q \
+            app/multi_venue_shadow.py \
+            plugins_portfolio/default_portfolio.py \
+            tools/paper_execution_watchdog.py
+      - name: Run execution and portfolio contracts
+        run: |
+          pytest --confcutdir=tests/unit -q \
+            tests/unit/test_multi_venue_shadow.py \
+            tests/unit/test_paper_execution_watchdog.py \
+            tests/unit/test_portfolio_invariants.py

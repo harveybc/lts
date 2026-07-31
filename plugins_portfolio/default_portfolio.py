@@ -76,6 +76,31 @@ class DefaultPortfolio(PluginBase):
         """Get current vol scalar for a cell."""
         return self._cell_vol_scalar.get(cell_name, 1.0)
 
+    @staticmethod
+    def net_instrument_targets(cell_targets):
+        """Aggregate virtual-cell targets into exact broker instrument targets."""
+        net_targets = {}
+        attribution = {}
+        for row in cell_targets:
+            cell_id = str(row["cell_id"])
+            instrument = str(row["instrument"])
+            target_units = float(row["target_units"])
+            if not np.isfinite(target_units):
+                raise ValueError("target_units must be finite")
+            if cell_id in attribution:
+                raise ValueError(f"duplicate cell_id: {cell_id}")
+            attribution[cell_id] = {
+                "instrument": instrument,
+                "target_units": target_units,
+            }
+            net_targets[instrument] = (
+                net_targets.get(instrument, 0.0) + target_units
+            )
+        return {
+            "net_targets": net_targets,
+            "cell_attribution": attribution,
+        }
+
     def allocate(self, cell_returns_today):
         """Compute portfolio daily return from cell returns.
 
