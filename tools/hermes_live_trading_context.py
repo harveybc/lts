@@ -135,6 +135,29 @@ def main() -> int:
             "ibkr_online": (latest.get("ibkr") or {}).get("available"),
             "oanda_configured": (latest.get("oanda") or {}).get("configured"),
             "oanda_available": (latest.get("oanda") or {}).get("available"),
+            "shadow_available": (latest.get("shadow") or {}).get("available"),
+            "shadow_nav": (
+                ((latest.get("shadow") or {}).get("latest") or {}).get("nav")
+            ),
+            "shadow_total_return": (
+                ((latest.get("shadow") or {}).get("latest") or {}).get(
+                    "total_return"
+                )
+            ),
+            "shadow_available_weight": (
+                ((latest.get("shadow") or {}).get("latest") or {}).get(
+                    "available_weight"
+                )
+            ),
+            "shadow_missing_cells": (
+                ((latest.get("shadow") or {}).get("latest") or {}).get(
+                    "missing_cells"
+                )
+            ),
+            "capital_configured": (latest.get("capital") or {}).get(
+                "configured"
+            ),
+            "capital_available": (latest.get("capital") or {}).get("available"),
         },
         "quote_evidence_24h": _quote_summary(ALPACA_DB),
         "monitor_events_24h": _event_summary(MONITOR_DB),

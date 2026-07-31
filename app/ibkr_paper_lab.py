@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
@@ -31,7 +32,13 @@ def _canonical_json(value: Any) -> str:
 def _as_float(value: Any) -> Optional[float]:
     if value in (None, ""):
         return None
-    return float(value)
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def _as_price(value: Any) -> Optional[float]:
+    result = _as_float(value)
+    return result if result is not None and result > 0 else None
 
 
 def _fingerprint(value: str) -> str:
@@ -94,6 +101,7 @@ class IbkrPaperLabConfig:
     port: int
     client_id: int
     timeout_seconds: float
+    market_data_wait_seconds: float
     database_path: Path
     contracts: tuple[ContractSelection, ...]
 
@@ -123,6 +131,11 @@ class IbkrPaperLabConfig:
         timeout_seconds = float(data.get("timeout_seconds", 15.0))
         if timeout_seconds <= 0:
             raise IbkrPaperError("timeout_seconds must be positive")
+        market_data_wait_seconds = float(data.get("market_data_wait_seconds", 4.0))
+        if not 1.0 <= market_data_wait_seconds <= 10.0:
+            raise IbkrPaperError(
+                "market_data_wait_seconds must be between 1 and 10"
+            )
 
         contracts = tuple(
             sorted(
@@ -153,6 +166,7 @@ class IbkrPaperLabConfig:
             port=port,
             client_id=client_id,
             timeout_seconds=timeout_seconds,
+            market_data_wait_seconds=market_data_wait_seconds,
             database_path=database_path,
             contracts=contracts,
         )
@@ -168,6 +182,7 @@ class IbkrTwsPaperClient:
         client_id: int,
         *,
         timeout_seconds: float = 15.0,
+        market_data_wait_seconds: float = 4.0,
     ) -> None:
         if host not in {"127.0.0.1", "localhost"}:
             raise IbkrPaperError("IBKR TWS must be local during initial integration")
@@ -177,6 +192,7 @@ class IbkrTwsPaperClient:
         self.port = port
         self.client_id = client_id
         self.timeout_seconds = timeout_seconds
+        self.market_data_wait_seconds = market_data_wait_seconds
         self.probes: list[Dict[str, Any]] = []
 
     def _measure(self, endpoint: str, operation) -> Any:
@@ -265,7 +281,11 @@ class IbkrTwsPaperClient:
             positions = self._measure("positions", ib.positions)
             open_orders = self._measure("orders.open", ib.openOrders)
 
+            selection_by_cell = {
+                selection.cell_id: selection for selection in selections
+            }
             qualified: Dict[str, Optional[Dict[str, Any]]] = {}
+            qualified_objects: Dict[str, Any] = {}
             for selection in selections:
                 contract = self._make_contract(selection)
                 matches = self._measure(
@@ -275,6 +295,70 @@ class IbkrTwsPaperClient:
                 qualified[selection.cell_id] = (
                     self._contract_dict(matches[0]) if matches else None
                 )
+                if matches:
+                    qualified_objects[selection.cell_id] = matches[0]
+
+            quotes: Dict[str, Dict[str, Any]] = {}
+            tickers: Dict[str, Any] = {}
+            if qualified_objects:
+                ib.reqMarketDataType(3)
+                for cell_id, contract in qualified_objects.items():
+                    tickers[cell_id] = self._measure(
+                        f"quote.request.{cell_id}",
+                        lambda contract=contract: ib.reqMktData(
+                            contract,
+                            genericTickList="",
+                            snapshot=False,
+                            regulatorySnapshot=False,
+                        ),
+                    )
+                ib.sleep(self.market_data_wait_seconds)
+                for cell_id, ticker in tickers.items():
+                    bid = _as_price(getattr(ticker, "bid", None))
+                    ask = _as_price(getattr(ticker, "ask", None))
+                    last = _as_price(getattr(ticker, "last", None))
+                    close = _as_price(getattr(ticker, "close", None))
+                    mid = (
+                        (bid + ask) / 2.0
+                        if bid is not None and ask is not None
+                        else None
+                    )
+                    spread = (
+                        ask - bid
+                        if bid is not None and ask is not None
+                        else None
+                    )
+                    mark_price = mid or last or close
+                    broker_time = getattr(ticker, "time", None)
+                    quotes[cell_id] = {
+                        "cell_id": cell_id,
+                        "symbol": selection_by_cell[cell_id].symbol,
+                        "broker_time": (
+                            broker_time.isoformat()
+                            if hasattr(broker_time, "isoformat")
+                            else None
+                        ),
+                        "observed_at": _utc_now(),
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": mid,
+                        "last": last,
+                        "close": close,
+                        "mark_price": mark_price,
+                        "spread": spread,
+                        "spread_bps": (
+                            spread / mid * 10000.0
+                            if spread is not None and mid
+                            else None
+                        ),
+                        "bid_size": _as_float(getattr(ticker, "bidSize", None)),
+                        "ask_size": _as_float(getattr(ticker, "askSize", None)),
+                        "market_data_type": getattr(
+                            ticker, "marketDataType", None
+                        ),
+                    }
+                for ticker in tickers.values():
+                    ib.cancelMktData(ticker.contract)
 
             summaries: list[Dict[str, Any]] = []
             for item in account_values:
@@ -318,6 +402,7 @@ class IbkrTwsPaperClient:
                 "positions": normalized_positions,
                 "open_orders": normalized_orders,
                 "contracts": qualified,
+                "quotes": quotes,
             }
         except IbkrPaperError:
             raise
@@ -406,6 +491,27 @@ class IbkrPaperOlap:
                 snapshot_json TEXT NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES lab_sessions(session_id)
             );
+            CREATE TABLE IF NOT EXISTS quote_observations (
+                session_id TEXT NOT NULL,
+                cell_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                broker_time TEXT,
+                observed_at TEXT NOT NULL,
+                bid REAL,
+                ask REAL,
+                mid REAL,
+                last REAL,
+                close REAL,
+                mark_price REAL,
+                spread REAL,
+                spread_bps REAL,
+                bid_size REAL,
+                ask_size REAL,
+                market_data_type INTEGER,
+                quote_json TEXT NOT NULL,
+                PRIMARY KEY (session_id,cell_id),
+                FOREIGN KEY (session_id) REFERENCES lab_sessions(session_id)
+            );
             CREATE VIEW IF NOT EXISTS ibkr_endpoint_health_olap AS
             SELECT endpoint,COUNT(*) AS requests,SUM(success) AS successful_requests,
                    AVG(latency_ms) AS mean_latency_ms,MAX(latency_ms) AS max_latency_ms,
@@ -418,6 +524,16 @@ class IbkrPaperOlap:
                    MAX(observed_at) AS last_observed_at
             FROM contract_capabilities
             GROUP BY cell_id,canonical_asset,symbol,security_type,currency,role,timeframe;
+            CREATE VIEW IF NOT EXISTS ibkr_quote_summary_olap AS
+            SELECT cell_id,symbol,COUNT(*) AS observations,
+                   MIN(observed_at) AS first_observed_at,
+                   MAX(observed_at) AS last_observed_at,
+                   AVG(spread_bps) AS mean_spread_bps,
+                   MIN(spread_bps) AS min_spread_bps,
+                   MAX(spread_bps) AS max_spread_bps,
+                   SUM(CASE WHEN mark_price IS NOT NULL THEN 1 ELSE 0 END)
+                       AS priced_observations
+            FROM quote_observations GROUP BY cell_id,symbol;
             """
         )
         self.connection.commit()
@@ -533,6 +649,32 @@ class IbkrPaperOlap:
                     _utc_now(),
                 ),
             )
+        for cell_id, quote in snapshot.get("quotes", {}).items():
+            self.connection.execute(
+                """
+                INSERT OR REPLACE INTO quote_observations VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    cell_id,
+                    quote["symbol"],
+                    quote.get("broker_time"),
+                    quote["observed_at"],
+                    quote.get("bid"),
+                    quote.get("ask"),
+                    quote.get("mid"),
+                    quote.get("last"),
+                    quote.get("close"),
+                    quote.get("mark_price"),
+                    quote.get("spread"),
+                    quote.get("spread_bps"),
+                    quote.get("bid_size"),
+                    quote.get("ask_size"),
+                    quote.get("market_data_type"),
+                    _canonical_json(quote),
+                ),
+            )
         reconciliation = {
             "positions": snapshot["positions"],
             "open_orders": snapshot["open_orders"],
@@ -567,6 +709,22 @@ class IbkrPaperOlap:
         capabilities = self.connection.execute(
             "SELECT * FROM ibkr_capability_olap ORDER BY role,timeframe,symbol"
         ).fetchall()
+        quotes = self.connection.execute(
+            "SELECT * FROM ibkr_quote_summary_olap ORDER BY cell_id"
+        ).fetchall()
+        latest_quotes = self.connection.execute(
+            """
+            SELECT q.cell_id,q.symbol,q.observed_at,q.mark_price,q.spread_bps,
+                   q.market_data_type
+            FROM quote_observations q
+            JOIN (
+                SELECT cell_id,MAX(observed_at) AS observed_at
+                FROM quote_observations GROUP BY cell_id
+            ) latest
+              ON latest.cell_id=q.cell_id AND latest.observed_at=q.observed_at
+            ORDER BY q.cell_id
+            """
+        ).fetchall()
         return {
             "schema_version": SCHEMA_VERSION,
             "adapter_version": ADAPTER_VERSION,
@@ -574,6 +732,8 @@ class IbkrPaperOlap:
             "latest_session": dict(latest) if latest else None,
             "endpoint_health": [dict(row) for row in endpoints],
             "contract_capabilities": [dict(row) for row in capabilities],
+            "quote_summary": [dict(row) for row in quotes],
+            "latest_quotes": [dict(row) for row in latest_quotes],
         }
 
 
@@ -600,6 +760,7 @@ class IbkrPaperLab:
             "host": self.config.host,
             "port": self.config.port,
             "platform": PAPER_PORTS[self.config.port],
+            "market_data_wait_seconds": self.config.market_data_wait_seconds,
             "contracts": [item.__dict__ for item in self.config.contracts],
         }
 
@@ -639,6 +800,11 @@ class IbkrPaperLab:
                 "account_fingerprint": fleet_fingerprint,
                 "available_cells": available,
                 "missing_cells": missing,
+                "priced_cells": sorted(
+                    cell_id
+                    for cell_id, quote in snapshot.get("quotes", {}).items()
+                    if quote.get("mark_price") is not None
+                ),
                 "open_positions": len(snapshot["positions"]),
                 "open_orders": len(snapshot["open_orders"]),
                 "protected_execution_eligible": False,

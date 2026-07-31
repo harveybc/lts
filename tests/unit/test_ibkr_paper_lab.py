@@ -100,6 +100,25 @@ class FakeClient:
                 },
                 "eurusd_4h": None,
             },
+            "quotes": {
+                "spy_1h": {
+                    "cell_id": "spy_1h",
+                    "symbol": "SPY",
+                    "broker_time": "2026-07-29T21:00:00+00:00",
+                    "observed_at": "2026-07-29T21:00:01+00:00",
+                    "bid": 600.0,
+                    "ask": 600.2,
+                    "mid": 600.1,
+                    "last": 600.1,
+                    "close": 598.0,
+                    "mark_price": 600.1,
+                    "spread": 0.2,
+                    "spread_bps": 3.3327778703549406,
+                    "bid_size": 10.0,
+                    "ask_size": 12.0,
+                    "market_data_type": 3,
+                }
+            },
         }
 
 
@@ -134,6 +153,7 @@ def test_preflight_persists_capability_without_account_identity(tmp_path):
         assert result["available_cells"] == ["spy_1h"]
         assert result["missing_cells"] == ["eurusd_4h"]
         assert result["orders_submitted"] == 0
+        assert result["priced_cells"] == ["spy_1h"]
         assert result["protected_execution_eligible"] is False
 
         rows = store.connection.execute(
@@ -149,6 +169,7 @@ def test_preflight_persists_capability_without_account_identity(tmp_path):
         stored = config.database_path.read_bytes()
         assert b"DU123456" not in stored
         assert store.report()["latest_session"]["status"] == "complete"
+        assert store.report()["latest_quotes"][0]["mark_price"] == 600.1
     finally:
         store.close()
 

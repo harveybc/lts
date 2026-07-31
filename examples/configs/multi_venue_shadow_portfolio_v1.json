@@ -1,0 +1,105 @@
+{
+  "schema": "lts.multi_venue_shadow_config.v1",
+  "mode": "shadow_no_orders",
+  "database_path": "~/.local/state/lts/multi-venue-shadow.sqlite",
+  "initial_nav": 100000,
+  "orders": {
+    "enabled": false
+  },
+  "source_databases": {
+    "alpaca_paper": "~/.local/state/lts/alpaca-paper-lab.sqlite",
+    "ibkr_paper": "~/.local/state/lts/ibkr-paper-lab.sqlite"
+  },
+  "cells": [
+    {
+      "cell_id": "btc_short",
+      "venue": "alpaca_paper",
+      "symbol": "BTC/USD",
+      "source_key": "BTC/USD",
+      "role": "crypto_core",
+      "horizon": "short",
+      "weight": 0.1,
+      "max_quote_age_seconds": 900
+    },
+    {
+      "cell_id": "eth_short",
+      "venue": "alpaca_paper",
+      "symbol": "ETH/USD",
+      "source_key": "ETH/USD",
+      "role": "crypto_core",
+      "horizon": "short",
+      "weight": 0.1,
+      "max_quote_age_seconds": 900
+    },
+    {
+      "cell_id": "sol_medium",
+      "venue": "alpaca_paper",
+      "symbol": "SOL/USD",
+      "source_key": "SOL/USD",
+      "role": "crypto_rush_candidate",
+      "horizon": "medium",
+      "weight": 0.1,
+      "max_quote_age_seconds": 900
+    },
+    {
+      "cell_id": "spy_control",
+      "venue": "ibkr_paper",
+      "symbol": "SPY",
+      "source_key": "spy_execution_control",
+      "role": "equity_control",
+      "horizon": "short",
+      "weight": 0.15,
+      "max_quote_age_seconds": 86400
+    },
+    {
+      "cell_id": "tlt_duration",
+      "venue": "ibkr_paper",
+      "symbol": "TLT",
+      "source_key": "tlt_duration_control",
+      "role": "duration_diversifier",
+      "horizon": "medium",
+      "weight": 0.15,
+      "max_quote_age_seconds": 86400
+    },
+    {
+      "cell_id": "gld_metal",
+      "venue": "ibkr_paper",
+      "symbol": "GLD",
+      "source_key": "gld_metal_control",
+      "role": "metal_diversifier",
+      "horizon": "medium",
+      "weight": 0.15,
+      "max_quote_age_seconds": 86400
+    },
+    {
+      "cell_id": "eurusd_medium",
+      "venue": "ibkr_paper",
+      "symbol": "EURUSD",
+      "source_key": "eurusd_4h",
+      "role": "fx_medium_long",
+      "horizon": "medium",
+      "weight": 0.1,
+      "max_quote_age_seconds": 86400
+    },
+    {
+      "cell_id": "usdjpy_short",
+      "venue": "ibkr_paper",
+      "symbol": "USDJPY",
+      "source_key": "usdjpy_1h",
+      "role": "fx_short",
+      "horizon": "short",
+      "weight": 0.075,
+      "max_quote_age_seconds": 86400
+    },
+    {
+      "cell_id": "audusd_medium",
+      "venue": "ibkr_paper",
+      "symbol": "AUDUSD",
+      "source_key": "audusd_4h",
+      "role": "fx_medium_long",
+      "horizon": "medium",
+      "weight": 0.075,
+      "max_quote_age_seconds": 86400
+    }
+  ]
+}

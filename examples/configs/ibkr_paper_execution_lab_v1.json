@@ -6,6 +6,7 @@
   "port": 7497,
   "client_id": 7,
   "timeout_seconds": 15,
+  "market_data_wait_seconds": 4,
   "database_path": "~/.local/state/lts/ibkr-paper-lab.sqlite",
   "contracts": [
     {

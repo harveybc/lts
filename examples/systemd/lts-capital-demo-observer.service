@@ -1,0 +1,20 @@
+[Unit]
+Description=LTS Capital.com Demo GET-only observer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/GitHub/lts
+EnvironmentFile=%h/.config/lts/capital-demo.env
+ExecStart=%h/anaconda3/envs/trading-stack/bin/python -m app.capital_demo_cli --config examples/configs/capital_demo_execution_lab_v1.json observe
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/lts
+MemoryMax=256M
+CPUQuota=25%
+TimeoutStartSec=90

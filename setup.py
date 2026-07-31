@@ -10,6 +10,8 @@ setup(
             'lts-oanda-practice=app.oanda_practice_cli:main',
             'lts-alpaca-paper=app.alpaca_paper_cli:main',
             'lts-ibkr-paper=app.ibkr_paper_cli:main',
+            'lts-multi-venue-shadow=app.multi_venue_shadow_cli:main',
+            'lts-capital-demo=app.capital_demo_cli:main',
             'lts-mt5-bridge=app.mt5_bridge_cli:main'
         ],
         # AAA plugins - Authentication, Authorization, Accounting
@@ -40,7 +42,8 @@ setup(
             'oanda_broker=plugins_broker.oanda_broker:OandaBroker',
             'alpaca_paper_broker=plugins_broker.alpaca_paper_broker:AlpacaPaperBroker',
             'ibkr_paper_broker=plugins_broker.ibkr_paper_broker:IbkrPaperBroker',
-            'mt5_bridge_broker=plugins_broker.mt5_bridge_broker:Mt5BridgeBroker'
+            'mt5_bridge_broker=plugins_broker.mt5_bridge_broker:Mt5BridgeBroker',
+            'capital_demo_broker=plugins_broker.capital_demo_broker:CapitalDemoBroker'
         ],
         # Portfolio plugins - Capital allocation management
         'plugins_portfolio': [

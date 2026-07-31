@@ -1,0 +1,19 @@
+[Unit]
+Description=LTS no-order multi-venue shadow portfolio snapshot
+After=network-online.target lts-alpaca-paper-observer.service lts-ibkr-paper-observer.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/GitHub/lts
+ExecStart=%h/anaconda3/envs/trading-stack/bin/python -m app.multi_venue_shadow_cli --config examples/configs/multi_venue_shadow_portfolio_v1.json snapshot
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/lts
+MemoryMax=256M
+CPUQuota=25%
+TimeoutStartSec=60

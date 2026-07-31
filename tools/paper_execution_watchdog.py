@@ -35,6 +35,9 @@ DEFAULT_IBKR_DB = Path.home() / ".local/state/lts/ibkr-paper-lab.sqlite"
 DEFAULT_OANDA_DB = Path.home() / ".local/state/lts/oanda-practice-lab.sqlite"
 DEFAULT_OANDA_ENV = Path.home() / ".config/lts/oanda-practice.env"
 DEFAULT_MT5_DB = Path.home() / ".local/state/lts/mt5-bridge.sqlite"
+DEFAULT_SHADOW_DB = Path.home() / ".local/state/lts/multi-venue-shadow.sqlite"
+DEFAULT_CAPITAL_DB = Path.home() / ".local/state/lts/capital-demo-lab.sqlite"
+DEFAULT_CAPITAL_ENV = Path.home() / ".config/lts/capital-demo.env"
 DEFAULT_STATE = Path.home() / ".local/state/lts/paper-execution-watchdog/state.json"
 DEFAULT_LATEST = Path.home() / ".local/state/lts/paper-execution-watchdog/latest.json"
 DEFAULT_DISCUSSION = Path.home() / ".local/state/lts/hermes/live-trading-discussion.json"
@@ -309,6 +312,72 @@ def read_ibkr_snapshot(
         connection.close()
 
 
+def read_shadow_snapshot(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"available": False, "reason": "database_missing"}
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        latest = connection.execute(
+            """
+            SELECT p.*,r.status
+            FROM portfolio_snapshots p
+            JOIN shadow_runs r ON r.run_id=p.run_id
+            ORDER BY p.observed_at DESC LIMIT 1
+            """
+        ).fetchone()
+        return {
+            "available": latest is not None,
+            "reason": None if latest is not None else "no_snapshots",
+            "latest": dict(latest) if latest is not None else None,
+        }
+    except sqlite3.OperationalError as exc:
+        return {
+            "available": False,
+            "reason": "schema_unavailable",
+            "detail": str(exc),
+        }
+    finally:
+        connection.close()
+
+
+def read_capital_snapshot(path: Path, environment_path: Path) -> dict[str, Any]:
+    configured = environment_path.exists()
+    if not path.exists():
+        return {
+            "available": False,
+            "configured": configured,
+            "reason": "database_missing" if configured else "not_configured",
+        }
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        latest = connection.execute(
+            """
+            SELECT s.session_id,s.status,s.started_at,s.ended_at,
+                   r.open_positions,r.working_orders
+            FROM lab_sessions s
+            LEFT JOIN reconciliation_snapshots r ON r.session_id=s.session_id
+            ORDER BY s.started_at DESC LIMIT 1
+            """
+        ).fetchone()
+        return {
+            "available": latest is not None,
+            "configured": configured,
+            "reason": None if latest is not None else "no_sessions",
+            "latest": dict(latest) if latest is not None else None,
+        }
+    except sqlite3.OperationalError as exc:
+        return {
+            "available": False,
+            "configured": configured,
+            "reason": "schema_unavailable",
+            "detail": str(exc),
+        }
+    finally:
+        connection.close()
+
+
 def read_oanda_snapshot(
     path: Path,
     environment_path: Path,
@@ -505,6 +574,8 @@ def evaluate(
     ibkr: Mapping[str, Any],
     oanda: Optional[Mapping[str, Any]] = None,
     mt5: Optional[Mapping[str, Any]] = None,
+    shadow: Optional[Mapping[str, Any]] = None,
+    capital: Optional[Mapping[str, Any]] = None,
     *,
     now: float,
     stale_seconds: float,
@@ -788,6 +859,93 @@ def evaluate(
                 )
     if mt5 is not None:
         events.extend(evaluate_mt5(mt5, now=now, stale_seconds=stale_seconds))
+    if shadow is not None:
+        latest_shadow = shadow.get("latest") or {}
+        observed_at = _parse_time(latest_shadow.get("observed_at"))
+        if not shadow.get("available") or observed_at is None:
+            events.append(
+                _event(
+                    "multi_venue_shadow_missing",
+                    "LTS PAPER ALERT: SHADOW PORTFOLIO HAS NO DATA",
+                    f"reason: {shadow.get('reason', 'unknown')}",
+                    severity="critical",
+                    category="portfolio",
+                )
+            )
+        elif now - observed_at > stale_seconds:
+            events.append(
+                _event(
+                    "multi_venue_shadow_stale",
+                    "LTS PAPER ALERT: SHADOW PORTFOLIO STALE",
+                    f"snapshot age: {(now - observed_at) / 60:.1f} min",
+                    severity="critical",
+                    category="portfolio",
+                )
+            )
+        missing = int(latest_shadow.get("missing_cells") or 0)
+        if missing:
+            events.append(
+                _event(
+                    "multi_venue_shadow_incomplete",
+                    "LTS PAPER ALERT: SHADOW PORTFOLIO COVERAGE INCOMPLETE",
+                    (
+                        f"missing cells: {missing}\n"
+                        f"fresh portfolio weight: "
+                        f"{float(latest_shadow.get('available_weight') or 0):.1%}"
+                    ),
+                    severity="warning",
+                    category="portfolio",
+                )
+            )
+        if int(latest_shadow.get("orders_submitted") or 0):
+            events.append(
+                _event(
+                    "multi_venue_shadow_order_violation",
+                    "LTS PAPER CRITICAL: SHADOW PORTFOLIO SUBMITTED AN ORDER",
+                    "Stop the shadow observer and inspect immediately.",
+                    severity="critical",
+                    category="reconciliation",
+                )
+            )
+    if capital is not None and capital.get("configured"):
+        latest_capital = capital.get("latest") or {}
+        ended_at = _parse_time(latest_capital.get("ended_at"))
+        if not capital.get("available") or ended_at is None:
+            events.append(
+                _event(
+                    "capital_demo_missing",
+                    "LTS PAPER ALERT: CAPITAL.COM DEMO HAS NO DATA",
+                    f"reason: {capital.get('reason', 'unknown')}",
+                    severity="warning",
+                    category="operations",
+                )
+            )
+        elif now - ended_at > stale_seconds:
+            events.append(
+                _event(
+                    "capital_demo_stale",
+                    "LTS PAPER ALERT: CAPITAL.COM DEMO STALE",
+                    f"observation age: {(now - ended_at) / 60:.1f} min",
+                    severity="warning",
+                    category="operations",
+                )
+            )
+        if int(latest_capital.get("open_positions") or 0) or int(
+            latest_capital.get("working_orders") or 0
+        ):
+            events.append(
+                _event(
+                    "capital_demo_unexpected_exposure",
+                    "LTS PAPER ALERT: UNEXPECTED CAPITAL.COM EXPOSURE",
+                    (
+                        f"positions/orders: "
+                        f"{latest_capital.get('open_positions', 0)}/"
+                        f"{latest_capital.get('working_orders', 0)}"
+                    ),
+                    severity="critical",
+                    category="reconciliation",
+                )
+            )
     return events, discussions
 
 
@@ -796,6 +954,8 @@ def format_summary(
     ibkr: Mapping[str, Any],
     oanda: Optional[Mapping[str, Any]] = None,
     mt5: Optional[Mapping[str, Any]] = None,
+    shadow: Optional[Mapping[str, Any]] = None,
+    capital: Optional[Mapping[str, Any]] = None,
 ) -> str:
     if not alpaca.get("available"):
         alpaca_text = f"Alpaca: unavailable ({alpaca.get('reason', 'unknown')})"
@@ -864,6 +1024,25 @@ def format_summary(
             f"positions/orders: {snapshot.get('positions_total', 0)}/"
             f"{snapshot.get('orders_total', 0)}"
         )
+    shadow_latest = (shadow or {}).get("latest") or {}
+    shadow_text = (
+        "Multi-venue shadow: "
+        f"{(shadow or {}).get('available', False)}\n"
+        f"NAV/return: {float(shadow_latest.get('nav') or 0):.2f}/"
+        f"{float(shadow_latest.get('total_return') or 0):+.4%}\n"
+        f"fresh weight: {float(shadow_latest.get('available_weight') or 0):.1%}; "
+        f"missing/stale: {shadow_latest.get('missing_cells', 0)}/"
+        f"{shadow_latest.get('stale_cells', 0)}\n"
+        f"orders submitted: {shadow_latest.get('orders_submitted', 0)}"
+    )
+    capital_latest = (capital or {}).get("latest") or {}
+    capital_text = (
+        "Capital.com Demo: "
+        f"{'healthy' if (capital or {}).get('available') else (capital or {}).get('reason', 'not monitored')}\n"
+        f"configured: {bool((capital or {}).get('configured'))}; "
+        f"positions/orders: {capital_latest.get('open_positions', 0)}/"
+        f"{capital_latest.get('working_orders', 0)}"
+    )
     return (
         "LTS PAPER/SHADOW STATUS\n\n"
         + alpaca_text
@@ -873,6 +1052,10 @@ def format_summary(
         + oanda_text
         + "\n\n"
         + mt5_text
+        + "\n\n"
+        + shadow_text
+        + "\n\n"
+        + capital_text
     )
 
 
@@ -999,6 +1182,9 @@ def main() -> int:
     parser.add_argument("--oanda-db", type=Path, default=DEFAULT_OANDA_DB)
     parser.add_argument("--oanda-env", type=Path, default=DEFAULT_OANDA_ENV)
     parser.add_argument("--mt5-db", type=Path, default=DEFAULT_MT5_DB)
+    parser.add_argument("--shadow-db", type=Path, default=DEFAULT_SHADOW_DB)
+    parser.add_argument("--capital-db", type=Path, default=DEFAULT_CAPITAL_DB)
+    parser.add_argument("--capital-env", type=Path, default=DEFAULT_CAPITAL_ENV)
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--latest-file", type=Path, default=DEFAULT_LATEST)
     parser.add_argument("--discussion-file", type=Path, default=DEFAULT_DISCUSSION)
@@ -1025,6 +1211,8 @@ def main() -> int:
             alpaca: dict[str, Any] = {}
             ibkr: dict[str, Any] = {}
             oanda: Optional[dict[str, Any]] = None
+            shadow: dict[str, Any] = {}
+            capital: dict[str, Any] = {}
             events = evaluate_mt5(
                 mt5,
                 now=now,
@@ -1039,11 +1227,15 @@ def main() -> int:
                 args.ibkr_port,
             )
             oanda = read_oanda_snapshot(args.oanda_db, args.oanda_env)
+            shadow = read_shadow_snapshot(args.shadow_db)
+            capital = read_capital_snapshot(args.capital_db, args.capital_env)
             events, discussions = evaluate(
                 alpaca,
                 ibkr,
                 oanda,
                 mt5,
+                shadow,
+                capital,
                 now=now,
                 stale_seconds=args.stale_minutes * 60.0,
             )
@@ -1061,7 +1253,11 @@ def main() -> int:
                 if args.mt5_only:
                     messages.append(format_mt5_summary(mt5))
                 else:
-                    messages.append(format_summary(alpaca, ibkr, oanda, mt5))
+                    messages.append(
+                        format_summary(
+                            alpaca, ibkr, oanda, mt5, shadow, capital
+                        )
+                    )
                 state["last_summary_at"] = now
             packet = {
                 "schema": "lts.hermes.live_trading_discussion.v1",
@@ -1092,6 +1288,8 @@ def main() -> int:
                 "ibkr": ibkr,
                 "oanda": oanda,
                 "mt5": mt5,
+                "shadow": shadow,
+                "capital": capital,
                 "active_event_keys": sorted(item["key"] for item in events),
                 "discussion_event_keys": sorted(item["key"] for item in discussions),
             }

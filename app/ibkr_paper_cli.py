@@ -53,6 +53,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     config.port,
                     config.client_id,
                     timeout_seconds=config.timeout_seconds,
+                    market_data_wait_seconds=config.market_data_wait_seconds,
                 )
                 result = IbkrPaperLab(config, client, store).preflight()
         except IbkrPaperError as exc:

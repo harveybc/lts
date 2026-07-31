@@ -1,6 +1,6 @@
 [Unit]
 Description=LTS Paper/Shadow execution watchdog and Telegram reporter
-After=network-online.target lts-alpaca-paper-observer.service
+After=network-online.target lts-alpaca-paper-observer.service lts-multi-venue-shadow.service
 Wants=network-online.target
 
 [Service]

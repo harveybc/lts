@@ -1,6 +1,6 @@
 # Multi-Venue Paper Execution
 
-Status: Alpaca and IBKR Paper observation active; MT5 VM and read-only bridge in commissioning
+Status: Alpaca, IBKR and shadow observation active; Capital.com Demo adapter ready; MT5 bridge in commissioning
 Date: 2026-07-30
 
 ## Account State
@@ -41,6 +41,7 @@ to fabricate portfolio capital.
 | OANDA Global Markets MT5 | FX and available crypto-CFD calibration | eligible after MT5 demo capability and protected-canary gates |
 | Alpaca Trading API Paper | crypto data/API and long-only control | shadow-only until native server-side SL+TP satisfies the common contract |
 | IBKR Individual Margin Paper | equities/ETF and broad multi-asset calibration | eligible after Paper/TWS or Web API capability and protected-canary gates |
+| Capital.com Demo API | crypto, FX, index and CFD fallback discovery | GET-only observer; mutation plugin disabled |
 
 The existing `oanda_broker` and OANDA Practice laboratory use REST v20 and are
 not OANDA Global Markets adapters.
@@ -90,13 +91,17 @@ not available inside the MT5 Strategy Tester.
 
 ## Active Observation Runtime
 
-Omega currently runs three five-minute user timers:
+Omega currently runs four five-minute user timers:
 
 - `lts-alpaca-paper-observer.timer` records account/instrument capabilities,
   quotes, endpoint latency and reconciliation facts;
 - `lts-ibkr-paper-observer.timer` waits without failing while TWS is closed and
   runs the authenticated read-only contract preflight when Paper port `7497`
   is available. A nonblocking file lock prevents overlapping preflights;
+- `lts-multi-venue-shadow.timer` marks one synthetic USD 100,000 NAV from BTC,
+  ETH, SOL, SPY, TLT, GLD, EURUSD, USDJPY and AUDUSD. Missing quotes retain
+  their sleeve as cash and are reported as degraded coverage; this service has
+  no order interface;
 - `lts-paper-execution-watchdog.timer` checks freshness, endpoint failures,
   missing quotes, unexpected exposure and venue availability. IBKR health
   requires a recent completed authenticated session plus reconciliation facts;
@@ -119,6 +124,20 @@ for Hermes. A bounded DeepSeek review runs every 12 hours with only the `todo`
 toolset and cannot place orders, change risk, enqueue jobs or promote models.
 Interesting one-hour and four-hour moves are discussion candidates, never
 automatic trading signals.
+
+The optional `lts-capital-demo-observer.timer` is installed only after its
+local credential file exists. It authenticates against the official Demo API,
+then uses allowlisted GET requests for accounts, positions, working orders and
+market discovery. Its adapter has no mutation request method.
+
+Runtime acceptance at 2026-07-30 23:46 America/Bogota:
+
+- Alpaca and IBKR produced fresh normalized quotes;
+- all nine shadow cells were available with no missing or stale sleeve;
+- the shadow NAV persisted successfully with `orders_submitted=0`;
+- the consolidated watchdog completed successfully;
+- the complete LTS test suite passed: `211` tests, with one dependency
+  deprecation warning and no failures.
 
 ## Alpaca Paper Credentials
 
@@ -145,6 +164,20 @@ port `7497`. Then run:
 
 IB Gateway Paper may later use port `4002`, but the initial laboratory is
 intentionally pinned to local TWS Paper `7497`.
+
+## Capital.com Demo Startup
+
+Create a Demo account, enable 2FA, generate an API key and define its custom
+API password. Then enter the values locally:
+
+```bash
+./examples/scripts/configure_capital_demo.py
+./examples/scripts/enable_capital_demo_observer.sh
+```
+
+The secret file is `~/.config/lts/capital-demo.env` with mode `600`. The
+observer targets only `https://demo-api-capital.backend-capital.com` and
+submits no orders.
 
 ## OANDA Credential Boundaries
 
@@ -246,6 +279,8 @@ Inside MT5:
   heartbeat plus full snapshot;
 - obtain REST-v20 Practice credentials only if the OANDA division exposes that
   API; MT5 credentials cannot be used with REST v20.
+- activate the Capital.com Demo GET-only observer to cover the missing
+  crypto/FX/CFD capability inventory while OANDA remains blocked.
 
 The complete architecture, OLAP contract and social-trading boundary are in:
 

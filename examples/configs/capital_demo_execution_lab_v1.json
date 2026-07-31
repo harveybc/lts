@@ -1,0 +1,24 @@
+{
+  "schema": "lts.capital.demo_lab_config.v1",
+  "environment": "demo",
+  "mode": "get_only",
+  "base_url": "https://demo-api-capital.backend-capital.com",
+  "database_path": "~/.local/state/lts/capital-demo-lab.sqlite",
+  "timeout_seconds": 20,
+  "orders": {
+    "enabled": false
+  },
+  "secrets": {
+    "api_key_env": "CAPITAL_DEMO_API_KEY",
+    "identifier_env": "CAPITAL_DEMO_IDENTIFIER",
+    "password_env": "CAPITAL_DEMO_PASSWORD"
+  },
+  "market_search_terms": [
+    "Bitcoin",
+    "Ethereum",
+    "Solana",
+    "EUR/USD",
+    "Gold",
+    "US 500"
+  ]
+}

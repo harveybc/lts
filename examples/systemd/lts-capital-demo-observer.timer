@@ -1,0 +1,13 @@
+[Unit]
+Description=Observe Capital.com Demo every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+AccuracySec=15s
+Persistent=true
+Unit=lts-capital-demo-observer.service
+
+[Install]
+WantedBy=timers.target

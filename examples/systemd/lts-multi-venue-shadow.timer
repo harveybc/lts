@@ -1,0 +1,13 @@
+[Unit]
+Description=Mark the multi-venue shadow portfolio every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+AccuracySec=15s
+Persistent=true
+Unit=lts-multi-venue-shadow.service
+
+[Install]
+WantedBy=timers.target
