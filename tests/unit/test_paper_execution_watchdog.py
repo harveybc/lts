@@ -101,11 +101,33 @@ def test_evaluate_reports_unconfigured_oanda() -> None:
         {"available": False, "configured": False, "reason": "not_configured"},
         now=1785384300.0,
         stale_seconds=900,
+        oanda_rest_required=True,
     )
 
     assert [event["key"] for event in events] == [
         "oanda_practice_not_configured"
     ]
+    assert discussions == []
+
+
+def test_evaluate_ignores_optional_unconfigured_oanda() -> None:
+    events, discussions = evaluate(
+        _healthy_alpaca(1785384300.0),
+        {
+            "available": True,
+            "socket": {"available": True},
+            "latest_complete": {
+                "ended_at": "2026-07-30T04:00:00+00:00",
+                "open_positions": 0,
+                "open_orders": 0,
+            },
+        },
+        {"available": False, "configured": False, "reason": "not_configured"},
+        now=1785384300.0,
+        stale_seconds=900,
+    )
+
+    assert events == []
     assert discussions == []
 
 

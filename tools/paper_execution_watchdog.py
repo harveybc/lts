@@ -579,6 +579,7 @@ def evaluate(
     *,
     now: float,
     stale_seconds: float,
+    oanda_rest_required: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     events: list[dict[str, Any]] = []
     discussions: list[dict[str, Any]] = []
@@ -787,18 +788,19 @@ def evaluate(
             )
     if oanda is not None:
         if not oanda.get("configured"):
-            events.append(
-                _event(
-                    "oanda_practice_not_configured",
-                    "LTS PAPER ACTION REQUIRED: OANDA PRACTICE NOT CONFIGURED",
-                    (
-                        "Run examples/scripts/configure_oanda_practice.sh after "
-                        "creating the REST-v20 Practice token."
-                    ),
-                    severity="warning",
-                    category="operations",
+            if oanda_rest_required:
+                events.append(
+                    _event(
+                        "oanda_practice_not_configured",
+                        "LTS PAPER ACTION REQUIRED: OANDA PRACTICE NOT CONFIGURED",
+                        (
+                            "Run examples/scripts/configure_oanda_practice.sh after "
+                            "creating the REST-v20 Practice token."
+                        ),
+                        severity="warning",
+                        category="operations",
+                    )
                 )
-            )
         elif not oanda.get("available"):
             events.append(
                 _event(
@@ -997,7 +999,7 @@ def format_summary(
     if oanda is None:
         oanda_text = "OANDA Practice: not monitored"
     elif not oanda.get("configured"):
-        oanda_text = "OANDA Practice: credentials not configured"
+        oanda_text = "OANDA REST-v20 Practice: optional and not configured"
     elif not oanda.get("available"):
         oanda_text = (
             f"OANDA Practice: unavailable ({oanda.get('reason', 'unknown')})"
@@ -1194,6 +1196,14 @@ def main() -> int:
     parser.add_argument("--summary-hours", type=float, default=6.0)
     parser.add_argument("--ibkr-host", default="127.0.0.1")
     parser.add_argument("--ibkr-port", type=int, default=7497)
+    parser.add_argument(
+        "--require-oanda-rest",
+        action="store_true",
+        help=(
+            "Alert when REST-v20 Practice credentials are absent. Leave disabled "
+            "for OANDA Global Markets, whose supported automation path is MT5."
+        ),
+    )
     parser.add_argument("--mt5-only", action="store_true")
     parser.add_argument("--no-telegram", action="store_true")
     args = parser.parse_args()
@@ -1238,6 +1248,7 @@ def main() -> int:
                 capital,
                 now=now,
                 stale_seconds=args.stale_minutes * 60.0,
+                oanda_rest_required=args.require_oanda_rest,
             )
         store = MonitorStore(args.monitor_db)
         try:
