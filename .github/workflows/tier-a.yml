@@ -31,7 +31,7 @@ jobs:
             tools/paper_execution_watchdog.py
       - name: Run execution and portfolio contracts
         run: |
-          pytest --confcutdir=tests/unit -q \
+          python -m pytest --confcutdir=tests/unit -q \
             tests/unit/test_multi_venue_shadow.py \
             tests/unit/test_paper_execution_watchdog.py \
             tests/unit/test_portfolio_invariants.py
