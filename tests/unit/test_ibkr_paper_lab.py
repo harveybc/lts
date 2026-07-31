@@ -1,3 +1,4 @@
+import fcntl
 import json
 
 import pytest
@@ -10,6 +11,7 @@ from app.ibkr_paper_lab import (
     IbkrPaperOlap,
     IbkrTwsPaperClient,
 )
+from app.ibkr_paper_cli import main as ibkr_cli_main
 from plugins_broker.ibkr_paper_broker import IbkrPaperBroker
 
 
@@ -161,3 +163,15 @@ def test_broker_adapter_rejects_every_mutation():
     ):
         assert result["success"] is False
         assert "disabled" in result["error"]
+
+
+def test_cli_rejects_concurrent_preflights(tmp_path, capsys):
+    config = _config(tmp_path)
+    config_path = tmp_path / "config.json"
+    lock_path = config.database_path.with_name(config.database_path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = ibkr_cli_main(["--config", str(config_path), "preflight"])
+
+    assert result == 2
+    assert "already running" in capsys.readouterr().err

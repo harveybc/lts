@@ -95,10 +95,13 @@ Omega currently runs three five-minute user timers:
 - `lts-alpaca-paper-observer.timer` records account/instrument capabilities,
   quotes, endpoint latency and reconciliation facts;
 - `lts-ibkr-paper-observer.timer` waits without failing while TWS is closed and
-  runs the read-only contract preflight when Paper port `7497` is available;
+  runs the authenticated read-only contract preflight when Paper port `7497`
+  is available. A nonblocking file lock prevents overlapping preflights;
 - `lts-paper-execution-watchdog.timer` checks freshness, endpoint failures,
-  missing quotes, unexpected exposure and venue availability. Its MT5 input
-  will be pointed at Dragon's bridge facts after the first heartbeat.
+  missing quotes, unexpected exposure and venue availability. IBKR health
+  requires a recent completed authenticated session plus reconciliation facts;
+  a reachable TCP port alone is only diagnostic evidence. Its MT5 input will
+  be pointed at Dragon's bridge facts after the first heartbeat.
 
 Dragon runs `lts-mt5-bridge.service` plus an independent five-minute
 `lts-mt5-bridge-watchdog.timer`. The bridge listens on TCP `8766`, with host

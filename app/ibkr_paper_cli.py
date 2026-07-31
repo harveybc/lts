@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import sys
 from pathlib import Path
@@ -27,9 +28,23 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     config = IbkrPaperLabConfig.load(args.config)
-    store = IbkrPaperOlap(config.database_path)
+    lock = None
+    store = None
     try:
         try:
+            if args.command == "preflight":
+                lock_path = config.database_path.with_name(
+                    config.database_path.name + ".lock"
+                )
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                lock = lock_path.open("a+", encoding="utf-8")
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise IbkrPaperError(
+                        "Another IBKR Paper preflight is already running"
+                    ) from exc
+            store = IbkrPaperOlap(config.database_path)
             if args.command == "report":
                 result = store.report()
             else:
@@ -53,7 +68,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     finally:
-        store.close()
+        if store is not None:
+            store.close()
+        if lock is not None:
+            lock.close()
 
 
 if __name__ == "__main__":

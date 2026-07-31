@@ -31,6 +31,7 @@ EXPECTED_ALPACA_SYMBOLS = {
     "XRP/USD",
 }
 DEFAULT_ALPACA_DB = Path.home() / ".local/state/lts/alpaca-paper-lab.sqlite"
+DEFAULT_IBKR_DB = Path.home() / ".local/state/lts/ibkr-paper-lab.sqlite"
 DEFAULT_OANDA_DB = Path.home() / ".local/state/lts/oanda-practice-lab.sqlite"
 DEFAULT_OANDA_ENV = Path.home() / ".config/lts/oanda-practice.env"
 DEFAULT_MT5_DB = Path.home() / ".local/state/lts/mt5-bridge.sqlite"
@@ -242,6 +243,70 @@ def read_ibkr_socket(host: str, port: int, timeout: float = 1.0) -> dict[str, An
         "latency_ms": (time.perf_counter() - started) * 1000.0,
         "connect_errno": result,
     }
+
+
+def read_ibkr_snapshot(
+    path: Path,
+    host: str,
+    port: int,
+) -> dict[str, Any]:
+    socket_status = read_ibkr_socket(host, port)
+    if not path.exists():
+        return {
+            "available": False,
+            "reason": "database_missing",
+            "socket": socket_status,
+        }
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        latest = connection.execute(
+            """
+            SELECT session_id,status,started_at,ended_at
+            FROM lab_sessions ORDER BY started_at DESC LIMIT 1
+            """
+        ).fetchone()
+        latest_complete = connection.execute(
+            """
+            SELECT s.session_id,s.status,s.started_at,s.ended_at,
+                   r.observed_at AS reconciliation_observed_at,
+                   r.open_positions,r.open_orders
+            FROM lab_sessions s
+            INNER JOIN reconciliation_snapshots r ON r.session_id=s.session_id
+            WHERE s.status='complete'
+            ORDER BY s.ended_at DESC LIMIT 1
+            """
+        ).fetchone()
+        complete_sessions = connection.execute(
+            "SELECT COUNT(*) FROM lab_sessions WHERE status='complete'"
+        ).fetchone()[0]
+        return {
+            "available": latest_complete is not None,
+            "reason": (
+                None
+                if latest_complete is not None
+                else (
+                    "no_reconciled_complete_sessions"
+                    if complete_sessions
+                    else "no_complete_sessions"
+                )
+            ),
+            "socket": socket_status,
+            "latest_session": dict(latest) if latest is not None else None,
+            "latest_complete": (
+                dict(latest_complete) if latest_complete is not None else None
+            ),
+            "complete_sessions": int(complete_sessions),
+        }
+    except sqlite3.OperationalError as exc:
+        return {
+            "available": False,
+            "reason": "schema_unavailable",
+            "detail": str(exc),
+            "socket": socket_status,
+        }
+    finally:
+        connection.close()
 
 
 def read_oanda_snapshot(
@@ -585,19 +650,70 @@ def evaluate(
                     )
                 )
 
-    if not ibkr.get("available"):
+    ibkr_socket = ibkr.get("socket") or {}
+    if not ibkr_socket.get("available"):
         events.append(
             _event(
                 "ibkr_paper_offline",
                 "LTS PAPER ACTION REQUIRED: IBKR TWS OFFLINE",
                 (
-                    f"endpoint: {ibkr.get('host')}:{ibkr.get('port')}\n"
+                    f"endpoint: {ibkr_socket.get('host')}:{ibkr_socket.get('port')}\n"
                     "Start TWS in Paper mode, enable socket clients and retain Read-Only API."
                 ),
                 severity="warning",
                 category="operations",
             )
         )
+    if not ibkr.get("available"):
+        events.append(
+            _event(
+                "ibkr_observer_missing",
+                "LTS PAPER ALERT: IBKR OBSERVER HAS NO FUNCTIONAL DATA",
+                (
+                    f"reason: {ibkr.get('reason', 'unknown')}\n"
+                    f"TWS socket reachable: {bool(ibkr_socket.get('available'))}"
+                ),
+                severity="critical",
+                category="operations",
+            )
+        )
+    else:
+        latest_complete = ibkr.get("latest_complete") or {}
+        ended_at = _parse_time(latest_complete.get("ended_at"))
+        if ended_at is None or now - ended_at > stale_seconds:
+            age = (
+                "unknown"
+                if ended_at is None
+                else f"{(now - ended_at) / 60:.1f} min"
+            )
+            events.append(
+                _event(
+                    "ibkr_observer_stale",
+                    "LTS PAPER ALERT: IBKR OBSERVER STALE",
+                    (
+                        f"latest successful authenticated snapshot age: {age}\n"
+                        f"TWS socket reachable: {bool(ibkr_socket.get('available'))}"
+                    ),
+                    severity="critical",
+                    category="operations",
+                )
+            )
+        positions = int(latest_complete.get("open_positions") or 0)
+        orders = int(latest_complete.get("open_orders") or 0)
+        if positions or orders:
+            events.append(
+                _event(
+                    "ibkr_unexpected_exposure",
+                    "LTS PAPER ALERT: UNEXPECTED IBKR EXPOSURE",
+                    (
+                        f"open positions: {positions}\n"
+                        f"open orders: {orders}\n"
+                        "The observer is read-only; inspect TWS immediately."
+                    ),
+                    severity="critical",
+                    category="reconciliation",
+                )
+            )
     if oanda is not None:
         if not oanda.get("configured"):
             events.append(
@@ -707,9 +823,16 @@ def format_summary(
             f"spread bps p50/p95: {_percentile(spreads, 0.5) or 0:.3f}/"
             f"{_percentile(spreads, 0.95) or 0:.3f}"
         )
+    ibkr_socket = ibkr.get("socket") or {}
+    latest_ibkr = ibkr.get("latest_complete") or {}
     ibkr_text = (
-        f"IBKR Paper TWS: {'online' if ibkr.get('available') else 'offline'} "
-        f"at {ibkr.get('host')}:{ibkr.get('port')}"
+        f"IBKR Paper observer: {'healthy' if ibkr.get('available') else 'unavailable'}\n"
+        f"authenticated observations: {ibkr.get('complete_sessions', 0)}\n"
+        f"last successful snapshot: {latest_ibkr.get('ended_at', 'none')}\n"
+        f"TWS socket: {'online' if ibkr_socket.get('available') else 'offline'} "
+        f"at {ibkr_socket.get('host')}:{ibkr_socket.get('port')}\n"
+        f"positions/orders: {latest_ibkr.get('open_positions', 0)}/"
+        f"{latest_ibkr.get('open_orders', 0)}"
     )
     if oanda is None:
         oanda_text = "OANDA Practice: not monitored"
@@ -872,6 +995,7 @@ def process_events(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--alpaca-db", type=Path, default=DEFAULT_ALPACA_DB)
+    parser.add_argument("--ibkr-db", type=Path, default=DEFAULT_IBKR_DB)
     parser.add_argument("--oanda-db", type=Path, default=DEFAULT_OANDA_DB)
     parser.add_argument("--oanda-env", type=Path, default=DEFAULT_OANDA_ENV)
     parser.add_argument("--mt5-db", type=Path, default=DEFAULT_MT5_DB)
@@ -909,7 +1033,11 @@ def main() -> int:
             discussions: list[dict[str, Any]] = []
         else:
             alpaca = read_alpaca_snapshot(args.alpaca_db, now)
-            ibkr = read_ibkr_socket(args.ibkr_host, args.ibkr_port)
+            ibkr = read_ibkr_snapshot(
+                args.ibkr_db,
+                args.ibkr_host,
+                args.ibkr_port,
+            )
             oanda = read_oanda_snapshot(args.oanda_db, args.oanda_env)
             events, discussions = evaluate(
                 alpaca,

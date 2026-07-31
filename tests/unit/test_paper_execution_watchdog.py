@@ -7,6 +7,7 @@ from tools.paper_execution_watchdog import (
     MonitorStore,
     evaluate,
     process_events,
+    read_ibkr_snapshot,
     read_mt5_snapshot,
 )
 
@@ -40,7 +41,19 @@ def test_evaluate_reports_no_event_for_healthy_online_venues() -> None:
     now = 1785384300.0
     events, discussions = evaluate(
         _healthy_alpaca(now),
-        {"available": True, "host": "127.0.0.1", "port": 7497},
+        {
+            "available": True,
+            "socket": {
+                "available": True,
+                "host": "127.0.0.1",
+                "port": 7497,
+            },
+            "latest_complete": {
+                "ended_at": "2026-07-30T04:00:00+00:00",
+                "open_positions": 0,
+                "open_orders": 0,
+            },
+        },
         now=now,
         stale_seconds=900,
     )
@@ -52,7 +65,15 @@ def test_evaluate_reports_no_event_for_healthy_online_venues() -> None:
 def test_evaluate_reports_missing_alpaca_and_offline_ibkr() -> None:
     events, discussions = evaluate(
         {"available": False, "reason": "database_missing"},
-        {"available": False, "host": "127.0.0.1", "port": 7497},
+        {
+            "available": False,
+            "reason": "database_missing",
+            "socket": {
+                "available": False,
+                "host": "127.0.0.1",
+                "port": 7497,
+            },
+        },
         now=1785384300.0,
         stale_seconds=900,
     )
@@ -60,6 +81,7 @@ def test_evaluate_reports_missing_alpaca_and_offline_ibkr() -> None:
     assert {event["key"] for event in events} == {
         "alpaca_observer_missing",
         "ibkr_paper_offline",
+        "ibkr_observer_missing",
     }
     assert discussions == []
 
@@ -67,7 +89,15 @@ def test_evaluate_reports_missing_alpaca_and_offline_ibkr() -> None:
 def test_evaluate_reports_unconfigured_oanda() -> None:
     events, discussions = evaluate(
         _healthy_alpaca(1785384300.0),
-        {"available": True, "host": "127.0.0.1", "port": 7497},
+        {
+            "available": True,
+            "socket": {"available": True},
+            "latest_complete": {
+                "ended_at": "2026-07-30T04:00:00+00:00",
+                "open_positions": 0,
+                "open_orders": 0,
+            },
+        },
         {"available": False, "configured": False, "reason": "not_configured"},
         now=1785384300.0,
         stale_seconds=900,
@@ -82,7 +112,15 @@ def test_evaluate_reports_unconfigured_oanda() -> None:
 def test_evaluate_reports_stale_disconnected_mt5_with_exposure() -> None:
     events, discussions = evaluate(
         _healthy_alpaca(1785384300.0),
-        {"available": True, "host": "127.0.0.1", "port": 7497},
+        {
+            "available": True,
+            "socket": {"available": True},
+            "latest_complete": {
+                "ended_at": "2026-07-30T04:00:00+00:00",
+                "open_positions": 0,
+                "open_orders": 0,
+            },
+        },
         None,
         {
             "available": True,
@@ -115,6 +153,121 @@ def test_read_mt5_snapshot_handles_missing_schema(tmp_path: Path) -> None:
 
     assert snapshot["available"] is False
     assert snapshot["reason"] == "schema_unavailable"
+
+
+def test_read_ibkr_snapshot_requires_completed_authenticated_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ibkr.sqlite"
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE lab_sessions (
+                session_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                detail_json TEXT NOT NULL
+            );
+            CREATE TABLE reconciliation_snapshots (
+                session_id TEXT PRIMARY KEY,
+                observed_at TEXT NOT NULL,
+                open_positions INTEGER NOT NULL,
+                open_orders INTEGER NOT NULL
+            );
+            INSERT INTO lab_sessions VALUES (
+                'session-1','complete','2026-07-30T03:59:00+00:00',
+                '2026-07-30T04:00:00+00:00','{}'
+            );
+            INSERT INTO reconciliation_snapshots VALUES (
+                'session-1','2026-07-30T04:00:00+00:00',0,0
+            );
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setattr(
+        "tools.paper_execution_watchdog.read_ibkr_socket",
+        lambda host, port: {
+            "available": True,
+            "host": host,
+            "port": port,
+        },
+    )
+
+    snapshot = read_ibkr_snapshot(path, "127.0.0.1", 7497)
+
+    assert snapshot["available"] is True
+    assert snapshot["complete_sessions"] == 1
+    assert snapshot["latest_complete"]["open_positions"] == 0
+
+
+def test_read_ibkr_snapshot_rejects_complete_session_without_reconciliation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "ibkr.sqlite"
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE lab_sessions (
+                session_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                detail_json TEXT NOT NULL
+            );
+            CREATE TABLE reconciliation_snapshots (
+                session_id TEXT PRIMARY KEY,
+                observed_at TEXT NOT NULL,
+                open_positions INTEGER NOT NULL,
+                open_orders INTEGER NOT NULL
+            );
+            INSERT INTO lab_sessions VALUES (
+                'session-1','complete','2026-07-30T03:59:00+00:00',
+                '2026-07-30T04:00:00+00:00','{}'
+            );
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    monkeypatch.setattr(
+        "tools.paper_execution_watchdog.read_ibkr_socket",
+        lambda host, port: {
+            "available": True,
+            "host": host,
+            "port": port,
+        },
+    )
+
+    snapshot = read_ibkr_snapshot(path, "127.0.0.1", 7497)
+
+    assert snapshot["available"] is False
+    assert snapshot["reason"] == "no_reconciled_complete_sessions"
+
+
+def test_evaluate_reports_reachable_but_stale_ibkr_observer() -> None:
+    events, _ = evaluate(
+        _healthy_alpaca(1785384300.0),
+        {
+            "available": True,
+            "socket": {"available": True},
+            "latest_complete": {
+                "ended_at": "2026-07-30T03:00:00+00:00",
+                "open_positions": 0,
+                "open_orders": 0,
+            },
+        },
+        now=1785384300.0,
+        stale_seconds=900,
+    )
+
+    assert [event["key"] for event in events] == ["ibkr_observer_stale"]
 
 
 def test_process_events_deduplicates_and_records_recovery(tmp_path: Path) -> None:
