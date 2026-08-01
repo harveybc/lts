@@ -44,7 +44,7 @@
       "display_name": "cTrader Open API demo",
       "disposition": "next_automated_execution_and_custom_copy_lab",
       "modes": ["copy", "mam"],
-      "account_environment": "ctid_created_demo_trading_account_pending",
+      "account_environment": "spotware_demo_ready_eur_1000_leverage_1_100",
       "automation": "official_python_api",
       "instrument_classes": ["broker_dependent_fx_cfd_crypto"],
       "protection": {

@@ -89,10 +89,10 @@ chain. External account creation and terms acceptance remain owner actions.
 
 ## Owner Walkthrough State, 2026-08-01
 
-- cTrader: cTID created. The demo trading account remains pending. Use the
-  cross-broker cTrader Web account bar and create a hedging demo; if a broker
-  selector is still presented, choose only after its demo, Copy and Open API
-  capabilities are confirmed.
+- cTrader: cTID and the automatically provisioned Spotware demo are active in
+  cross-broker cTrader Web (`EUR 1,000`, leverage `1:100`). This account is
+  sufficient for Open API preflight. Copy catalogue visibility and account
+  type confirmation remain pending; no broker onboarding is required now.
 - eToro: account and Virtual Portfolio opened. Asset inventory and copy-control
   walkthrough remain pending; no real deposit or automated adapter is needed.
 - Darwinex Zero: on hold. Registration requires selecting a paid product and
