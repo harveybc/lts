@@ -53,7 +53,7 @@ run records `orders_submitted=0`.
 
 | Platform | Immediate question | Automation | Capital | Protected-order consequence |
 | --- | --- | --- | --- | --- |
-| MQL5 Signals on OANDA demo | Signal subscription/provider workflow, terminal uptime, copy sizing and slippage | Platform-managed | Demo first | Copying SL/TP is supported as a subscriber setting; first protected social control |
+| MQL5 Signals | Future live-only signal/provider workflow | Platform-managed | Real account only | MT5 build 4150 disabled Signals on demo accounts; no current demo experiment |
 | cTrader Open API demo | Custom copier, broad broker capabilities, latency and account-local protection | Official Python API | Demo | LTS must create and reconcile local SL/TP on every copied entry |
 | cTrader Copy demo investor | User experience, equity-to-equity sizing, fees, missed trades and reallocation | Platform-managed | Demo investor | Native Copy does not copy provider SL/TP; observation only under our strict rule |
 | Darwinex Zero | Provider track record, investable index, risk transformation, capital allocation and performance fees | MT4/MT5/TradingView | Paid virtual membership | Provider policy can retain protected entries; investor exposure is mediated by the DARWIN layer |
@@ -67,9 +67,10 @@ committed.
 
 ## Immediate Commissioning Order
 
-1. Keep OANDA MT5 demo and MQL5 Signals as the protected signal-control path.
-   Create only a free/private signal or subscription during commissioning.
-2. Open a cTrader ID and demo with a cTrader-affiliated broker. Use cTrader
+1. Keep the OANDA MT5 demo as a read-only venue-reality stream. Do not create
+   another MQL5 identity: MetaQuotes disabled Signals on demo accounts in
+   build 4150 and also removed free/private signal creation.
+2. Complete the cTrader demo account under the existing cTID. Use cTrader
    Copy as an investor in one eligible free strategy, then register an Open API
    application for the custom protected-copy experiment.
 3. Create an eToro account only for its free Virtual Portfolio. Capture the
@@ -85,6 +86,20 @@ committed.
 
 Credentials never enter this registry, Git, chat, portable OLAP or the DOIN
 chain. External account creation and terms acceptance remain owner actions.
+
+## Owner Walkthrough State, 2026-08-01
+
+- cTrader: cTID created. The demo trading account remains pending. Use the
+  cross-broker cTrader Web account bar and create a hedging demo; if a broker
+  selector is still presented, choose only after its demo, Copy and Open API
+  capabilities are confirmed.
+- eToro: account and Virtual Portfolio opened. Asset inventory and copy-control
+  walkthrough remain pending; no real deposit or automated adapter is needed.
+- Darwinex Zero: on hold. Registration requires selecting a paid product and
+  charging the first recurring subscription.
+- OANDA MT5: demo and read-only bridge are operational. MQL5 Signals is
+  intentionally unavailable on demo accounts, independently of MQL5 Community
+  email identity.
 
 ## Business-Reality Feedback Loop
 
@@ -180,6 +195,7 @@ OLAP. Stable pseudonymous hashes are sufficient for analysis.
 - cTrader Copy investing: https://help.ctrader.com/ctrader-copy/investing-in-strategies/
 - MQL5 Signals rules: https://www.mql5.com/en/signals/rules
 - MQL5 provider agreement: https://www.mql5.com/en/signals/terms/provider
+- MT5 build 4150 release: https://www.mql5.com/en/forum/459335
 - Darwinex Zero overview: https://www.darwinexzero.com/docs/what-is-darwinex-zero
 - Darwinex Zero assets: https://www.darwinexzero.com/assets
 - eToro CopyTrader: https://www.etoro.com/en-us/copytrader/

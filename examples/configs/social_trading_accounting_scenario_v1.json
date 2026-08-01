@@ -55,7 +55,7 @@
     },
     {
       "type": "copy_allocation",
-      "platform_id": "mql5_signals_oanda_demo",
+      "platform_id": "ctrader_open_api_demo",
       "investor_id": "synthetic-investor-a",
       "provider_volume": "2",
       "provider_equity": "100000",

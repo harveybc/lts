@@ -1,5 +1,6 @@
 import json
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -166,6 +167,28 @@ def test_platform_registry_filters_live_capital_and_protection(tmp_path):
     ] == ["safe"]
     assert registry.eligible(mode="pamm") == []
     assert registry.eligible(mode="pamm", allow_live_capital=True)[0].platform_id == "live"
+
+
+def test_current_registry_excludes_mql5_demo_and_keeps_protected_ctrader_api():
+    registry = SocialPlatformRegistry.load(
+        Path(__file__).parents[2]
+        / "examples"
+        / "configs"
+        / "social_trading_platform_registry_v1.json"
+    )
+    protected_demo_ids = {
+        item.platform_id
+        for item in registry.eligible(
+            mode="copy",
+            require_automation=True,
+            require_protected_entries=True,
+        )
+    }
+    assert "ctrader_open_api_demo" in protected_demo_ids
+    assert "mql5_signals_oanda_demo" not in protected_demo_ids
+    assert registry.get(
+        "mql5_signals_oanda_demo"
+    ).provider_requires_live_capital
 
 
 def test_scenario_is_no_order_and_persists_olap(tmp_path):
