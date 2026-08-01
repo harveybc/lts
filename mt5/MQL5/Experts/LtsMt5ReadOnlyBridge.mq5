@@ -9,7 +9,7 @@
 
 input string InpBridgeUrl = "http://192.168.122.1:8766";
 input string InpBridgeSecret = "";
-input string InpObservedSymbols = "EURUSD,GBPJPY,USDCAD,USDJPY,NZDUSD,EURJPY";
+input string InpObservedSymbols = "SOLUSD,ETHUSD,BTCUSD,ADAUSD,DOGEUSD,XRPUSD,USDCAD,EURJPY,EURUSD,AUDUSD,GBPJPY,USDJPY,NZDUSD";
 input int InpTimerSeconds = 15;
 input int InpSnapshotEveryTimers = 4;
 input int InpRequestTimeoutMs = 4000;

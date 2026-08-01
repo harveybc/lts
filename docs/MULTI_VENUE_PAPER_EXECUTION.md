@@ -248,6 +248,11 @@ Verified runtime state on 2026-08-01:
 - the initial valid symbol snapshot covered `ETHUSD`, `SOLUSD`, `BTCUSD`,
   `ADAUSD`, `DOGEUSD` and `EURJPY`. `EURUSD` and `AUDUSD` were requested but
   had no valid tick in the weekend acceptance snapshot;
+- the tracked source now defaults to `SOLUSD`, `ETHUSD`, `BTCUSD`, `ADAUSD`,
+  `DOGEUSD`, `XRPUSD`, `USDCAD`, `EURJPY`, `EURUSD`, `AUDUSD`, `GBPJPY`,
+  `USDJPY` and `NZDUSD`. This expands read-only observation only; MT5 must
+  reload the compiled EA or update its Inputs before the new default is
+  reflected in snapshots;
 - `lts-mt5-paper` autostart, the bridge service, the independent watchdog
   timer and user linger are enabled. Deterministic monitoring reports no
   active MT5 event.
@@ -265,6 +270,16 @@ Implemented and tested on 2026-07-30:
 The read-only EA and bridge vertical are operationally accepted. This does not
 authorize order submission: the EA has no mutation endpoint and remains
 fail-closed outside demo/read-only mode.
+
+## Decision Data Versus Execution Venue
+
+LTS does not require a model's decision feed to come from the broker that
+executes its order. Binance, public macro/on-chain APIs or another observed
+venue may supply causal inputs while Alpaca, IBKR or MT5 executes. Promotion
+requires explicit symbol aliases, point-in-time availability, cross-venue
+basis/session calibration, staleness handling and offline-versus-runtime
+feature parity. Historical availability or a broker quote alone does not
+authorize inference or execution.
 
 ## Dragon Bridge Setup
 

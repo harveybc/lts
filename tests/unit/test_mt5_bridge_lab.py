@@ -18,6 +18,13 @@ from app.mt5_bridge_lab import (
 
 
 SECRET = b"0123456789abcdef0123456789abcdef"
+EA_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "mt5"
+    / "MQL5"
+    / "Experts"
+    / "LtsMt5ReadOnlyBridge.mq5"
+)
 
 
 def _config(tmp_path: Path) -> Mt5BridgeConfig:
@@ -33,6 +40,26 @@ def _config(tmp_path: Path) -> Mt5BridgeConfig:
         stale_heartbeat_seconds=180,
         allowed_account_fingerprints=(),
     )
+
+
+def test_read_only_ea_default_watchlist_covers_selected_crypto_and_fx() -> None:
+    source = EA_PATH.read_text(encoding="utf-8")
+    for symbol in (
+        "SOLUSD",
+        "ETHUSD",
+        "BTCUSD",
+        "ADAUSD",
+        "DOGEUSD",
+        "XRPUSD",
+        "USDCAD",
+        "EURJPY",
+        "EURUSD",
+        "AUDUSD",
+        "GBPJPY",
+        "USDJPY",
+        "NZDUSD",
+    ):
+        assert symbol in source
 
 
 def _signed_post(client: TestClient, path: str, payload: dict, nonce: str):
