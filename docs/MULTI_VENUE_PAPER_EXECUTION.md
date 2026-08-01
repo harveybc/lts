@@ -1,7 +1,7 @@
 # Multi-Venue Paper Execution
 
-Status: Alpaca, IBKR and shadow observation active; Capital.com Demo adapter ready; MT5 bridge in commissioning
-Date: 2026-07-30
+Status: Alpaca, IBKR, shadow and OANDA MT5 read-only observation active; Capital.com Demo adapter ready
+Date: 2026-08-01
 
 ## Account State
 
@@ -9,9 +9,10 @@ User-reported:
 
 - Alpaca Trading API account: created and verified;
 - IBKR Individual Margin account: created and verified;
-- OANDA Global Markets live account: compliance review pending;
-- OANDA Global Markets MT5 demo: credentials remain user-owned and must be
-  entered only inside MT5 Desktop;
+- OANDA Global Markets live account: created and MT5 login verified, but not
+  authorized for automation;
+- OANDA Global Markets MT5 demo: authenticated inside MT5 Desktop; credentials
+  remain user-owned and are not stored by LTS;
 - Alpaca Paper credentials: provisioned locally and verified by the read-only
   preflight;
 - IBKR TWS Paper: authenticated read-only observer active on
@@ -224,7 +225,7 @@ In Remmina's RDP profile, set **Colour depth** to **Automatic (32 bpp)** and
 `32 bpp` plus `None`; that combination does not advertise the Graphics Pipeline
 required by GNOME Remote Login.
 
-Verified runtime state on 2026-07-29:
+Verified runtime state on 2026-08-01:
 
 - KVM, libvirt 12.0.0, QEMU 10.2.1 and the persistent NAT network pass host
   validation on Dragon;
@@ -233,8 +234,18 @@ Verified runtime state on 2026-07-29:
   `66b7b4b71763ed6f9b2ce29326ed9284544da6f5283d00329921540c01aaaeea`;
 - `lts-mt5-paper` is defined and running with the declared resources, UEFI,
   Secure Boot and TPM 2.0;
-- Windows Setup has booted and awaits the user's interactive language,
-  licensing, edition and account choices. MT5 is not installed yet.
+- Windows 11 is installed and activated, MT5 build 6075 is authenticated to
+  `OANDA_Global-Demo-1`, and the tracked EA compiled with zero errors and zero
+  warnings;
+- the bridge accepted signed heartbeats and snapshots from the demo account,
+  persisted account and symbol facts in SQLite OLAP, and reported zero
+  positions and zero orders;
+- the initial valid symbol snapshot covered `ETHUSD`, `SOLUSD`, `BTCUSD`,
+  `ADAUSD`, `DOGEUSD` and `EURJPY`. `EURUSD` and `AUDUSD` were requested but
+  had no valid tick in the weekend acceptance snapshot;
+- `lts-mt5-paper` autostart, the bridge service, the independent watchdog
+  timer and user linger are enabled. Deterministic monitoring reports no
+  active MT5 event.
 
 Implemented and tested on 2026-07-30:
 
@@ -246,8 +257,9 @@ Implemented and tested on 2026-07-30:
   `trading-stack` environment;
 - reproducible Dragon service and firewall scripts.
 
-The EA source is not accepted as operational until MetaEditor compiles it with
-zero errors inside the installed terminal.
+The read-only EA and bridge vertical are operationally accepted. This does not
+authorize order submission: the EA has no mutation endpoint and remains
+fail-closed outside demo/read-only mode.
 
 ## Dragon Bridge Setup
 
@@ -273,14 +285,16 @@ Inside MT5:
 
 ## Required Next Inputs
 
-- complete Windows Setup in the verified Dragon VM, then install MT5 Desktop
-  and enter the demo credentials only inside the terminal;
-- compile the read-only EA with zero errors and verify an authenticated
-  heartbeat plus full snapshot;
-- obtain REST-v20 Practice credentials only if the OANDA division exposes that
-  API; MT5 credentials cannot be used with REST v20.
-- activate the Capital.com Demo GET-only observer to cover the missing
-  crypto/FX/CFD capability inventory while OANDA remains blocked.
+- complete the 24-hour MT5 read-only observation window and summarize uptime,
+  spread, symbol coverage, reconnects and unexpected exposure;
+- install the QEMU guest agent and configure MT5 launch recovery without
+  placing credentials in Git, chat or Linux observer state;
+- implement and review the protected-canary EA contract before enabling any
+  mutation. Every entry must have broker-accepted SL and TP;
+- activate the Capital.com Demo GET-only observer when credentials are
+  available to retain an independent crypto/FX/CFD capability comparison;
+- obtain REST-v20 Practice credentials only for a compatible OANDA division;
+  Global Markets MT5 credentials cannot be used with REST v20.
 
 The complete architecture, OLAP contract and social-trading boundary are in:
 
