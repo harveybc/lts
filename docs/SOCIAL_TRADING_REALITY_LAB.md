@@ -1,7 +1,7 @@
 # Social-Trading Business Reality Lab
 
-Status: provider-neutral accounting and allocation vertical implemented;
-external social-platform commissioning pending
+Status: accounting/allocation v2 verified; cTrader Copy available; cTrader
+Open API application submitted; external API commissioning pending approval
 Decision date: 2026-08-01
 
 ## Purpose
@@ -24,12 +24,15 @@ expose:
 - copied-versus-provider exposure and tracking error;
 - native or account-local SL/TP capability;
 - platform, account, instrument and jurisdiction limitations.
+- explicit account-currency quantization and withdrawal fee crystallization;
+- contract size, FX conversion, leverage, margin reserve and overshoot limits;
+- idempotent events with before/after state and an append-only SHA-256 chain.
 
 Machine-readable sources:
 
 ```text
 examples/configs/social_trading_platform_registry_v1.json
-examples/configs/social_trading_accounting_scenario_v1.json
+examples/configs/social_trading_accounting_scenario_v2.json
 ```
 
 Execution and report:
@@ -39,7 +42,7 @@ lts-social-trading-lab registry \
   --registry examples/configs/social_trading_platform_registry_v1.json
 
 lts-social-trading-lab run-scenario \
-  --scenario examples/configs/social_trading_accounting_scenario_v1.json
+  --scenario examples/configs/social_trading_accounting_scenario_v2.json
 
 lts-social-trading-lab report \
   --database ~/.local/state/lts/social-trading-lab.sqlite
@@ -47,7 +50,20 @@ lts-social-trading-lab report \
 
 The SQLite views `social_lab_run_olap` and `social_lab_event_olap` preserve
 scenario hashes, registry hashes, event outcomes and the final ledger. Every
-run records `orders_submitted=0`.
+event carries a unique idempotency key, input hash, prior-event hash,
+before/after state and its own hash. `report` verifies the chain against the
+run's final-event anchor. Existing v1 SQLite tables are migrated in place;
+old rows remain available but cannot claim a v2-valid chain. Every run records
+`orders_submitted=0`.
+
+Accounting v2 treats a withdrawal amount as a gross redemption. The investor
+receives that amount net of the proportional performance fee on accrued profit,
+and the manager fee balance receives the crystallized fee. All monetary event
+boundaries use the scenario's declared currency exponent with half-even
+rounding. A copy allocation fails closed when its instrument dimensions are
+missing, volume bounds are not step-aligned, minimum rounding exceeds the
+declared overshoot cap, protected entry is unavailable, or required margin
+exceeds free margin after its reserve.
 
 ## Platform Decision Matrix
 
@@ -90,9 +106,10 @@ chain. External account creation and terms acceptance remain owner actions.
 ## Owner Walkthrough State, 2026-08-01
 
 - cTrader: cTID and the automatically provisioned Spotware demo are active in
-  cross-broker cTrader Web (`EUR 1,000`, leverage `1:100`). This account is
-  sufficient for Open API preflight. Copy catalogue visibility and account
-  type confirmation remain pending; no broker onboarding is required now.
+  cross-broker cTrader Web (`EUR 1,000`, leverage `1:100`). The owner verified
+  that the Copy catalogue is visible. The Open API application is `submitted`,
+  so API authentication and capability discovery wait for Spotware approval;
+  no duplicate application or broker onboarding is required.
 - eToro: account and Virtual Portfolio opened. The owner verified the target
   asset searches, Buy/Sell controls and CopyTrader UI. No real deposit,
   credentials or automated adapter is needed; structured observation is now

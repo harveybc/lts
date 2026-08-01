@@ -14,15 +14,21 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_FLOOR, getcontext
+from decimal import (
+    Decimal,
+    InvalidOperation,
+    ROUND_FLOOR,
+    ROUND_HALF_EVEN,
+    getcontext,
+)
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
 REGISTRY_SCHEMA = "lts.social_platform_registry.v1"
-SCENARIO_SCHEMA = "lts.social_trading_scenario.v1"
-OLAP_SCHEMA = "lts.social_trading_olap.v1"
-ENGINE_VERSION = "lts.social_trading_lab.v1"
+SCENARIO_SCHEMA = "lts.social_trading_scenario.v2"
+OLAP_SCHEMA = "lts.social_trading_olap.v2"
+ENGINE_VERSION = "lts.social_trading_lab.v2"
 SUPPORTED_MODES = {"copy", "signal", "pamm", "mam", "provider_index"}
 SUPPORTED_EVENT_TYPES = {
     "subscribe",
@@ -248,6 +254,8 @@ class InvestorAccount:
     high_water_mark: Decimal = Decimal("0")
     cumulative_deposits: Decimal = Decimal("0")
     cumulative_withdrawals: Decimal = Decimal("0")
+    cumulative_gross_withdrawals: Decimal = Decimal("0")
+    cumulative_net_withdrawals: Decimal = Decimal("0")
     performance_fees: Decimal = Decimal("0")
     management_fees: Decimal = Decimal("0")
 
@@ -255,11 +263,43 @@ class InvestorAccount:
 class UnitizedPammLedger:
     """Unitized pooled accounting with investor-level high-water marks."""
 
-    def __init__(self, *, unit_nav: Any = "1") -> None:
+    def __init__(
+        self,
+        *,
+        unit_nav: Any = "1",
+        currency: str = "USD",
+        money_quantum: Any = "0.01",
+        performance_fee_rate: Any = "0",
+        crystallize_on_withdrawal: bool = True,
+    ) -> None:
         self.unit_nav = _positive(unit_nav, "unit_nav")
+        self.currency = str(currency).strip().upper()
+        if not self.currency or len(self.currency) > 12:
+            raise SocialTradingLabError("currency must be a short non-empty code")
+        self.money_quantum = _positive(money_quantum, "money_quantum")
+        if self.money_quantum.normalize().as_tuple().digits != (1,):
+            raise SocialTradingLabError(
+                "money_quantum must define a base-10 currency exponent"
+            )
+        self.performance_fee_rate = _positive(
+            performance_fee_rate,
+            "performance_fee_rate",
+            allow_zero=True,
+        )
+        if self.performance_fee_rate > 1:
+            raise SocialTradingLabError(
+                "performance_fee_rate cannot exceed 1"
+            )
+        self.crystallize_on_withdrawal = bool(crystallize_on_withdrawal)
         self.investors: dict[str, InvestorAccount] = {}
         self.manager_fee_balance = Decimal("0")
         self.sequence = 0
+
+    def _money(self, value: Decimal) -> Decimal:
+        return value.quantize(self.money_quantum, rounding=ROUND_HALF_EVEN)
+
+    def _money_text(self, value: Decimal) -> str:
+        return _decimal_text(self._money(value))
 
     @property
     def total_units(self) -> Decimal:
@@ -302,31 +342,84 @@ class UnitizedPammLedger:
     def deposit(
         self, investor_id: str, amount: Any, *, role: str = "investor"
     ) -> dict[str, Any]:
-        value = _positive(amount, "deposit amount")
+        value = self._money(_positive(amount, "deposit amount"))
+        if value <= 0:
+            raise SocialTradingLabError(
+                "deposit amount is below the account currency quantum"
+            )
         account = self._account(investor_id, role=role)
         units = value / self.unit_nav
         account.units += units
-        account.high_water_mark += value
-        account.cumulative_deposits += value
+        account.high_water_mark = self._money(account.high_water_mark + value)
+        account.cumulative_deposits = self._money(
+            account.cumulative_deposits + value
+        )
         self.sequence += 1
         return self._event(
             "deposit", investor_id, value, units=units, account_role=role
         )
 
     def withdraw(self, investor_id: str, amount: Any) -> dict[str, Any]:
-        value = _positive(amount, "withdraw amount")
+        gross_redemption = self._money(_positive(amount, "withdraw amount"))
+        if gross_redemption <= 0:
+            raise SocialTradingLabError(
+                "withdraw amount is below the account currency quantum"
+            )
         account = self._account(investor_id)
-        equity_before = account.units * self.unit_nav
-        if value > equity_before:
+        equity_before = self._money(account.units * self.unit_nav)
+        if gross_redemption > equity_before:
             raise SocialTradingLabError("withdraw amount exceeds investor equity")
-        units_before = account.units
-        units = value / self.unit_nav
-        fraction = units / units_before
-        account.units -= units
-        account.high_water_mark *= Decimal("1") - fraction
-        account.cumulative_withdrawals += value
+        fraction = gross_redemption / equity_before
+        eligible_profit = max(
+            equity_before - self._money(account.high_water_mark), Decimal("0")
+        )
+        withdrawn_eligible_profit = self._money(eligible_profit * fraction)
+        performance_fee = Decimal("0")
+        if (
+            account.role == "investor"
+            and self.crystallize_on_withdrawal
+            and self.performance_fee_rate
+        ):
+            performance_fee = self._money(
+                withdrawn_eligible_profit * self.performance_fee_rate
+            )
+        net_disbursement = self._money(gross_redemption - performance_fee)
+        units = gross_redemption / self.unit_nav
+        if gross_redemption == equity_before:
+            account.units = Decimal("0")
+        else:
+            account.units -= units
+        account.high_water_mark = self._money(
+            account.high_water_mark * (Decimal("1") - fraction)
+        )
+        account.performance_fees = self._money(
+            account.performance_fees + performance_fee
+        )
+        self.manager_fee_balance = self._money(
+            self.manager_fee_balance + performance_fee
+        )
+        account.cumulative_withdrawals = self._money(
+            account.cumulative_withdrawals + net_disbursement
+        )
+        account.cumulative_gross_withdrawals = self._money(
+            account.cumulative_gross_withdrawals + gross_redemption
+        )
+        account.cumulative_net_withdrawals = self._money(
+            account.cumulative_net_withdrawals + net_disbursement
+        )
         self.sequence += 1
-        return self._event("withdraw", investor_id, value, units=units)
+        return self._event(
+            "withdraw",
+            investor_id,
+            net_disbursement,
+            gross_redemption=gross_redemption,
+            performance_fee=performance_fee,
+            eligible_profit=eligible_profit,
+            withdrawn_eligible_profit=withdrawn_eligible_profit,
+            performance_fee_rate=self.performance_fee_rate,
+            redeemed_fraction=fraction,
+            units=units,
+        )
 
     def apply_strategy_return(self, rate: Any) -> dict[str, Any]:
         value = _decimal(rate, "strategy return")
@@ -344,25 +437,41 @@ class UnitizedPammLedger:
         }
 
     def crystallize_performance_fee(
-        self, investor_id: str, rate: Any
+        self, investor_id: str, rate: Any = None
     ) -> dict[str, Any]:
-        fee_rate = _positive(rate, "performance fee rate", allow_zero=True)
+        fee_rate = (
+            self.performance_fee_rate
+            if rate is None
+            else _positive(rate, "performance fee rate", allow_zero=True)
+        )
         if fee_rate > 1:
             raise SocialTradingLabError("performance fee rate cannot exceed 1")
+        if fee_rate != self.performance_fee_rate:
+            raise SocialTradingLabError(
+                "performance fee rate does not match the ledger policy"
+            )
         account = self._account(investor_id)
         if account.role == "manager":
             raise SocialTradingLabError(
                 "manager capital cannot be charged a performance fee"
             )
-        gross_equity = account.units * self.unit_nav
-        eligible_profit = max(gross_equity - account.high_water_mark, Decimal("0"))
-        fee = eligible_profit * fee_rate
+        gross_equity = self._money(account.units * self.unit_nav)
+        eligible_profit = max(
+            gross_equity - self._money(account.high_water_mark), Decimal("0")
+        )
+        fee = self._money(eligible_profit * fee_rate)
         if fee:
             account.units -= fee / self.unit_nav
-            account.performance_fees += fee
-            self.manager_fee_balance += fee
-        net_equity = account.units * self.unit_nav
-        account.high_water_mark = max(account.high_water_mark, net_equity)
+            account.performance_fees = self._money(
+                account.performance_fees + fee
+            )
+            self.manager_fee_balance = self._money(
+                self.manager_fee_balance + fee
+            )
+        net_equity = self._money(account.units * self.unit_nav)
+        account.high_water_mark = self._money(
+            max(account.high_water_mark, net_equity)
+        )
         self.sequence += 1
         return self._event(
             "performance_fee",
@@ -386,14 +495,20 @@ class UnitizedPammLedger:
             raise SocialTradingLabError(
                 "manager capital cannot be charged a management fee"
             )
-        gross_equity = account.units * self.unit_nav
-        fee = gross_equity * fee_rate * days / Decimal("365")
+        gross_equity = self._money(account.units * self.unit_nav)
+        fee = self._money(
+            gross_equity * fee_rate * days / Decimal("365")
+        )
         if fee >= gross_equity and gross_equity:
             raise SocialTradingLabError("management fee would exhaust investor equity")
         if fee:
             account.units -= fee / self.unit_nav
-            account.management_fees += fee
-            self.manager_fee_balance += fee
+            account.management_fees = self._money(
+                account.management_fees + fee
+            )
+            self.manager_fee_balance = self._money(
+                self.manager_fee_balance + fee
+            )
         self.sequence += 1
         return self._event(
             "management_fee",
@@ -414,9 +529,10 @@ class UnitizedPammLedger:
             "event_type": event_type,
             "sequence": self.sequence,
             "investor_id": investor_id,
-            "amount": _decimal_text(amount),
+            "amount": self._money_text(amount),
+            "currency": self.currency,
             "unit_nav": _decimal_text(self.unit_nav),
-            "investor_equity": _decimal_text(self.equity(investor_id)),
+            "investor_equity": self._money_text(self.equity(investor_id)),
         }
         result.update(
             {
@@ -428,11 +544,15 @@ class UnitizedPammLedger:
 
     def snapshot(self) -> dict[str, Any]:
         return {
+            "currency": self.currency,
+            "money_quantum": _decimal_text(self.money_quantum),
+            "performance_fee_rate": _decimal_text(self.performance_fee_rate),
+            "crystallize_on_withdrawal": self.crystallize_on_withdrawal,
             "unit_nav": _decimal_text(self.unit_nav),
             "total_units": _decimal_text(self.total_units),
-            "pool_equity": _decimal_text(self.pool_equity),
-            "investor_equity": _decimal_text(self.investor_equity),
-            "manager_capital_equity": _decimal_text(
+            "pool_equity": self._money_text(self.pool_equity),
+            "investor_equity": self._money_text(self.investor_equity),
+            "manager_capital_equity": self._money_text(
                 sum(
                     (
                         account.units * self.unit_nav
@@ -442,22 +562,28 @@ class UnitizedPammLedger:
                     Decimal("0"),
                 )
             ),
-            "manager_fee_balance": _decimal_text(self.manager_fee_balance),
+            "manager_fee_balance": self._money_text(self.manager_fee_balance),
             "sequence": self.sequence,
             "investors": {
                 investor_id: {
                     "role": account.role,
                     "units": _decimal_text(account.units),
-                    "equity": _decimal_text(account.units * self.unit_nav),
-                    "high_water_mark": _decimal_text(account.high_water_mark),
-                    "cumulative_deposits": _decimal_text(
+                    "equity": self._money_text(account.units * self.unit_nav),
+                    "high_water_mark": self._money_text(account.high_water_mark),
+                    "cumulative_deposits": self._money_text(
                         account.cumulative_deposits
                     ),
-                    "cumulative_withdrawals": _decimal_text(
+                    "cumulative_withdrawals": self._money_text(
                         account.cumulative_withdrawals
                     ),
-                    "performance_fees": _decimal_text(account.performance_fees),
-                    "management_fees": _decimal_text(account.management_fees),
+                    "cumulative_gross_withdrawals": self._money_text(
+                        account.cumulative_gross_withdrawals
+                    ),
+                    "cumulative_net_withdrawals": self._money_text(
+                        account.cumulative_net_withdrawals
+                    ),
+                    "performance_fees": self._money_text(account.performance_fees),
+                    "management_fees": self._money_text(account.management_fees),
                 }
                 for investor_id, account in sorted(self.investors.items())
             },
@@ -467,10 +593,23 @@ class UnitizedPammLedger:
 @dataclass(frozen=True)
 class CopyAllocationContract:
     platform_id: str
+    instrument_id: str
+    quote_currency: str
+    investor_currency: str
+    provider_equity_currency: str
     minimum_volume: Decimal
     maximum_volume: Decimal
     volume_step: Decimal
     below_minimum_policy: str
+    max_overshoot_ratio: Decimal
+    contract_size: Decimal
+    reference_price: Decimal
+    quote_to_investor_fx_rate: Decimal
+    provider_equity_to_investor_fx_rate: Decimal
+    provider_leverage: Decimal
+    investor_leverage: Decimal
+    investor_free_margin: Decimal
+    margin_buffer_ratio: Decimal
     native_sltp_replication: bool
     local_protection_overlay: bool
 
@@ -484,12 +623,80 @@ class CopyAllocationContract:
         step = _positive(value.get("volume_step"), "volume_step")
         if maximum < minimum:
             raise SocialTradingLabError("maximum_volume cannot be below minimum")
+        if minimum % step:
+            raise SocialTradingLabError(
+                "minimum_volume must be aligned to volume_step"
+            )
+        if maximum % step:
+            raise SocialTradingLabError(
+                "maximum_volume must be aligned to volume_step"
+            )
+        instrument_id = str(value.get("instrument_id") or "").strip().upper()
+        if not instrument_id:
+            raise SocialTradingLabError("instrument_id is required")
+        currencies = {
+            field: str(value.get(field) or "").strip().upper()
+            for field in (
+                "quote_currency",
+                "investor_currency",
+                "provider_equity_currency",
+            )
+        }
+        invalid_currencies = [
+            field
+            for field, currency in currencies.items()
+            if not currency or len(currency) > 12
+        ]
+        if invalid_currencies:
+            raise SocialTradingLabError(
+                "Copy contract requires currency codes: "
+                + ", ".join(invalid_currencies)
+            )
+        max_overshoot_ratio = _positive(
+            value.get("max_overshoot_ratio"),
+            "max_overshoot_ratio",
+            allow_zero=True,
+        )
+        margin_buffer_ratio = _positive(
+            value.get("margin_buffer_ratio"),
+            "margin_buffer_ratio",
+            allow_zero=True,
+        )
+        if margin_buffer_ratio >= 1:
+            raise SocialTradingLabError("margin_buffer_ratio must be below 1")
         return cls(
             platform_id=str(value.get("platform_id") or "local"),
+            instrument_id=instrument_id,
+            quote_currency=currencies["quote_currency"],
+            investor_currency=currencies["investor_currency"],
+            provider_equity_currency=currencies["provider_equity_currency"],
             minimum_volume=minimum,
             maximum_volume=maximum,
             volume_step=step,
             below_minimum_policy=policy,
+            max_overshoot_ratio=max_overshoot_ratio,
+            contract_size=_positive(value.get("contract_size"), "contract_size"),
+            reference_price=_positive(
+                value.get("reference_price"), "reference_price"
+            ),
+            quote_to_investor_fx_rate=_positive(
+                value.get("quote_to_investor_fx_rate"),
+                "quote_to_investor_fx_rate",
+            ),
+            provider_equity_to_investor_fx_rate=_positive(
+                value.get("provider_equity_to_investor_fx_rate"),
+                "provider_equity_to_investor_fx_rate",
+            ),
+            provider_leverage=_positive(
+                value.get("provider_leverage"), "provider_leverage"
+            ),
+            investor_leverage=_positive(
+                value.get("investor_leverage"), "investor_leverage"
+            ),
+            investor_free_margin=_positive(
+                value.get("investor_free_margin"), "investor_free_margin"
+            ),
+            margin_buffer_ratio=margin_buffer_ratio,
             native_sltp_replication=bool(
                 value.get("native_sltp_replication", False)
             ),
@@ -509,14 +716,17 @@ class CopyAllocationContract:
         source_volume = _positive(provider_volume, "provider_volume")
         source_equity = _positive(provider_equity, "provider_equity")
         target_equity = _positive(investor_equity, "investor_equity")
+        normalized_source_equity = (
+            source_equity * self.provider_equity_to_investor_fx_rate
+        )
+        raw = source_volume * target_equity / normalized_source_equity
         if require_protected_entry and not (
             self.native_sltp_replication or self.local_protection_overlay
         ):
             return self._rejected(
                 "protected_entry_unavailable",
-                raw_volume=source_volume * target_equity / source_equity,
+                raw_volume=raw,
             )
-        raw = source_volume * target_equity / source_equity
         if raw > self.maximum_volume:
             return self._rejected("above_maximum_volume", raw_volume=raw)
         if raw < self.minimum_volume:
@@ -529,24 +739,81 @@ class CopyAllocationContract:
             if allocated < self.minimum_volume:
                 allocated = self.minimum_volume
         tracking_error = abs(allocated - raw) / raw if raw else Decimal("0")
+        if allocated > raw and tracking_error > self.max_overshoot_ratio:
+            return self._rejected(
+                "minimum_volume_overshoot",
+                raw_volume=raw,
+                volume_tracking_error=tracking_error,
+            )
+        notional_quote = allocated * self.contract_size * self.reference_price
+        notional_investor = notional_quote * self.quote_to_investor_fx_rate
+        required_margin = notional_investor / self.investor_leverage
+        available_margin = self.investor_free_margin * (
+            Decimal("1") - self.margin_buffer_ratio
+        )
+        if required_margin > available_margin:
+            return self._rejected(
+                "insufficient_margin_headroom",
+                raw_volume=raw,
+                volume_tracking_error=tracking_error,
+                required_margin=required_margin,
+                available_margin=available_margin,
+            )
         return {
             "status": "allocated",
             "platform_id": self.platform_id,
+            "instrument_id": self.instrument_id,
+            "quote_currency": self.quote_currency,
+            "investor_currency": self.investor_currency,
+            "provider_equity_currency": self.provider_equity_currency,
             "raw_volume": _decimal_text(raw),
             "allocated_volume": _decimal_text(allocated),
             "volume_tracking_error": _decimal_text(tracking_error),
+            "contract_size": _decimal_text(self.contract_size),
+            "reference_price": _decimal_text(self.reference_price),
+            "quote_to_investor_fx_rate": _decimal_text(
+                self.quote_to_investor_fx_rate
+            ),
+            "provider_equity_to_investor_fx_rate": _decimal_text(
+                self.provider_equity_to_investor_fx_rate
+            ),
+            "provider_leverage": _decimal_text(self.provider_leverage),
+            "investor_leverage": _decimal_text(self.investor_leverage),
+            "notional_investor_currency": _decimal_text(notional_investor),
+            "required_margin": _decimal_text(required_margin),
+            "available_margin_after_buffer": _decimal_text(available_margin),
             "native_sltp_replication": self.native_sltp_replication,
             "local_protection_overlay": self.local_protection_overlay,
         }
 
-    def _rejected(self, reason: str, *, raw_volume: Decimal) -> dict[str, Any]:
+    def _rejected(
+        self,
+        reason: str,
+        *,
+        raw_volume: Decimal,
+        volume_tracking_error: Optional[Decimal] = None,
+        required_margin: Optional[Decimal] = None,
+        available_margin: Optional[Decimal] = None,
+    ) -> dict[str, Any]:
         return {
             "status": "rejected",
             "platform_id": self.platform_id,
+            "instrument_id": self.instrument_id,
+            "quote_currency": self.quote_currency,
+            "investor_currency": self.investor_currency,
+            "provider_equity_currency": self.provider_equity_currency,
             "reason": reason,
             "raw_volume": _decimal_text(raw_volume),
             "allocated_volume": "0",
-            "volume_tracking_error": None,
+            "volume_tracking_error": None
+            if volume_tracking_error is None
+            else _decimal_text(volume_tracking_error),
+            "required_margin": None
+            if required_margin is None
+            else _decimal_text(required_margin),
+            "available_margin_after_buffer": None
+            if available_margin is None
+            else _decimal_text(available_margin),
             "native_sltp_replication": self.native_sltp_replication,
             "local_protection_overlay": self.local_protection_overlay,
         }
@@ -559,6 +826,10 @@ class SocialTradingScenario:
     registry_path: Path
     events: tuple[Mapping[str, Any], ...]
     orders_enabled: bool
+    currency: str
+    money_quantum: str
+    performance_fee_rate: str
+    crystallize_on_withdrawal: bool
 
     @classmethod
     def load(cls, path: Path | str) -> "SocialTradingScenario":
@@ -585,6 +856,39 @@ class SocialTradingScenario:
             raise SocialTradingLabError(
                 f"Unsupported scenario events: {', '.join(unsupported)}"
             )
+        idempotency_keys = [
+            str(event.get("idempotency_key") or "").strip() for event in events
+        ]
+        if any(not key for key in idempotency_keys):
+            raise SocialTradingLabError(
+                "Every scenario event requires an idempotency_key"
+            )
+        if len(idempotency_keys) != len(set(idempotency_keys)):
+            raise SocialTradingLabError(
+                "Scenario event idempotency_key values must be unique"
+            )
+        accounting = payload.get("accounting") or {}
+        required_accounting = (
+            "currency",
+            "money_quantum",
+            "performance_fee_rate",
+            "crystallize_on_withdrawal",
+        )
+        missing_accounting = [
+            key for key in required_accounting if key not in accounting
+        ]
+        if missing_accounting:
+            raise SocialTradingLabError(
+                "Scenario accounting is missing: "
+                + ", ".join(missing_accounting)
+            )
+        # Validate the policy at load time, before any event can be persisted.
+        UnitizedPammLedger(
+            currency=accounting["currency"],
+            money_quantum=accounting["money_quantum"],
+            performance_fee_rate=accounting["performance_fee_rate"],
+            crystallize_on_withdrawal=accounting["crystallize_on_withdrawal"],
+        )
         return cls(
             scenario_id=str(payload.get("scenario_id") or source_path.stem),
             database_path=_expand_path(
@@ -600,6 +904,12 @@ class SocialTradingScenario:
             else Path(payload["registry_path"]),
             events=events,
             orders_enabled=orders_enabled,
+            currency=str(accounting["currency"]),
+            money_quantum=str(accounting["money_quantum"]),
+            performance_fee_rate=str(accounting["performance_fee_rate"]),
+            crystallize_on_withdrawal=bool(
+                accounting["crystallize_on_withdrawal"]
+            ),
         )
 
     def fingerprint(self) -> str:
@@ -609,6 +919,14 @@ class SocialTradingScenario:
                 "registry_path": str(self.registry_path),
                 "events": self.events,
                 "orders_enabled": self.orders_enabled,
+                "accounting": {
+                    "currency": self.currency,
+                    "money_quantum": self.money_quantum,
+                    "performance_fee_rate": self.performance_fee_rate,
+                    "crystallize_on_withdrawal": (
+                        self.crystallize_on_withdrawal
+                    ),
+                },
             }
         )
 
@@ -639,7 +957,8 @@ class SocialTradingOlap:
                 ended_at TEXT NOT NULL,
                 status TEXT NOT NULL,
                 orders_submitted INTEGER NOT NULL,
-                final_snapshot_json TEXT NOT NULL
+                final_snapshot_json TEXT NOT NULL,
+                final_event_sha256 TEXT
             );
             CREATE TABLE IF NOT EXISTS social_lab_events (
                 run_id TEXT NOT NULL,
@@ -647,6 +966,10 @@ class SocialTradingOlap:
                 event_type TEXT NOT NULL,
                 investor_id TEXT,
                 status TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_sha256 TEXT,
+                previous_event_sha256 TEXT,
+                event_sha256 TEXT,
                 event_json TEXT NOT NULL,
                 PRIMARY KEY (run_id,event_index),
                 FOREIGN KEY (run_id) REFERENCES social_lab_runs(run_id)
@@ -662,7 +985,41 @@ class SocialTradingOlap:
             GROUP BY event_type,status;
             """
         )
+        self._ensure_column(
+            "social_lab_runs", "final_event_sha256", "TEXT"
+        )
+        self._ensure_column(
+            "social_lab_events", "idempotency_key", "TEXT"
+        )
+        self._ensure_column(
+            "social_lab_events", "input_sha256", "TEXT"
+        )
+        self._ensure_column(
+            "social_lab_events", "previous_event_sha256", "TEXT"
+        )
+        self._ensure_column(
+            "social_lab_events", "event_sha256", "TEXT"
+        )
+        self.connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            social_lab_events_run_idempotency_uq
+            ON social_lab_events(run_id,idempotency_key)
+            """
+        )
         self.connection.commit()
+
+    def _ensure_column(self, table: str, column: str, declaration: str) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.connection.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+        }
+        if column not in columns:
+            self.connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            )
 
     def record(
         self,
@@ -674,6 +1031,7 @@ class SocialTradingOlap:
         ended_at: str,
         events: Sequence[Mapping[str, Any]],
         final_snapshot: Mapping[str, Any],
+        final_event_sha256: str,
     ) -> None:
         with self.connection:
             self.connection.execute(
@@ -681,8 +1039,8 @@ class SocialTradingOlap:
                 INSERT INTO social_lab_runs
                 (run_id,schema_version,engine_version,scenario_id,
                  scenario_sha256,registry_sha256,started_at,ended_at,status,
-                 orders_submitted,final_snapshot_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 orders_submitted,final_snapshot_json,final_event_sha256)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     run_id,
@@ -696,26 +1054,64 @@ class SocialTradingOlap:
                     "complete",
                     0,
                     _canonical_json(final_snapshot),
+                    final_event_sha256,
                 ),
             )
             self.connection.executemany(
                 """
                 INSERT INTO social_lab_events
-                (run_id,event_index,event_type,investor_id,status,event_json)
-                VALUES (?,?,?,?,?,?)
+                (run_id,event_index,event_type,investor_id,status,
+                 idempotency_key,input_sha256,previous_event_sha256,
+                 event_sha256,event_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
                         run_id,
-                        index,
+                        int(event["event_index"]),
                         str(event.get("event_type") or event.get("type")),
                         event.get("investor_id"),
                         str(event.get("status") or "complete"),
+                        str(event["idempotency_key"]),
+                        str(event["input_sha256"]),
+                        str(event["previous_event_sha256"]),
+                        str(event["event_sha256"]),
                         _canonical_json(event),
                     )
-                    for index, event in enumerate(events)
+                    for event in events
                 ],
             )
+
+    def verify_event_chain(self, run_id: str) -> bool:
+        rows = self.connection.execute(
+            """
+            SELECT event_index,event_sha256,event_json
+            FROM social_lab_events
+            WHERE run_id=?
+            ORDER BY event_index
+            """,
+            (run_id,),
+        ).fetchall()
+        if not rows:
+            return False
+        previous = "0" * 64
+        for expected_index, row in enumerate(rows):
+            if int(row["event_index"]) != expected_index:
+                return False
+            event = json.loads(row["event_json"])
+            stored_hash = str(event.pop("event_sha256", ""))
+            if stored_hash != str(row["event_sha256"] or ""):
+                return False
+            if event.get("previous_event_sha256") != previous:
+                return False
+            if _sha256(event) != stored_hash:
+                return False
+            previous = stored_hash
+        final = self.connection.execute(
+            "SELECT final_event_sha256 FROM social_lab_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        return bool(final and final["final_event_sha256"] == previous)
 
     def report(self) -> dict[str, Any]:
         latest = self.connection.execute(
@@ -742,6 +1138,8 @@ class SocialTradingOlap:
                 "ended_at": latest["ended_at"],
                 "status": latest["status"],
                 "orders_submitted": latest["orders_submitted"],
+                "final_event_sha256": latest["final_event_sha256"],
+                "event_chain_valid": self.verify_event_chain(latest["run_id"]),
                 "final_snapshot": json.loads(latest["final_snapshot_json"]),
             },
             "event_aggregate": aggregate,
@@ -755,9 +1153,16 @@ def run_scenario(
 ) -> dict[str, Any]:
     run_id = f"social-{uuid.uuid4().hex[:16]}"
     started_at = _utc_now()
-    ledger = UnitizedPammLedger()
+    ledger = UnitizedPammLedger(
+        currency=scenario.currency,
+        money_quantum=scenario.money_quantum,
+        performance_fee_rate=scenario.performance_fee_rate,
+        crystallize_on_withdrawal=scenario.crystallize_on_withdrawal,
+    )
     results: list[dict[str, Any]] = []
-    for raw_event in scenario.events:
+    previous_event_sha256 = "0" * 64
+    for event_index, raw_event in enumerate(scenario.events):
+        state_before = ledger.snapshot()
         event_type = str(raw_event["type"])
         investor_id = str(raw_event.get("investor_id") or "")
         if event_type in {"subscribe", "deposit"}:
@@ -773,7 +1178,7 @@ def run_scenario(
             result = ledger.apply_strategy_return(raw_event["rate"])
         elif event_type == "performance_fee":
             result = ledger.crystallize_performance_fee(
-                investor_id, raw_event["rate"]
+                investor_id, raw_event.get("rate")
             )
         elif event_type == "management_fee":
             result = ledger.charge_management_fee(
@@ -793,6 +1198,13 @@ def run_scenario(
                     ),
                 }
             )
+            if (
+                str(allocation_payload.get("investor_currency") or "").upper()
+                != scenario.currency.upper()
+            ):
+                raise SocialTradingLabError(
+                    "copy allocation investor_currency must match scenario currency"
+                )
             result = CopyAllocationContract.from_dict(
                 allocation_payload
             ).allocate(
@@ -805,7 +1217,19 @@ def run_scenario(
             )
             result["event_type"] = "copy_allocation"
             result["investor_id"] = investor_id or None
-        results.append(result)
+        event = {
+            **result,
+            "event_index": event_index,
+            "idempotency_key": str(raw_event["idempotency_key"]),
+            "input_sha256": _sha256(raw_event),
+            "previous_event_sha256": previous_event_sha256,
+            "state_before": state_before,
+            "state_after": ledger.snapshot(),
+        }
+        event_sha256 = _sha256(event)
+        event["event_sha256"] = event_sha256
+        previous_event_sha256 = event_sha256
+        results.append(event)
     ended_at = _utc_now()
     snapshot = ledger.snapshot()
     store.record(
@@ -816,6 +1240,7 @@ def run_scenario(
         ended_at=ended_at,
         events=results,
         final_snapshot=snapshot,
+        final_event_sha256=previous_event_sha256,
     )
     return {
         "schema": OLAP_SCHEMA,
@@ -825,6 +1250,8 @@ def run_scenario(
         "orders_submitted": 0,
         "events": results,
         "final_snapshot": snapshot,
+        "final_event_sha256": previous_event_sha256,
+        "event_chain_valid": store.verify_event_chain(run_id),
         "registry_sha256": registry.fingerprint(),
         "scenario_sha256": scenario.fingerprint(),
     }

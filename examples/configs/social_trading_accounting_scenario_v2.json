@@ -1,59 +1,75 @@
 {
-  "schema": "lts.social_trading_scenario.v1",
-  "scenario_id": "baseline-copy-pamm-accounting-v1",
+  "schema": "lts.social_trading_scenario.v2",
+  "scenario_id": "baseline-copy-pamm-accounting-v2",
   "mode": "accounting_simulation_no_orders",
   "database_path": "~/.local/state/lts/social-trading-lab.sqlite",
   "registry_path": "social_trading_platform_registry_v1.json",
   "orders": {
     "enabled": false
   },
+  "accounting": {
+    "currency": "USD",
+    "money_quantum": "0.01",
+    "performance_fee_rate": "0.20",
+    "crystallize_on_withdrawal": true
+  },
   "events": [
     {
+      "idempotency_key": "manager-capital-subscribe",
       "type": "subscribe",
       "investor_id": "synthetic-manager-capital",
       "role": "manager",
       "amount": "5000"
     },
     {
+      "idempotency_key": "investor-a-subscribe",
       "type": "subscribe",
       "investor_id": "synthetic-investor-a",
       "amount": "10000"
     },
     {
+      "idempotency_key": "investor-b-subscribe",
       "type": "subscribe",
       "investor_id": "synthetic-investor-b",
       "amount": "25000"
     },
     {
+      "idempotency_key": "strategy-return-positive",
       "type": "strategy_return",
       "rate": "0.08"
     },
     {
+      "idempotency_key": "investor-a-partial-withdrawal",
       "type": "withdraw",
       "investor_id": "synthetic-investor-a",
       "amount": "1000"
     },
     {
+      "idempotency_key": "investor-a-performance-fee",
       "type": "performance_fee",
       "investor_id": "synthetic-investor-a",
       "rate": "0.20"
     },
     {
+      "idempotency_key": "investor-b-performance-fee",
       "type": "performance_fee",
       "investor_id": "synthetic-investor-b",
       "rate": "0.20"
     },
     {
+      "idempotency_key": "investor-a-management-fee",
       "type": "management_fee",
       "investor_id": "synthetic-investor-a",
       "annual_rate": "0.02",
       "elapsed_days": "30"
     },
     {
+      "idempotency_key": "strategy-return-negative",
       "type": "strategy_return",
       "rate": "-0.03"
     },
     {
+      "idempotency_key": "ctrader-api-eurusd-allocation",
       "type": "copy_allocation",
       "platform_id": "ctrader_open_api_demo",
       "investor_id": "synthetic-investor-a",
@@ -62,13 +78,27 @@
       "investor_equity": "25000",
       "require_protected_entry": true,
       "contract": {
+        "instrument_id": "EURUSD",
+        "quote_currency": "USD",
+        "investor_currency": "USD",
+        "provider_equity_currency": "USD",
         "minimum_volume": "0.01",
         "maximum_volume": "100",
         "volume_step": "0.01",
-        "below_minimum_policy": "round_up_minimum"
+        "below_minimum_policy": "round_up_minimum",
+        "max_overshoot_ratio": "0.25",
+        "contract_size": "100000",
+        "reference_price": "1.15",
+        "quote_to_investor_fx_rate": "1",
+        "provider_equity_to_investor_fx_rate": "1",
+        "provider_leverage": "100",
+        "investor_leverage": "100",
+        "investor_free_margin": "25000",
+        "margin_buffer_ratio": "0.20"
       }
     },
     {
+      "idempotency_key": "ctrader-native-eurusd-allocation",
       "type": "copy_allocation",
       "platform_id": "ctrader_copy_demo_investor",
       "investor_id": "synthetic-investor-b",
@@ -77,10 +107,23 @@
       "investor_equity": "25000",
       "require_protected_entry": true,
       "contract": {
+        "instrument_id": "EURUSD",
+        "quote_currency": "USD",
+        "investor_currency": "USD",
+        "provider_equity_currency": "USD",
         "minimum_volume": "0.01",
         "maximum_volume": "100",
         "volume_step": "0.01",
-        "below_minimum_policy": "round_up_minimum"
+        "below_minimum_policy": "round_up_minimum",
+        "max_overshoot_ratio": "0.25",
+        "contract_size": "100000",
+        "reference_price": "1.15",
+        "quote_to_investor_fx_rate": "1",
+        "provider_equity_to_investor_fx_rate": "1",
+        "provider_leverage": "100",
+        "investor_leverage": "100",
+        "investor_free_margin": "25000",
+        "margin_buffer_ratio": "0.20"
       }
     }
   ]
