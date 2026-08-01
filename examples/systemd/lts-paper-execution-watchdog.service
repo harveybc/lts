@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=%h/Documents/GitHub/lts
+EnvironmentFile=-%h/.config/lts/paper-execution-watchdog.env
 ExecStart=%h/anaconda3/envs/trading-stack/bin/python %h/Documents/GitHub/lts/tools/paper_execution_watchdog.py
 NoNewPrivileges=true
 PrivateTmp=true

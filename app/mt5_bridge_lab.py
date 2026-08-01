@@ -25,6 +25,7 @@ BRIDGE_VERSION = "lts.mt5.bridge.readonly.v1"
 HEARTBEAT_SCHEMA = "lts.mt5.heartbeat.v1"
 SNAPSHOT_SCHEMA = "lts.mt5.snapshot.v1"
 EVENT_SCHEMA = "lts.mt5.trade_event.v1"
+STATUS_SCHEMA = "lts.mt5.operational_status.v1"
 
 
 def _utc_now() -> str:
@@ -566,6 +567,43 @@ class Mt5BridgeStore:
             "counts": counts,
         }
 
+    def operational_status(self, stale_seconds: int = 180) -> dict[str, Any]:
+        """Return fleet-safe freshness evidence without account or capital data."""
+        report = self.report(stale_seconds)
+        snapshot = report.get("latest_snapshot") or {}
+        public_snapshot = (
+            {
+                "received_at": snapshot.get("received_at"),
+                "positions_total": int(snapshot.get("positions_total") or 0),
+                "orders_total": int(snapshot.get("orders_total") or 0),
+                "symbols_total": int(snapshot.get("symbols_total") or 0),
+            }
+            if snapshot
+            else None
+        )
+        status: dict[str, Any] = {
+            "schema": STATUS_SCHEMA,
+            "available": bool(report.get("available")),
+            "reason": report.get("reason"),
+            "bridge_version": BRIDGE_VERSION,
+            "read_only": True,
+            "heartbeat": None,
+            "latest_snapshot": public_snapshot,
+            "counts": dict(report.get("counts") or {}),
+        }
+        if report.get("available"):
+            status["heartbeat"] = {
+                "environment": report.get("environment"),
+                "connected": bool(report.get("connected")),
+                "trade_allowed": bool(report.get("trade_allowed")),
+                "terminal_build": report.get("terminal_build"),
+                "terminal_ping_ms": report.get("terminal_ping_ms"),
+                "received_at": report.get("last_heartbeat_at"),
+                "age_seconds": report.get("heartbeat_age_seconds"),
+                "stale": bool(report.get("stale")),
+            }
+        return status
+
     def close(self) -> None:
         self.connection.close()
 
@@ -701,6 +739,10 @@ def create_mt5_bridge_app(
             "environment": config.environment,
             "read_only": config.read_only,
         }
+
+    @app.get("/v1/status")
+    def operational_status() -> dict[str, Any]:
+        return store.operational_status(config.stale_heartbeat_seconds)
 
     @app.post("/v1/heartbeat")
     async def heartbeat(payload: HeartbeatPayload, request: Request) -> dict[str, Any]:

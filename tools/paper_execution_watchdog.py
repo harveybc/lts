@@ -42,6 +42,7 @@ DEFAULT_STATE = Path.home() / ".local/state/lts/paper-execution-watchdog/state.j
 DEFAULT_LATEST = Path.home() / ".local/state/lts/paper-execution-watchdog/latest.json"
 DEFAULT_DISCUSSION = Path.home() / ".local/state/lts/hermes/live-trading-discussion.json"
 DEFAULT_MONITOR_DB = Path.home() / ".local/state/lts/paper-execution-monitor.sqlite"
+MT5_STATUS_SCHEMA = "lts.mt5.operational_status.v1"
 
 
 def _utc_now() -> str:
@@ -431,7 +432,41 @@ def read_oanda_snapshot(
         connection.close()
 
 
-def read_mt5_snapshot(path: Path) -> dict[str, Any]:
+def read_mt5_remote_status(url: str, timeout: float = 5.0) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return {"available": False, "reason": "remote_status_url_invalid"}
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        urllib.error.URLError,
+        ConnectionError,
+        TimeoutError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+    ) as exc:
+        return {
+            "available": False,
+            "reason": "remote_status_unavailable",
+            "error_kind": type(exc).__name__,
+        }
+    if not isinstance(payload, dict) or payload.get("schema") != MT5_STATUS_SCHEMA:
+        return {"available": False, "reason": "remote_status_schema_invalid"}
+    return payload
+
+
+def read_mt5_snapshot(
+    path: Path,
+    status_url: str = "",
+) -> dict[str, Any]:
+    if status_url.strip():
+        return read_mt5_remote_status(status_url.strip())
     if not path.exists():
         return {"available": False, "reason": "database_missing"}
     connection = sqlite3.connect(path)
@@ -1184,6 +1219,11 @@ def main() -> int:
     parser.add_argument("--oanda-db", type=Path, default=DEFAULT_OANDA_DB)
     parser.add_argument("--oanda-env", type=Path, default=DEFAULT_OANDA_ENV)
     parser.add_argument("--mt5-db", type=Path, default=DEFAULT_MT5_DB)
+    parser.add_argument(
+        "--mt5-status-url",
+        default=os.environ.get("LTS_MT5_STATUS_URL", ""),
+        help="Optional fleet-reachable MT5 operational status endpoint.",
+    )
     parser.add_argument("--shadow-db", type=Path, default=DEFAULT_SHADOW_DB)
     parser.add_argument("--capital-db", type=Path, default=DEFAULT_CAPITAL_DB)
     parser.add_argument("--capital-env", type=Path, default=DEFAULT_CAPITAL_ENV)
@@ -1216,7 +1256,7 @@ def main() -> int:
         state = _read_json(args.state_file)
         if state.get("schema") != STATE_SCHEMA:
             state = {"schema": STATE_SCHEMA, "events": {}}
-        mt5 = read_mt5_snapshot(args.mt5_db)
+        mt5 = read_mt5_snapshot(args.mt5_db, args.mt5_status_url)
         if args.mt5_only:
             alpaca: dict[str, Any] = {}
             ibkr: dict[str, Any] = {}

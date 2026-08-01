@@ -103,6 +103,18 @@ def test_heartbeat_requires_valid_signature_and_rejects_replay(
         assert first.json()["read_only"] is True
         assert replay.status_code == 401
         assert "already used" in replay.json()["detail"]
+
+        status = client.get("/v1/status")
+        assert status.status_code == 200
+        value = status.json()
+        assert value["schema"] == "lts.mt5.operational_status.v1"
+        assert value["available"] is True
+        assert value["heartbeat"]["connected"] is True
+        serialized = json.dumps(value)
+        assert "account_fingerprint" not in serialized
+        assert "server_fingerprint" not in serialized
+        assert "0123456789abcdef" not in serialized
+        assert "fedcba9876543210" not in serialized
     finally:
         store.close()
 

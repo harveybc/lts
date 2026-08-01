@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from tools.paper_execution_watchdog import (
     evaluate,
     process_events,
     read_ibkr_snapshot,
+    read_mt5_remote_status,
     read_mt5_snapshot,
 )
 
@@ -175,6 +177,40 @@ def test_read_mt5_snapshot_handles_missing_schema(tmp_path: Path) -> None:
 
     assert snapshot["available"] is False
     assert snapshot["reason"] == "schema_unavailable"
+
+
+def test_read_mt5_remote_status_accepts_fleet_safe_contract(monkeypatch) -> None:
+    payload = {
+        "schema": "lts.mt5.operational_status.v1",
+        "available": True,
+        "reason": None,
+        "heartbeat": {
+            "connected": True,
+            "received_at": "2026-08-01T12:00:00+00:00",
+        },
+        "latest_snapshot": {
+            "positions_total": 0,
+            "orders_total": 0,
+            "symbols_total": 6,
+        },
+    }
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(
+        "tools.paper_execution_watchdog.urllib.request.urlopen",
+        lambda request, timeout: Response(),
+    )
+
+    assert read_mt5_remote_status("http://dragon:8766/v1/status") == payload
 
 
 def test_read_ibkr_snapshot_requires_completed_authenticated_session(

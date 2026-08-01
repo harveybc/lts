@@ -106,8 +106,9 @@ Omega currently runs four five-minute user timers:
 - `lts-paper-execution-watchdog.timer` checks freshness, endpoint failures,
   missing quotes, unexpected exposure and venue availability. IBKR health
   requires a recent completed authenticated session plus reconciliation facts;
-  a reachable TCP port alone is only diagnostic evidence. Its MT5 input will
-  be pointed at Dragon's bridge facts after the first heartbeat.
+  a reachable TCP port alone is only diagnostic evidence. Its MT5 input uses
+  Dragon's fleet-safe `/v1/status` evidence rather than expecting a local copy
+  of Dragon's SQLite database.
 
 Dragon runs `lts-mt5-bridge.service` plus an independent five-minute
 `lts-mt5-bridge-watchdog.timer`. The bridge listens on TCP `8766`, with host
@@ -116,7 +117,11 @@ watchdog reports missing/stale heartbeats, broker disconnection and unexpected
 exposure through the existing Hermes Telegram channel even if Omega is
 offline. The shared secret lives at `~/.config/lts/mt5-bridge.env` with mode
 `600`; that value is entered locally into the EA and is never committed or
-pasted.
+pasted. The unauthenticated `/v1/status` route is network-allowlisted and
+exposes only bridge version, connection/freshness state, terminal diagnostics,
+observation counts and aggregate position/order/symbol counts. It excludes
+account/server fingerprints, balances, equity, margin, symbols, tickets and
+the HMAC secret.
 
 The watchdog writes restart-safe state under `~/.local/state/lts`, records
 event transitions in SQLite and sends deduplicated Telegram alerts through the
@@ -269,6 +274,7 @@ After pulling the matching LTS commit on Dragon:
 ./examples/scripts/configure_mt5_bridge.sh
 sudo ./examples/scripts/enable_mt5_bridge_host_firewall.sh
 curl http://192.168.122.1:8766/health
+curl http://192.168.122.1:8766/v1/status
 ```
 
 Inside MT5:
