@@ -243,6 +243,7 @@ class SocialPlatformRegistry:
 @dataclass
 class InvestorAccount:
     investor_id: str
+    role: str = "investor"
     units: Decimal = Decimal("0")
     high_water_mark: Decimal = Decimal("0")
     cumulative_deposits: Decimal = Decimal("0")
@@ -265,27 +266,52 @@ class UnitizedPammLedger:
         return sum((item.units for item in self.investors.values()), Decimal("0"))
 
     @property
-    def investor_equity(self) -> Decimal:
+    def pool_equity(self) -> Decimal:
         return self.total_units * self.unit_nav
 
-    def _account(self, investor_id: str) -> InvestorAccount:
+    @property
+    def investor_equity(self) -> Decimal:
+        return sum(
+            (
+                account.units * self.unit_nav
+                for account in self.investors.values()
+                if account.role == "investor"
+            ),
+            Decimal("0"),
+        )
+
+    def _account(
+        self, investor_id: str, *, role: Optional[str] = None
+    ) -> InvestorAccount:
         if not investor_id:
             raise SocialTradingLabError("investor_id is required")
-        return self.investors.setdefault(investor_id, InvestorAccount(investor_id))
+        if role is not None and role not in {"investor", "manager"}:
+            raise SocialTradingLabError("account role must be investor or manager")
+        account = self.investors.get(investor_id)
+        if account is None:
+            account = InvestorAccount(investor_id, role or "investor")
+            self.investors[investor_id] = account
+        elif role is not None and role != account.role:
+            raise SocialTradingLabError("account role cannot change after creation")
+        return account
 
     def equity(self, investor_id: str) -> Decimal:
         account = self._account(investor_id)
         return account.units * self.unit_nav
 
-    def deposit(self, investor_id: str, amount: Any) -> dict[str, Any]:
+    def deposit(
+        self, investor_id: str, amount: Any, *, role: str = "investor"
+    ) -> dict[str, Any]:
         value = _positive(amount, "deposit amount")
-        account = self._account(investor_id)
+        account = self._account(investor_id, role=role)
         units = value / self.unit_nav
         account.units += units
         account.high_water_mark += value
         account.cumulative_deposits += value
         self.sequence += 1
-        return self._event("deposit", investor_id, value, units=units)
+        return self._event(
+            "deposit", investor_id, value, units=units, account_role=role
+        )
 
     def withdraw(self, investor_id: str, amount: Any) -> dict[str, Any]:
         value = _positive(amount, "withdraw amount")
@@ -324,6 +350,10 @@ class UnitizedPammLedger:
         if fee_rate > 1:
             raise SocialTradingLabError("performance fee rate cannot exceed 1")
         account = self._account(investor_id)
+        if account.role == "manager":
+            raise SocialTradingLabError(
+                "manager capital cannot be charged a performance fee"
+            )
         gross_equity = account.units * self.unit_nav
         eligible_profit = max(gross_equity - account.high_water_mark, Decimal("0"))
         fee = eligible_profit * fee_rate
@@ -352,6 +382,10 @@ class UnitizedPammLedger:
         if fee_rate > 1:
             raise SocialTradingLabError("annual management fee rate cannot exceed 1")
         account = self._account(investor_id)
+        if account.role == "manager":
+            raise SocialTradingLabError(
+                "manager capital cannot be charged a management fee"
+            )
         gross_equity = account.units * self.unit_nav
         fee = gross_equity * fee_rate * days / Decimal("365")
         if fee >= gross_equity and gross_equity:
@@ -374,7 +408,7 @@ class UnitizedPammLedger:
         event_type: str,
         investor_id: str,
         amount: Decimal,
-        **extra: Decimal,
+        **extra: Any,
     ) -> dict[str, Any]:
         result = {
             "event_type": event_type,
@@ -384,18 +418,35 @@ class UnitizedPammLedger:
             "unit_nav": _decimal_text(self.unit_nav),
             "investor_equity": _decimal_text(self.equity(investor_id)),
         }
-        result.update({key: _decimal_text(value) for key, value in extra.items()})
+        result.update(
+            {
+                key: _decimal_text(value) if isinstance(value, Decimal) else value
+                for key, value in extra.items()
+            }
+        )
         return result
 
     def snapshot(self) -> dict[str, Any]:
         return {
             "unit_nav": _decimal_text(self.unit_nav),
             "total_units": _decimal_text(self.total_units),
+            "pool_equity": _decimal_text(self.pool_equity),
             "investor_equity": _decimal_text(self.investor_equity),
+            "manager_capital_equity": _decimal_text(
+                sum(
+                    (
+                        account.units * self.unit_nav
+                        for account in self.investors.values()
+                        if account.role == "manager"
+                    ),
+                    Decimal("0"),
+                )
+            ),
             "manager_fee_balance": _decimal_text(self.manager_fee_balance),
             "sequence": self.sequence,
             "investors": {
                 investor_id: {
+                    "role": account.role,
                     "units": _decimal_text(account.units),
                     "equity": _decimal_text(account.units * self.unit_nav),
                     "high_water_mark": _decimal_text(account.high_water_mark),
@@ -710,7 +761,11 @@ def run_scenario(
         event_type = str(raw_event["type"])
         investor_id = str(raw_event.get("investor_id") or "")
         if event_type in {"subscribe", "deposit"}:
-            result = ledger.deposit(investor_id, raw_event["amount"])
+            result = ledger.deposit(
+                investor_id,
+                raw_event["amount"],
+                role=str(raw_event.get("role") or "investor"),
+            )
             result["event_type"] = event_type
         elif event_type == "withdraw":
             result = ledger.withdraw(investor_id, raw_event["amount"])

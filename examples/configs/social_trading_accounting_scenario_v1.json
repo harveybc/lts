@@ -10,6 +10,12 @@
   "events": [
     {
       "type": "subscribe",
+      "investor_id": "synthetic-manager-capital",
+      "role": "manager",
+      "amount": "5000"
+    },
+    {
+      "type": "subscribe",
       "investor_id": "synthetic-investor-a",
       "amount": "10000"
     },

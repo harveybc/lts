@@ -36,6 +36,19 @@ def test_unitized_flows_preserve_nav_and_adjust_high_water_mark():
     assert ledger.investors["a"].high_water_mark == Decimal("1422")
 
 
+def test_manager_capital_shares_pool_return_but_cannot_pay_itself_fee():
+    ledger = UnitizedPammLedger()
+    ledger.deposit("manager", "5000", role="manager")
+    ledger.deposit("investor", "10000")
+    ledger.apply_strategy_return("0.10")
+
+    snapshot = ledger.snapshot()
+    assert snapshot["manager_capital_equity"] == "5500"
+    assert snapshot["investors"]["manager"]["role"] == "manager"
+    with pytest.raises(SocialTradingLabError, match="manager capital"):
+        ledger.crystallize_performance_fee("manager", "0.20")
+
+
 def test_performance_fee_is_only_charged_above_net_high_water_mark():
     ledger = UnitizedPammLedger()
     ledger.deposit("a", "1000")
