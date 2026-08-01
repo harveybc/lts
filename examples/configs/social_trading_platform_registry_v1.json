@@ -146,7 +146,7 @@
       "display_name": "eToro Virtual Portfolio CopyTrader",
       "disposition": "manual_user_experience_control",
       "modes": ["copy"],
-      "account_environment": "free_virtual_portfolio_opened_inventory_pending",
+      "account_environment": "virtual_portfolio_asset_and_copy_ui_owner_verified",
       "automation": "manual_only",
       "instrument_classes": ["availability_depends_on_customer_entity"],
       "protection": {

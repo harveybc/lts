@@ -93,8 +93,10 @@ chain. External account creation and terms acceptance remain owner actions.
   cross-broker cTrader Web (`EUR 1,000`, leverage `1:100`). This account is
   sufficient for Open API preflight. Copy catalogue visibility and account
   type confirmation remain pending; no broker onboarding is required now.
-- eToro: account and Virtual Portfolio opened. Asset inventory and copy-control
-  walkthrough remain pending; no real deposit or automated adapter is needed.
+- eToro: account and Virtual Portfolio opened. The owner verified the target
+  asset searches, Buy/Sell controls and CopyTrader UI. No real deposit,
+  credentials or automated adapter is needed; structured observation is now
+  an implementation task rather than an owner onboarding task.
 - Darwinex Zero: on hold. Registration requires selecting a paid product and
   charging the first recurring subscription.
 - OANDA MT5: demo and read-only bridge are operational. MQL5 Signals is
