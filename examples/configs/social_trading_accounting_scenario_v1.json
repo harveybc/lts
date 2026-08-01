@@ -1,0 +1,81 @@
+{
+  "schema": "lts.social_trading_scenario.v1",
+  "scenario_id": "baseline-copy-pamm-accounting-v1",
+  "mode": "accounting_simulation_no_orders",
+  "database_path": "~/.local/state/lts/social-trading-lab.sqlite",
+  "registry_path": "social_trading_platform_registry_v1.json",
+  "orders": {
+    "enabled": false
+  },
+  "events": [
+    {
+      "type": "subscribe",
+      "investor_id": "synthetic-investor-a",
+      "amount": "10000"
+    },
+    {
+      "type": "subscribe",
+      "investor_id": "synthetic-investor-b",
+      "amount": "25000"
+    },
+    {
+      "type": "strategy_return",
+      "rate": "0.08"
+    },
+    {
+      "type": "withdraw",
+      "investor_id": "synthetic-investor-a",
+      "amount": "1000"
+    },
+    {
+      "type": "performance_fee",
+      "investor_id": "synthetic-investor-a",
+      "rate": "0.20"
+    },
+    {
+      "type": "performance_fee",
+      "investor_id": "synthetic-investor-b",
+      "rate": "0.20"
+    },
+    {
+      "type": "management_fee",
+      "investor_id": "synthetic-investor-a",
+      "annual_rate": "0.02",
+      "elapsed_days": "30"
+    },
+    {
+      "type": "strategy_return",
+      "rate": "-0.03"
+    },
+    {
+      "type": "copy_allocation",
+      "platform_id": "mql5_signals_oanda_demo",
+      "investor_id": "synthetic-investor-a",
+      "provider_volume": "2",
+      "provider_equity": "100000",
+      "investor_equity": "25000",
+      "require_protected_entry": true,
+      "contract": {
+        "minimum_volume": "0.01",
+        "maximum_volume": "100",
+        "volume_step": "0.01",
+        "below_minimum_policy": "round_up_minimum"
+      }
+    },
+    {
+      "type": "copy_allocation",
+      "platform_id": "ctrader_copy_demo_investor",
+      "investor_id": "synthetic-investor-b",
+      "provider_volume": "2",
+      "provider_equity": "100000",
+      "investor_equity": "25000",
+      "require_protected_entry": true,
+      "contract": {
+        "minimum_volume": "0.01",
+        "maximum_volume": "100",
+        "volume_step": "0.01",
+        "below_minimum_policy": "round_up_minimum"
+      }
+    }
+  ]
+}

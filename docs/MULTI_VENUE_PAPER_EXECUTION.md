@@ -1,6 +1,7 @@
 # Multi-Venue Paper Execution
 
-Status: Alpaca, IBKR, shadow and OANDA MT5 read-only observation active; Capital.com Demo adapter ready
+Status: Alpaca, IBKR, shadow and OANDA MT5 read-only observation active;
+Capital.com Demo adapter ready; social-trading accounting lab implemented
 Date: 2026-08-01
 
 ## Account State
@@ -321,4 +322,11 @@ The complete architecture, OLAP contract and social-trading boundary are in:
 
 ```text
 agent-multi/docs/work_plan/22_MULTI_VENUE_PAPER_EXECUTION_AND_SOCIAL_TRADING.md
+```
+
+The executable copy/PAMM/MAM accounting contract, platform decision matrix,
+protection gates and business-reality feedback loop are in:
+
+```text
+docs/SOCIAL_TRADING_REALITY_LAB.md
 ```

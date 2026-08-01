@@ -12,7 +12,8 @@ setup(
             'lts-ibkr-paper=app.ibkr_paper_cli:main',
             'lts-multi-venue-shadow=app.multi_venue_shadow_cli:main',
             'lts-capital-demo=app.capital_demo_cli:main',
-            'lts-mt5-bridge=app.mt5_bridge_cli:main'
+            'lts-mt5-bridge=app.mt5_bridge_cli:main',
+            'lts-social-trading-lab=app.social_trading_cli:main'
         ],
         # AAA plugins - Authentication, Authorization, Accounting
         'plugins_aaa': [

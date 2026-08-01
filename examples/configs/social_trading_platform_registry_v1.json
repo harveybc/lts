@@ -1,0 +1,194 @@
+{
+  "schema": "lts.social_platform_registry.v1",
+  "as_of": "2026-08-01",
+  "research_order": [
+    "mql5_signals_oanda_demo",
+    "ctrader_open_api_demo",
+    "ctrader_copy_demo_investor",
+    "darwinex_zero_provider",
+    "etoro_virtual_copy",
+    "hfm_pamm_live"
+  ],
+  "platforms": [
+    {
+      "platform_id": "mql5_signals_oanda_demo",
+      "display_name": "MQL5 Signals on OANDA MT5 demo",
+      "disposition": "immediate_protected_signal_lab",
+      "modes": ["signal", "copy"],
+      "account_environment": "demo_terminal_ready",
+      "automation": "platform_managed",
+      "instrument_classes": ["fx", "crypto_cfd", "index_cfd", "commodity_cfd"],
+      "protection": {
+        "native_sltp_replication": true,
+        "local_protection_overlay_possible": false
+      },
+      "provider_requirements": {
+        "requires_live_capital": false,
+        "paid_provider_requires_seller_verification": true
+      },
+      "evidence_urls": [
+        "https://www.mql5.com/en/signals/rules",
+        "https://www.mql5.com/en/signals/terms/provider"
+      ],
+      "limitations": [
+        "One subscriber account can follow only one signal.",
+        "The terminal must remain connected for copying.",
+        "Paid providers require seller verification and MQL5 retains an operational fee."
+      ]
+    },
+    {
+      "platform_id": "ctrader_open_api_demo",
+      "display_name": "cTrader Open API demo",
+      "disposition": "next_automated_execution_and_custom_copy_lab",
+      "modes": ["copy", "mam"],
+      "account_environment": "demo_supported_account_not_opened",
+      "automation": "official_python_api",
+      "instrument_classes": ["broker_dependent_fx_cfd_crypto"],
+      "protection": {
+        "native_sltp_replication": false,
+        "local_protection_overlay_possible": true
+      },
+      "provider_requirements": {
+        "requires_live_capital": false,
+        "application_registration_required": true
+      },
+      "evidence_urls": [
+        "https://help.ctrader.com/open-api/",
+        "https://help.ctrader.com/open-api/connection/",
+        "https://help.ctrader.com/open-api/proxies-endpoints/"
+      ],
+      "limitations": [
+        "Instrument availability and contract semantics depend on the selected cTrader broker.",
+        "LTS must create account-local SL and TP when operating as a custom copier."
+      ]
+    },
+    {
+      "platform_id": "ctrader_copy_demo_investor",
+      "display_name": "cTrader Copy demo investor",
+      "disposition": "immediate_manual_business_observation",
+      "modes": ["copy"],
+      "account_environment": "demo_investor_supported",
+      "automation": "platform_managed",
+      "instrument_classes": ["broker_dependent_fx_cfd_crypto"],
+      "protection": {
+        "native_sltp_replication": false,
+        "local_protection_overlay_possible": false
+      },
+      "provider_requirements": {
+        "requires_live_capital": false,
+        "free_strategy_required_for_demo_investor": true
+      },
+      "evidence_urls": [
+        "https://help.ctrader.com/ctrader-copy/faq/",
+        "https://help.ctrader.com/ctrader-copy/investing-in-strategies/"
+      ],
+      "limitations": [
+        "Native cTrader Copy does not copy provider SL or TP protections, only the provider close signal.",
+        "Stocks and shares are not copied.",
+        "Demo investors can copy only eligible free strategies."
+      ]
+    },
+    {
+      "platform_id": "ctrader_copy_live_provider",
+      "display_name": "cTrader Copy live strategy provider",
+      "disposition": "blocked_until_live_capital_decision",
+      "modes": ["copy"],
+      "account_environment": "live_provider_required",
+      "automation": "platform_managed",
+      "instrument_classes": ["broker_dependent_fx_cfd_crypto"],
+      "protection": {
+        "native_sltp_replication": false,
+        "local_protection_overlay_possible": false
+      },
+      "provider_requirements": {
+        "requires_live_capital": true
+      },
+      "evidence_urls": [
+        "https://help.ctrader.com/ctrader-copy/faq/"
+      ],
+      "limitations": [
+        "A demo account cannot provide a strategy.",
+        "Native copied accounts do not receive provider SL or TP levels."
+      ]
+    },
+    {
+      "platform_id": "darwinex_zero_provider",
+      "display_name": "Darwinex Zero virtual provider",
+      "disposition": "next_provider_business_lab",
+      "modes": ["provider_index", "signal"],
+      "account_environment": "paid_virtual_provider_track",
+      "automation": "mt4_mt5_or_tradingview",
+      "instrument_classes": ["fx", "cfd", "futures", "stocks", "etfs", "crypto_cfd"],
+      "protection": {
+        "native_sltp_replication": false,
+        "local_protection_overlay_possible": true
+      },
+      "provider_requirements": {
+        "requires_live_capital": false,
+        "membership_required": true
+      },
+      "evidence_urls": [
+        "https://www.darwinexzero.com/docs/what-is-darwinex-zero",
+        "https://www.darwinexzero.com/assets",
+        "https://www.darwinexzero.com/pricing"
+      ],
+      "limitations": [
+        "This is a paid virtual provider program, not a broker demo.",
+        "Investor replication is mediated through the DARWIN risk/index layer.",
+        "Country eligibility and platform terms must be confirmed during onboarding."
+      ]
+    },
+    {
+      "platform_id": "etoro_virtual_copy",
+      "display_name": "eToro Virtual Portfolio CopyTrader",
+      "disposition": "manual_user_experience_control",
+      "modes": ["copy"],
+      "account_environment": "free_virtual_portfolio",
+      "automation": "manual_only",
+      "instrument_classes": ["availability_depends_on_customer_entity"],
+      "protection": {
+        "native_sltp_replication": false,
+        "local_protection_overlay_possible": false
+      },
+      "provider_requirements": {
+        "requires_live_capital": false
+      },
+      "evidence_urls": [
+        "https://www.etoro.com/en-us/copytrader/",
+        "https://www.etoro.com/en-us/copytrader/how-it-works/"
+      ],
+      "limitations": [
+        "Use as a manual product and allocation control, not an LTS execution adapter.",
+        "Minimum copy and instrument availability depend on entity and current terms.",
+        "Copy relationship loss thresholds are not equivalent to per-order SL and TP."
+      ]
+    },
+    {
+      "platform_id": "hfm_pamm_live",
+      "display_name": "HFM PAMM live manager/investor",
+      "disposition": "deferred_real_capital_pamm_lab",
+      "modes": ["pamm"],
+      "account_environment": "live_capital_required",
+      "automation": "platform_managed",
+      "instrument_classes": ["fx_and_related_markets"],
+      "protection": {
+        "native_sltp_replication": false,
+        "local_protection_overlay_possible": false
+      },
+      "provider_requirements": {
+        "requires_live_capital": true,
+        "manager_capital_required": true,
+        "terms_and_lpoa_required": true
+      },
+      "evidence_urls": [
+        "https://pamm.hfm.com/int/en/pamm-accounts/program",
+        "https://pamm.hfm.com/int/en/fund-managers/fund-managers-faqs"
+      ],
+      "limitations": [
+        "Manager capital and investor funds are live and proportionally share profit and loss.",
+        "Rollover and withdrawal policy can force partial position closure or consume free margin.",
+        "Country eligibility and the exact account agreement require legal and operational review."
+      ]
+    }
+  ]
+}
