@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.social_trading_cli import main as social_trading_main
 from app.social_trading_lab import (
     CopyAllocationContract,
     SocialPlatformRegistry,
@@ -376,6 +377,90 @@ def test_scenario_is_no_order_and_persists_olap(tmp_path):
         assert store.verify_event_chain(result["run_id"]) is False
     finally:
         store.close()
+
+
+def test_run_scenario_cli_database_override_is_authoritative(
+    tmp_path, capsys
+):
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "schema": "lts.social_platform_registry.v1",
+                "research_order": ["safe"],
+                "platforms": [
+                    {
+                        "platform_id": "safe",
+                        "display_name": "Safe",
+                        "disposition": "now",
+                        "modes": ["copy"],
+                        "account_environment": "demo",
+                        "automation": "api",
+                        "instrument_classes": ["fx"],
+                        "protection": {
+                            "native_sltp_replication": True,
+                            "local_protection_overlay_possible": False,
+                        },
+                        "provider_requirements": {
+                            "requires_live_capital": False
+                        },
+                        "evidence_urls": ["https://example.com/safe"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    default_database = tmp_path / "default.sqlite"
+    override_database = tmp_path / "override.sqlite"
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps(
+            {
+                "schema": "lts.social_trading_scenario.v2",
+                "scenario_id": "cli-override",
+                "mode": "accounting_simulation_no_orders",
+                "database_path": str(default_database),
+                "registry_path": registry_path.name,
+                "orders": {"enabled": False},
+                "accounting": {
+                    "currency": "USD",
+                    "money_quantum": "0.01",
+                    "performance_fee_rate": "0.20",
+                    "crystallize_on_withdrawal": True,
+                },
+                "events": [
+                    {
+                        "idempotency_key": "deposit-a",
+                        "type": "subscribe",
+                        "investor_id": "a",
+                        "amount": "1000",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert social_trading_main(
+        [
+            "run-scenario",
+            "--scenario",
+            str(scenario_path),
+            "--database",
+            str(override_database),
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    assert not default_database.exists()
+    with sqlite3.connect(override_database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM social_lab_runs"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM social_lab_events"
+        ).fetchone()[0] == 1
 
 
 def test_scenario_rejects_order_enablement(tmp_path):

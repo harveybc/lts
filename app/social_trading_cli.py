@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -40,6 +41,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.scenario is None:
                 raise SocialTradingLabError("--scenario is required")
             scenario = SocialTradingScenario.load(args.scenario)
+            if args.database is not None:
+                scenario = replace(
+                    scenario,
+                    database_path=args.database.expanduser(),
+                )
             registry = SocialPlatformRegistry.load(scenario.registry_path)
             store = SocialTradingOlap(scenario.database_path)
             result = run_scenario(scenario, registry, store)
