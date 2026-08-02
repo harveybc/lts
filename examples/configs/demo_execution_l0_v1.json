@@ -1,0 +1,65 @@
+{
+  "schema": "lts.demo_execution_runner.config.v1",
+  "comment": "L0 continuous zero-network demo-execution runner. Mechanics only; no broker write path exists in the process. Capability evidence is a labeled synthetic fixture (ruling R3) and is mechanically excluded from readiness claims.",
+  "service": {
+    "venue": "ibkr_paper",
+    "account_fingerprint": "synthetic-ibkr-l0-omega",
+    "environment": "paper",
+    "database_path": "/home/harveybc/.local/state/lts/demo-execution-l0.sqlite",
+    "risk_fraction_at_stop": 0.005,
+    "max_overshoot_ratio": 0.25,
+    "gross_notional_fraction_max": 0.10,
+    "margin_fraction_max": 0.10,
+    "daily_loss_budget_fraction": 0.02,
+    "max_concurrent_positions": 3,
+    "signal_max_age_seconds": 3900.0,
+    "synthetic_equity": 100000.0,
+    "owner_issuer_allowlist": ["harvey-owner-telegram"],
+    "command_phrases": {
+      "hold": "HOLD ALL DEMO TRADING NOW",
+      "kill": "KILL ALL DEMO TRADING NOW",
+      "flatten_all": "FLATTEN ALL DEMO POSITIONS NOW",
+      "cancel_pending": "CANCEL ALL PENDING DEMO ENTRIES NOW"
+    }
+  },
+  "policy": {
+    "cell_id": "crypto:ETH/USD@1h:mech:policy",
+    "asset_id": "crypto:ETH/USD",
+    "target_exposure_magnitude": 0.5,
+    "stop_fraction": 0.01,
+    "take_profit_fraction": 0.02,
+    "validity_hours": 1.0,
+    "policy_version": "0.1.0"
+  },
+  "quote_source": {
+    "database_path": "/home/harveybc/.local/state/lts/alpaca-paper-lab.sqlite",
+    "symbol": "ETH/USD",
+    "instrument": "ETH.USD",
+    "max_age_seconds": 900.0
+  },
+  "capability_fixture": {
+    "venue": "ibkr_paper",
+    "account_fingerprint": "synthetic-ibkr-l0-omega",
+    "environment": "paper",
+    "capability_evidence": "synthetic_fixture",
+    "source_artifact_hash": "sha256:1f2e3d4c5b6a79880102030405060708090a0b0c0d0e0f101112131415161718",
+    "source_observed_at": "2026-08-02T00:00:00+00:00",
+    "instruments": [
+      {
+        "instrument": "ETH.USD",
+        "tradeable": true,
+        "shortable": true,
+        "min_units": 0.001,
+        "unit_step": 0.001,
+        "price_decimals": 2,
+        "margin_rate": 0.3,
+        "native_stop_loss": true,
+        "native_take_profit": true,
+        "native_bracket": true
+      }
+    ]
+  },
+  "bar_seconds": 3600,
+  "loop_seconds": 60,
+  "heartbeat_path": "/home/harveybc/.local/state/lts/demo-execution-l0/heartbeat.json"
+}

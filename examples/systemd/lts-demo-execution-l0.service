@@ -1,0 +1,21 @@
+# L0 continuous zero-network demo-execution runner (doc 29 §7, finding 048).
+# User service; intentionally NOT enabled at boot (house rule doc 09 §7).
+# Install:  cp examples/systemd/lts-demo-execution-l0.service ~/.config/systemd/user/
+#           systemctl --user daemon-reload
+# Start:    systemctl --user start lts-demo-execution-l0.service
+# Stop:     systemctl --user stop lts-demo-execution-l0.service
+[Unit]
+Description=LTS L0 demo-execution runner (zero-network, mechanics only)
+
+[Service]
+Type=simple
+WorkingDirectory=/home/harveybc/Documents/GitHub/lts
+ExecStart=/home/harveybc/anaconda3/envs/trading-stack/bin/python -m app.demo_execution_runner --config /home/harveybc/Documents/GitHub/lts/examples/configs/demo_execution_l0_v1.json
+Restart=on-failure
+RestartSec=10
+MemoryHigh=512M
+MemoryMax=1G
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
