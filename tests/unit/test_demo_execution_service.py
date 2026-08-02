@@ -56,6 +56,8 @@ def _config(tmp_path, **overrides):
         "command_phrases": {
             "hold": "HOLD ALL DEMO TRADING NOW",
             "kill": "KILL ALL DEMO TRADING NOW",
+            "flatten_all": "FLATTEN ALL DEMO POSITIONS NOW",
+            "cancel_pending": "CANCEL ALL PENDING DEMO ENTRIES NOW",
         },
     }
     base.update(overrides)
@@ -75,8 +77,11 @@ def _capability(min_units=1.0, shortable=True, native=True):
         producer={"name": "test", "version": "0"},
         trace_id="t-1",
         venue="ibkr_paper",
-        account_fingerprint="fp-demo",
+        account_fingerprint="synthetic-ibkr-fixture-1",
         environment="paper",
+        capability_evidence="synthetic_fixture",
+        source_artifact_hash="sha256:" + "f" * 64,
+        source_observed_at=NOW,
         instruments=[
             InstrumentCapability(
                 instrument="USD.CAD",
@@ -294,7 +299,7 @@ def _report(service, result, state, previous, **kw):
         object_id=f"er-{state}", as_of=NOW + timedelta(seconds=5),
         producer={"name": "sink", "version": "0"}, trace_id="t-1",
         order_intent_id=result["order_intent_id"],
-        attempt_id=f"attempt-{result['reservation_id'].split('rsv-')[-1]}",
+        attempt_id=f"attempt-{result['reservation_id']}",
         bracket_role="parent", state=state, previous_state=previous,
         requested_units=result["delta_units"],
     )
@@ -439,6 +444,365 @@ def test_hold_state_survives_restart(tmp_path):
 def test_config_rejects_risk_enabling_command_verbs(tmp_path):
     with pytest.raises(DemoExecutionError, match="non-risk-reducing"):
         _config(tmp_path, command_phrases={"resume": "RESUME"})
+
+
+# ── Finding 043: protection anchored to the decision reference price ──
+
+def test_long_stop_above_reference_rejects(tmp_path):
+    service = _service(tmp_path)
+    out = _process(service, _intent(object_id="ai-043a", stop=1.01, tp=1.02))
+    assert out["outcome"] == "rejected"
+    assert "protection_not_anchored" in out["reason"]
+
+
+def test_short_stop_below_reference_rejects(tmp_path):
+    service = _service(tmp_path)
+    out = _process(service, _intent(object_id="ai-043b", exposure=-0.5,
+                                    stop=0.99, tp=0.97))
+    assert out["outcome"] == "rejected"
+    assert "protection_not_anchored" in out["reason"]
+
+
+def test_reference_price_and_quote_time_are_persisted(tmp_path):
+    service = _service(tmp_path)
+    result = _process(service, _intent(object_id="ai-043c"))
+    assert result["outcome"] == "would_be_order"
+    row = service.olap._con.execute(
+        "SELECT reference_price, quote_time, capability_evidence FROM decisions "
+        "WHERE outcome='would_be_order'"
+    ).fetchone()
+    assert row[0] == 1.0 and row[1] is not None
+    assert row[2] == "synthetic_fixture"
+
+
+# ── Finding 044: filled exposure stays in every risk total until close ──
+
+def test_filled_exposure_still_counts_against_position_cap(tmp_path):
+    service = _service(tmp_path, max_concurrent_positions=1,
+                       daily_loss_budget_fraction=0.05)
+    result = _process(service, _intent(object_id="ai-044"))
+    filled = _report(
+        service, result, "filled", "requested",
+        filled_units=abs(result["delta_units"]),
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=abs(result["delta_units"])),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=abs(result["delta_units"])),
+        ],
+    )
+    outcome = service.apply_execution_event(filled)
+    assert outcome["exposure"] == "opened"
+    day = NOW.date().isoformat()
+    assert service.olap.active_totals(day)["positions"] == 1.0  # not vanished
+    second = _process(service, _intent(object_id="ai-044b"))
+    assert second["reason"] == "max_concurrent_positions"
+    service.apply_position_close(result["order_intent_id"])
+    third = _process(service, _intent(object_id="ai-044c"))
+    assert third["outcome"] == "would_be_order"
+
+
+def test_partial_fill_splits_exposure_and_scaled_reservation(tmp_path):
+    service = _service(tmp_path)
+    result = _process(service, _intent(object_id="ai-044p"))
+    magnitude = abs(result["delta_units"])
+    partial = _report(
+        service, result, "partially_filled", "requested",
+        filled_units=magnitude * 0.4,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=magnitude * 0.4),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=magnitude * 0.4),
+        ],
+    )
+    outcome = service.apply_execution_event(partial)
+    assert outcome["exposure"] == "opened_partial"
+    assert outcome["reservation"] == "scaled"
+    day = NOW.date().isoformat()
+    totals = service.olap.active_totals(day)
+    # exposure(0.4) + scaled reservation(0.6) == original risk; no double count
+    original = service.olap._con.execute(
+        "SELECT gross_fraction FROM exposures"
+    ).fetchone()[0] / 0.4
+    assert abs(totals["gross"] - original) < 1e-9
+
+
+# ── Finding 045: concurrent instances cannot double-spend a cap ──
+
+def test_concurrent_instances_serialize_on_the_budget(tmp_path):
+    import threading
+    db = str(tmp_path / "race.sqlite")
+    DemoExecutionOlap(db).close()  # create schema once
+    barrier = threading.Barrier(2)
+    outcomes = {}
+
+    def worker(name, oid):
+        config = _config(tmp_path, database_path=db,
+                         risk_fraction_at_stop=0.01,
+                         daily_loss_budget_fraction=0.01,
+                         gross_notional_fraction_max=0.5,
+                         margin_fraction_max=0.5)
+        service = DemoExecutionService(config, DemoExecutionOlap(db),
+                                       ZeroNetworkSink())
+        barrier.wait()
+        outcomes[name] = _process(
+            service, _intent(object_id=oid, stop=0.9, tp=1.2))
+        service.olap.close()
+
+    threads = [
+        threading.Thread(target=worker, args=("a", "ai-race-a")),
+        threading.Thread(target=worker, args=("b", "ai-race-b")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    results = sorted(o["outcome"] for o in outcomes.values())
+    assert results == ["rejected", "would_be_order"], outcomes
+    check = DemoExecutionOlap(db)
+    day = NOW.date().isoformat()
+    totals = check.active_totals(day)
+    assert totals["positions"] == 1.0
+    assert totals["day_risk"] <= 0.01 + 1e-9
+    check.close()
+
+
+# ── Finding 046: no failure after reservation can leak capacity ──
+
+def test_failure_inside_atomic_unit_leaks_nothing_and_persists_rejection(
+        tmp_path, monkeypatch):
+    service = _service(tmp_path)
+
+    def explode(intent):
+        raise RuntimeError("serialization boundary failure")
+
+    monkeypatch.setattr(service.sink, "serialize", explode)
+    out = _process(service, _intent(object_id="ai-046"))
+    assert out["outcome"] == "rejected"
+    assert "atomic_unit_failed" in out["reason"]
+    day = NOW.date().isoformat()
+    assert service.olap.active_totals(day)["positions"] == 0.0
+    replay = _process(service, _intent(object_id="ai-046"))
+    assert replay["replayed"] is True and replay["outcome"] == "rejected"
+
+
+# ── Finding 047: commands emit deterministic zero-network intents ──
+
+def _open_position(service, oid):
+    result = _process(service, _intent(object_id=oid))
+    units = abs(result["delta_units"])
+    filled = _report(
+        service, result, "filled", "requested", filled_units=units,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=units),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=units),
+        ],
+    )
+    service.apply_execution_event(filled)
+    return result
+
+
+def test_flatten_all_emits_would_be_flatten_intents(tmp_path):
+    service = _service(tmp_path, daily_loss_budget_fraction=0.05)
+    opened = _open_position(service, "ai-047f")
+    out = service.apply_owner_command(
+        _command(command="flatten_all", nonce="n-flat",
+                 exact_phrase="FLATTEN ALL DEMO POSITIONS NOW"),
+        now=NOW,
+    )
+    assert out["accepted"]
+    kinds = [e["kind"] for e in out["emitted"]]
+    assert kinds == ["flatten"]
+    assert out["emitted"][0]["units"] == -abs(opened["delta_units"])
+    row = service.olap._con.execute(
+        "SELECT COUNT(*) FROM decisions WHERE outcome='would_be_flatten'"
+    ).fetchone()
+    assert row[0] == 1
+
+
+def test_cancel_pending_emits_would_be_cancels(tmp_path):
+    service = _service(tmp_path)
+    _process(service, _intent(object_id="ai-047c"))  # pending entry
+    out = service.apply_owner_command(
+        _command(command="cancel_pending", nonce="n-cxl",
+                 exact_phrase="CANCEL ALL PENDING DEMO ENTRIES NOW"),
+        now=NOW,
+    )
+    assert out["accepted"]
+    assert [e["kind"] for e in out["emitted"]] == ["cancel"]
+
+
+def test_kill_halts_and_emits_flatten_plus_cancel(tmp_path):
+    service = _service(tmp_path, daily_loss_budget_fraction=0.05,
+                       max_concurrent_positions=3,
+                       gross_notional_fraction_max=0.5)
+    result = _process(service, _intent(object_id="ai-047k1", stop=0.9, tp=1.2))
+    units = abs(result["delta_units"])
+    service.apply_execution_event(_report(
+        service, result, "filled", "requested", filled_units=units,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=units),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=units),
+        ],
+    ))
+    pending = _process(service, _intent(object_id="ai-047k2", stop=0.9, tp=1.2))
+    assert pending["outcome"] == "would_be_order", pending  # pending entry
+    out = service.apply_owner_command(
+        _command(command="kill", nonce="n-kill",
+                 exact_phrase="KILL ALL DEMO TRADING NOW"),
+        now=NOW,
+    )
+    assert out["accepted"] and out["state"] == "kill"
+    kinds = sorted(e["kind"] for e in out["emitted"])
+    assert kinds == ["cancel", "flatten"]
+
+
+def test_uncovered_fill_emits_emergency_flatten_not_just_flag(tmp_path):
+    service = _service(tmp_path)
+    result = _process(service, _intent(object_id="ai-047e"))
+    units = abs(result["delta_units"])
+    uncovered = _report(
+        service, result, "filled", "requested", filled_units=units,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=units),
+            ProtectionLegState(leg="take_profit", broker_confirmed=False,
+                               covered_units=0.0),
+        ],
+    )
+    outcome = service.apply_execution_event(uncovered)
+    assert outcome["emergency"] == "unprotected_exposure_hold_and_flatten"
+    assert [e["kind"] for e in outcome["emitted"]] == ["flatten"]
+
+
+# ── Ruling R4: six deterministic lifecycle traces ──
+
+def test_trace_fill_before_ack(tmp_path):
+    service = _service(tmp_path)
+    result = _process(service, _intent(object_id="tr-1"))
+    units = abs(result["delta_units"])
+    outcome = service.apply_execution_event(_report(
+        service, result, "filled", "requested", filled_units=units,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=units),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=units),
+        ],
+    ))
+    assert outcome["exposure"] == "opened"
+
+
+def test_trace_partial_then_cancel(tmp_path):
+    service = _service(tmp_path)
+    result = _process(service, _intent(object_id="tr-2"))
+    units = abs(result["delta_units"])
+    service.apply_execution_event(_report(service, result, "accepted",
+                                          "requested"))
+    service.apply_execution_event(_report(
+        service, result, "partially_filled", "accepted",
+        filled_units=units * 0.3,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=units * 0.3),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=units * 0.3),
+        ],
+    ))
+    service.apply_execution_event(_report(service, result, "cancel_pending",
+                                          "partially_filled",
+                                          filled_units=units * 0.3,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=units * 0.3),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=units * 0.3),
+        ]))
+    final = service.apply_execution_event(_report(
+        service, result, "cancelled", "cancel_pending",
+        filled_units=0.0))
+    assert final["reservation"] == "released"  # remaining entry freed
+    day = NOW.date().isoformat()
+    assert service.olap.active_totals(day)["positions"] == 1.0  # partial stays
+
+
+def test_trace_cancel_fill_race_fill_wins(tmp_path):
+    service = _service(tmp_path)
+    result = _process(service, _intent(object_id="tr-3"))
+    units = abs(result["delta_units"])
+    service.apply_execution_event(_report(service, result, "accepted",
+                                          "requested"))
+    service.apply_execution_event(_report(service, result, "cancel_pending",
+                                          "accepted"))
+    final = service.apply_execution_event(_report(
+        service, result, "filled", "cancel_pending", filled_units=units,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=units),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=units),
+        ],
+    ))
+    assert final["exposure"] == "opened"
+
+
+def test_trace_expiry_while_cancel_pending(tmp_path):
+    service = _service(tmp_path)
+    result = _process(service, _intent(object_id="tr-4"))
+    service.apply_execution_event(_report(service, result, "accepted",
+                                          "requested"))
+    service.apply_execution_event(_report(service, result, "cancel_pending",
+                                          "accepted"))
+    final = service.apply_execution_event(_report(
+        service, result, "expired", "cancel_pending"))
+    assert final["reservation"] == "released"
+
+
+def test_trace_unknown_then_reconciled_unblocks_new_risk(tmp_path):
+    service = _service(tmp_path, daily_loss_budget_fraction=0.05)
+    result = _process(service, _intent(object_id="tr-5"))
+    service.apply_execution_event(_report(
+        service, result, "unknown_requires_reconciliation", "requested",
+        reconciliation_required=True))
+    blocked = _process(service, _intent(object_id="tr-5b"))
+    assert blocked["reason"] == "reconciliation_required_before_new_risk"
+    reconciled = service.apply_execution_event(_report(
+        service, result, "cancelled", "unknown_requires_reconciliation"))
+    assert reconciled["reservation"] == "released"
+    after = _process(service, _intent(object_id="tr-5c"))
+    assert after["outcome"] == "would_be_order"
+
+
+def test_trace_bracket_child_execution(tmp_path):
+    service = _service(tmp_path)
+    result = _process(service, _intent(object_id="tr-6"))
+    units = abs(result["delta_units"])
+    service.apply_execution_event(_report(
+        service, result, "filled", "requested", filled_units=units,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=units),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=units),
+        ],
+    ))
+    child = ExecutionReportV2(
+        object_id="er-child-1", as_of=NOW + timedelta(seconds=9),
+        producer={"name": "sink", "version": "0"}, trace_id="t-1",
+        order_intent_id=f"{result['order_intent_id']}-sl",
+        attempt_id="attempt-child-sl",
+        bracket_role="stop_loss",
+        parent_order_intent_id=result["order_intent_id"],
+        state="requested", requested_units=-units,
+    )
+    outcome = service.apply_execution_event(child)
+    assert outcome["state"] == "requested"
+    assert outcome["chain_hash"]
 
 
 # ── the structural zero-submission proof ──
