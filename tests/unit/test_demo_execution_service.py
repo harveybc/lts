@@ -43,7 +43,8 @@ def _no_network(monkeypatch):
 def _config(tmp_path, **overrides):
     base = {
         "venue": "ibkr_paper",
-        "account_fingerprint": "fp-demo",
+        "account_fingerprint": "synthetic-ibkr-fixture-1",
+        "environment": "paper",
         "database_path": str(tmp_path / "demo_exec.sqlite"),
         "risk_fraction_at_stop": 0.005,
         "max_overshoot_ratio": 0.25,
@@ -68,6 +69,13 @@ def _service(tmp_path, **overrides):
     config = _config(tmp_path, **overrides)
     olap = DemoExecutionOlap(config.database_path)
     return DemoExecutionService(config, olap, ZeroNetworkSink())
+
+
+_CAP_IBKR = dict(
+    instrument="USD.CAD", tradeable=True, shortable=True, min_units=1.0,
+    unit_step=1.0, price_decimals=5, margin_rate=0.03,
+    native_stop_loss=True, native_take_profit=True, native_bracket=True,
+)
 
 
 def _capability(min_units=1.0, shortable=True, native=True):
@@ -678,6 +686,218 @@ def test_uncovered_fill_emits_emergency_flatten_not_just_flag(tmp_path):
     outcome = service.apply_execution_event(uncovered)
     assert outcome["emergency"] == "unprotected_exposure_hold_and_flatten"
     assert [e["kind"] for e in outcome["emitted"]] == ["flatten"]
+
+
+# ── Finding 049: partial fills conserve risk; one logical position ──
+
+def test_partial_fill_conserves_day_risk_and_position_cardinality(tmp_path):
+    """Musashi's exact reproduction: after a 40% partial of a 1% risk
+    reservation, day_risk must remain 1% and a second 0.4% order must be
+    rejected by the 1% daily cap."""
+    service = _service(tmp_path, risk_fraction_at_stop=0.01,
+                       daily_loss_budget_fraction=0.01,
+                       gross_notional_fraction_max=0.5,
+                       margin_fraction_max=0.5)
+    result = _process(service, _intent(object_id="ai-049", stop=0.9, tp=1.2))
+    magnitude = abs(result["delta_units"])
+    partial = _report(
+        service, result, "partially_filled", "requested",
+        filled_units=magnitude * 0.4,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=magnitude * 0.4),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=magnitude * 0.4),
+        ],
+    )
+    service.apply_execution_event(partial)
+    day = NOW.date().isoformat()
+    totals = service.olap.active_totals(day)
+    assert abs(totals["day_risk"] - 0.01) < 1e-9      # conserved, not 0.006
+    assert totals["positions"] == 1.0                 # one logical position
+    assert abs(totals["risk_active"] - 0.01) < 1e-9
+    second = _process(service, _intent(object_id="ai-049b", stop=0.9, tp=1.2))
+    assert second["outcome"] == "rejected"
+    assert second["reason"] == "daily_loss_budget_exhausted"
+
+
+def test_cancel_after_partial_keeps_filled_share_in_day_risk(tmp_path):
+    service = _service(tmp_path, risk_fraction_at_stop=0.01,
+                       gross_notional_fraction_max=0.5,
+                       margin_fraction_max=0.5,
+                       daily_loss_budget_fraction=0.02)
+    result = _process(service, _intent(object_id="ai-049c", stop=0.9, tp=1.2))
+    magnitude = abs(result["delta_units"])
+    kwargs = dict(
+        filled_units=magnitude * 0.4,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=magnitude * 0.4),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=magnitude * 0.4),
+        ],
+    )
+    service.apply_execution_event(
+        _report(service, result, "partially_filled", "requested", **kwargs))
+    service.apply_execution_event(
+        _report(service, result, "cancel_pending", "partially_filled", **kwargs))
+    service.apply_execution_event(
+        _report(service, result, "cancelled", "cancel_pending",
+                filled_units=0.0))
+    day = NOW.date().isoformat()
+    totals = service.olap.active_totals(day)
+    # released remainder leaves day_risk; the filled 0.4% share survives
+    assert abs(totals["day_risk"] - 0.004) < 1e-9
+    assert totals["positions"] == 1.0
+
+
+# ── Finding 050: signed, provenance-faithful exposure ──
+
+def test_short_fill_persists_signed_units_and_flatten_buys_back(tmp_path):
+    service = _service(tmp_path)
+    result = _process(service, _intent(object_id="ai-050s", exposure=-0.5,
+                                       stop=1.02, tp=0.98))
+    units = abs(result["delta_units"])
+    assert result["delta_units"] < 0
+    service.apply_execution_event(_report(
+        service, result, "filled", "requested", filled_units=units,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=units),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=units),
+        ],
+    ))
+    exposure = service.olap.open_exposures()[0]
+    assert exposure["units_open"] == -units            # signed short
+    assert exposure["instrument"] == "USD.CAD"
+    assert exposure["capability_evidence"] == "synthetic_fixture"
+    out = service.apply_owner_command(
+        _command(command="flatten_all", nonce="n-050",
+                 exact_phrase="FLATTEN ALL DEMO POSITIONS NOW"), now=NOW)
+    flatten = out["emitted"][0]
+    assert flatten["units"] == +units                  # BUY closes the short
+    assert flatten["target"] == result["order_intent_id"]
+
+
+def test_non_fx_fill_keeps_its_own_instrument(tmp_path):
+    service = _service(tmp_path)
+    capability = BrokerCapabilitySnapshot(
+        object_id="cap-eth", as_of=NOW,
+        producer={"name": "test", "version": "0"}, trace_id="t-1",
+        venue="ibkr_paper", account_fingerprint="synthetic-ibkr-fixture-1",
+        environment="paper", capability_evidence="synthetic_fixture",
+        source_artifact_hash="sha256:" + "e" * 64, source_observed_at=NOW,
+        instruments=[InstrumentCapability(
+            instrument="ETH.USD", tradeable=True, shortable=True,
+            min_units=0.001, unit_step=0.001, price_decimals=2,
+            margin_rate=0.3, native_stop_loss=True, native_take_profit=True,
+            native_bracket=True,
+        )],
+    )
+    intent = AssetIntent(
+        object_id="ai-050e", as_of=NOW, valid_until=NOW + timedelta(hours=4),
+        producer={"name": "provider.mechanics", "version": "0"},
+        trace_id="t-1", cell_id="crypto:ETH/USD@4h:mech:policy",
+        asset_id="crypto:ETH/USD", action="target", target_exposure=0.5,
+        risk_geometry={"mode": "fixed_price", "stop_price": 2000.0,
+                       "take_profit_price": 2400.0},
+        artifact_hash=ARTIFACT,
+    )
+    result = service.process_intent(
+        intent, capability, equity=100_000.0, reference_price=2200.0,
+        instrument="ETH.USD", now=NOW + timedelta(seconds=1))
+    assert result["outcome"] == "would_be_order", result
+    units = abs(result["delta_units"])
+    service.apply_execution_event(ExecutionReportV2(
+        object_id="er-eth", as_of=NOW + timedelta(seconds=5),
+        producer={"name": "sink", "version": "0"}, trace_id="t-1",
+        order_intent_id=result["order_intent_id"],
+        attempt_id=f"attempt-{result['reservation_id']}",
+        bracket_role="parent", state="filled", previous_state="requested",
+        requested_units=result["delta_units"], filled_units=units,
+        protection_legs=[
+            ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                               covered_units=units),
+            ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                               covered_units=units),
+        ],
+    ))
+    exposure = service.olap.open_exposures()[0]
+    assert exposure["instrument"] == "ETH.USD"
+    assert exposure["asset_id"] == "crypto:ETH/USD"
+
+
+# ── Finding 051: cancel names its exact target ──
+
+def test_cancel_carries_source_order_identity(tmp_path):
+    import json as jsonlib
+    service = _service(tmp_path)
+    result = _process(service, _intent(object_id="ai-051"))
+    out = service.apply_owner_command(
+        _command(command="cancel_pending", nonce="n-051",
+                 exact_phrase="CANCEL ALL PENDING DEMO ENTRIES NOW"), now=NOW)
+    assert out["emitted"][0]["target"] == result["order_intent_id"]
+    row = service.olap._con.execute(
+        "SELECT intent_json FROM decisions WHERE outcome='would_be_cancel'"
+    ).fetchone()
+    cancel = jsonlib.loads(row[0])
+    assert cancel["reduce_target_order_intent_id"] == result["order_intent_id"]
+    assert cancel["instrument"] == "USD.CAD"           # not 'pending-entry'
+
+
+def test_repeated_flatten_and_cancel_are_idempotent(tmp_path):
+    service = _service(tmp_path, daily_loss_budget_fraction=0.05)
+    _open_position(service, "ai-051i")
+    first = service.apply_owner_command(
+        _command(command="flatten_all", nonce="n-051a",
+                 exact_phrase="FLATTEN ALL DEMO POSITIONS NOW"), now=NOW)
+    second = service.apply_owner_command(
+        _command(command="flatten_all", nonce="n-051b",
+                 exact_phrase="FLATTEN ALL DEMO POSITIONS NOW"), now=NOW)
+    assert first["emitted"][0].get("replayed") is None
+    assert second["emitted"][0]["replayed"] is True
+    count = service.olap._con.execute(
+        "SELECT COUNT(*) FROM decisions WHERE outcome='would_be_flatten'"
+    ).fetchone()[0]
+    assert count == 1                                   # no duplicate emission
+
+
+# ── Finding 052: capability snapshot binds to venue/account/environment ──
+
+def test_cross_venue_capability_substitution_rejects(tmp_path):
+    service = _service(tmp_path)
+    alien = BrokerCapabilitySnapshot(
+        object_id="cap-alien", as_of=NOW,
+        producer={"name": "test", "version": "0"}, trace_id="t-1",
+        venue="alpaca_paper", account_fingerprint="synthetic-alpaca-9",
+        environment="paper", capability_evidence="synthetic_fixture",
+        source_artifact_hash="sha256:" + "a" * 64, source_observed_at=NOW,
+        instruments=[InstrumentCapability(**_CAP_IBKR)],
+    )
+    out = service.process_intent(
+        _intent(object_id="ai-052"), alien,
+        equity=100_000.0, reference_price=1.0, instrument="USD.CAD",
+        now=NOW + timedelta(seconds=1))
+    assert out["outcome"] == "rejected"
+    assert "capability_snapshot_mismatch" in out["reason"]
+
+
+def test_wrong_environment_capability_rejects(tmp_path):
+    service = _service(tmp_path)
+    wrong_env = BrokerCapabilitySnapshot(
+        object_id="cap-live", as_of=NOW,
+        producer={"name": "test", "version": "0"}, trace_id="t-1",
+        venue="ibkr_paper", account_fingerprint="synthetic-ibkr-fixture-1",
+        environment="live", capability_evidence="live_observed",
+        source_artifact_hash="sha256:" + "b" * 64, source_observed_at=NOW,
+        instruments=[InstrumentCapability(**_CAP_IBKR)],
+    )
+    out = service.process_intent(
+        _intent(object_id="ai-052e"), wrong_env,
+        equity=100_000.0, reference_price=1.0, instrument="USD.CAD",
+        now=NOW + timedelta(seconds=1))
+    assert "capability_snapshot_mismatch" in out["reason"]
 
 
 # ── Ruling R4: six deterministic lifecycle traces ──

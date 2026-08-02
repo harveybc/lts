@@ -68,6 +68,7 @@ class DemoExecutionConfig:
 
     venue: str
     account_fingerprint: str
+    environment: str
     database_path: str
     risk_fraction_at_stop: float
     max_overshoot_ratio: float
@@ -82,7 +83,7 @@ class DemoExecutionConfig:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "DemoExecutionConfig":
         required = [
-            "venue", "account_fingerprint", "database_path",
+            "venue", "account_fingerprint", "environment", "database_path",
             "risk_fraction_at_stop", "max_overshoot_ratio",
             "gross_notional_fraction_max", "margin_fraction_max",
             "daily_loss_budget_fraction", "max_concurrent_positions",
@@ -111,9 +112,14 @@ class DemoExecutionConfig:
             raise DemoExecutionError(
                 f"command_phrases has non-risk-reducing verbs: {sorted(unknown)}"
             )
+        if str(value["environment"]) not in ("paper", "demo"):
+            raise DemoExecutionError(
+                "environment must be paper or demo; live is not an L0 concept"
+            )
         return cls(
             venue=str(value["venue"]),
             account_fingerprint=str(value["account_fingerprint"]),
+            environment=str(value["environment"]),
             database_path=str(value["database_path"]),
             risk_fraction_at_stop=float(value["risk_fraction_at_stop"]),
             max_overshoot_ratio=float(value["max_overshoot_ratio"]),
@@ -188,16 +194,24 @@ CREATE TABLE IF NOT EXISTS reservations (
     risk_fraction REAL NOT NULL,
     gross_fraction REAL NOT NULL,
     margin_fraction REAL NOT NULL,
+    original_risk_fraction REAL NOT NULL,
+    original_gross_fraction REAL NOT NULL,
+    original_margin_fraction REAL NOT NULL,
     state TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS exposures (
     exposure_id TEXT PRIMARY KEY,
     order_intent_id TEXT NOT NULL,
+    source_reservation_id TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
     instrument TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    account_fingerprint TEXT NOT NULL,
     units_open REAL NOT NULL,
     risk_fraction REAL NOT NULL,
     gross_fraction REAL NOT NULL,
     margin_fraction REAL NOT NULL,
+    day TEXT NOT NULL,
     capability_evidence TEXT NOT NULL,
     state TEXT NOT NULL,
     opened_at TEXT NOT NULL,
@@ -313,28 +327,54 @@ class DemoExecutionOlap:
         )
         return digest
 
-    # -- reservations + exposures (findings 040, 044) -----------------------
+    # -- reservations + exposures (findings 040, 044, 049) -------------------
     def active_totals(self, day: str) -> dict[str, float]:
-        risk_active, gross_r, margin_r, count_r = self._con.execute(
-            "SELECT COALESCE(SUM(risk_fraction),0), COALESCE(SUM(gross_fraction),0),"
-            " COALESCE(SUM(margin_fraction),0), COUNT(*) FROM reservations "
-            "WHERE state='active'"
-        ).fetchone()
-        risk_e, gross_e, margin_e, count_e = self._con.execute(
-            "SELECT COALESCE(SUM(risk_fraction),0), COALESCE(SUM(gross_fraction),0),"
-            " COALESCE(SUM(margin_fraction),0), COUNT(*) FROM exposures "
-            "WHERE state='open'"
-        ).fetchone()
-        day_risk = self._con.execute(
-            "SELECT COALESCE(SUM(risk_fraction),0) FROM reservations "
-            "WHERE day=? AND state IN ('active','consumed')",
-            (day,),
-        ).fetchone()[0]
+        """Conservation-correct aggregates (finding 049).
+
+        One logical position spans its remaining entry reservation and its
+        open exposure: cardinality is counted by distinct reservation
+        identity. Daily worst-case risk uses the immutable ORIGINAL risk of
+        every non-released reservation, plus the filled share of positions
+        whose remaining entry was released — never the scaled remainder, so
+        cumulative partial fills conserve the original reservation.
+        """
+        reservations = self._con.execute(
+            "SELECT reservation_id, state, day, risk_fraction, gross_fraction,"
+            " margin_fraction, original_risk_fraction FROM reservations"
+        ).fetchall()
+        exposures = self._con.execute(
+            "SELECT source_reservation_id, state, day, risk_fraction,"
+            " gross_fraction, margin_fraction FROM exposures"
+        ).fetchall()
+        risk_active = gross = margin = day_risk = 0.0
+        position_keys: set[str] = set()
+        reservation_state = {row[0]: row[1] for row in reservations}
+        for res_id, state, res_day, risk, gross_f, margin_f, original in (
+            reservations
+        ):
+            if state == "active":
+                risk_active += risk
+                gross += gross_f
+                margin += margin_f
+                position_keys.add(res_id)
+            if res_day == day and state in ("active", "consumed"):
+                day_risk += original
+        for source_id, state, exp_day, risk, gross_f, margin_f in exposures:
+            if state != "open":
+                continue
+            risk_active += risk
+            gross += gross_f
+            margin += margin_f
+            position_keys.add(source_id)
+            if exp_day == day and reservation_state.get(source_id) == "released":
+                # entry cancelled after a partial fill: the filled share is
+                # the only surviving day-risk of this position
+                day_risk += risk
         return {
-            "risk_active": risk_active + risk_e,
-            "gross": gross_r + gross_e,
-            "margin": margin_r + margin_e,
-            "positions": float(count_r + count_e),
+            "risk_active": risk_active,
+            "gross": gross,
+            "margin": margin,
+            "positions": float(len(position_keys)),
             "day_risk": day_risk,
         }
 
@@ -348,7 +388,7 @@ class DemoExecutionOlap:
         margin_fraction: float,
     ) -> None:
         self._con.execute(
-            "INSERT INTO reservations VALUES (?,?,?,?,?,?,?,'active')",
+            "INSERT INTO reservations VALUES (?,?,?,?,?,?,?,?,?,?,'active')",
             (
                 reservation_id,
                 idempotency_key,
@@ -357,8 +397,30 @@ class DemoExecutionOlap:
                 risk_fraction,
                 gross_fraction,
                 margin_fraction,
+                risk_fraction,
+                gross_fraction,
+                margin_fraction,
             ),
         )
+
+    def reservation_idempotency(self, reservation_id: str) -> Optional[str]:
+        row = self._con.execute(
+            "SELECT idempotency_key FROM reservations WHERE reservation_id=?",
+            (reservation_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def decision_intent(self, idempotency_key: str) -> Optional[dict[str, Any]]:
+        row = self._con.execute(
+            "SELECT intent_json, capability_evidence FROM decisions "
+            "WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        intent = json.loads(row[0])
+        intent["_capability_evidence"] = row[1]
+        return intent
 
     def release(self, reservation_id: str, terminal_state: str) -> None:
         if terminal_state not in ("released", "consumed"):
@@ -373,19 +435,27 @@ class DemoExecutionOlap:
                 "idempotent by design"
             )
 
-    def scale_reservation(self, reservation_id: str, remaining_ratio: float) -> None:
+    def set_reservation_remaining(
+        self, reservation_id: str, remaining_ratio: float
+    ) -> None:
+        """Set current fractions ABSOLUTELY from the immutable originals so
+        repeated cumulative partial fills conserve risk (finding 049)."""
         if not (0.0 <= remaining_ratio <= 1.0):
             raise DemoExecutionError("remaining_ratio must be in [0, 1]")
         self._con.execute(
-            "UPDATE reservations SET risk_fraction=risk_fraction*?, "
-            "gross_fraction=gross_fraction*?, margin_fraction=margin_fraction*? "
+            "UPDATE reservations SET "
+            "risk_fraction=original_risk_fraction*?, "
+            "gross_fraction=original_gross_fraction*?, "
+            "margin_fraction=original_margin_fraction*? "
             "WHERE reservation_id=? AND state='active'",
             (remaining_ratio, remaining_ratio, remaining_ratio, reservation_id),
         )
 
     def reservation_row(self, reservation_id: str) -> Optional[dict[str, Any]]:
         row = self._con.execute(
-            "SELECT risk_fraction, gross_fraction, margin_fraction, state "
+            "SELECT risk_fraction, gross_fraction, margin_fraction, state,"
+            " original_risk_fraction, original_gross_fraction,"
+            " original_margin_fraction "
             "FROM reservations WHERE reservation_id=?",
             (reservation_id,),
         ).fetchone()
@@ -394,28 +464,37 @@ class DemoExecutionOlap:
         return {
             "risk_fraction": row[0], "gross_fraction": row[1],
             "margin_fraction": row[2], "state": row[3],
+            "original_risk_fraction": row[4],
+            "original_gross_fraction": row[5],
+            "original_margin_fraction": row[6],
         }
 
     def open_exposure(
         self,
         exposure_id: str,
         order_intent_id: str,
+        source_reservation_id: str,
+        asset_id: str,
         instrument: str,
+        venue: str,
+        account_fingerprint: str,
         units_open: float,
         risk_fraction: float,
         gross_fraction: float,
         margin_fraction: float,
+        day: str,
         capability_evidence: str,
     ) -> None:
         self._con.execute(
-            "INSERT INTO exposures VALUES (?,?,?,?,?,?,?,?,'open',?,NULL) "
+            "INSERT INTO exposures VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,NULL) "
             "ON CONFLICT(exposure_id) DO UPDATE SET "
             "units_open=excluded.units_open, risk_fraction=excluded.risk_fraction,"
             "gross_fraction=excluded.gross_fraction,"
             "margin_fraction=excluded.margin_fraction",
             (
-                exposure_id, order_intent_id, instrument, units_open,
-                risk_fraction, gross_fraction, margin_fraction,
+                exposure_id, order_intent_id, source_reservation_id, asset_id,
+                instrument, venue, account_fingerprint, units_open,
+                risk_fraction, gross_fraction, margin_fraction, day,
                 capability_evidence, _utc_now().isoformat(),
             ),
         )
@@ -431,12 +510,14 @@ class DemoExecutionOlap:
 
     def open_exposures(self) -> list[dict[str, Any]]:
         rows = self._con.execute(
-            "SELECT exposure_id, order_intent_id, instrument, units_open,"
-            " capability_evidence FROM exposures WHERE state='open'"
+            "SELECT exposure_id, order_intent_id, asset_id, instrument, venue,"
+            " account_fingerprint, units_open, capability_evidence "
+            "FROM exposures WHERE state='open'"
         ).fetchall()
         return [
-            {"exposure_id": r[0], "order_intent_id": r[1], "instrument": r[2],
-             "units_open": r[3], "capability_evidence": r[4]}
+            {"exposure_id": r[0], "order_intent_id": r[1], "asset_id": r[2],
+             "instrument": r[3], "venue": r[4], "account_fingerprint": r[5],
+             "units_open": r[6], "capability_evidence": r[7]}
             for r in rows
         ]
 
@@ -635,28 +716,36 @@ class DemoExecutionService:
         return result
 
     def _emit_flatten_all(self, trace_id: str, now: datetime) -> list[dict[str, Any]]:
-        """Finding 047: flatten is an emitted zero-network intent, not a flag."""
+        """Findings 047/050/051: flatten is an emitted zero-network intent
+        that names its target and moves signed exposure exactly to zero.
+        Idempotent: one flatten decision per exposure, replay returns it."""
         emitted = []
         for exposure in self.olap.open_exposures():
+            idem = f"flatten:{exposure['exposure_id']}"
+            if self.olap.recorded_decision(idem) is not None:
+                emitted.append({"kind": "flatten", "replayed": True,
+                                "target": exposure["order_intent_id"]})
+                continue
             intent = OrderIntentV2(
                 object_id=f"oi2-flatten-{exposure['exposure_id']}",
                 as_of=now,
                 producer=self._PRODUCER,
                 trace_id=trace_id,
-                account_ref=self.config.account_fingerprint,
-                asset_id=exposure["instrument"],
-                venue=self.config.venue,
+                account_ref=exposure["account_fingerprint"],
+                asset_id=exposure["asset_id"],
+                venue=exposure["venue"],
                 instrument=exposure["instrument"],
                 intent_class="risk_reducing",
                 reduce_action="flatten",
+                reduce_target_order_intent_id=exposure["order_intent_id"],
                 order_type="market",
                 delta_units=-exposure["units_open"],
-                idempotency_key=f"flatten:{exposure['exposure_id']}:{now.isoformat()}",
+                idempotency_key=idem,
             )
             payload = self.sink.serialize(intent)
             with self.olap.atomic_unit():
                 self.olap.record_decision(
-                    intent.idempotency_key, "would_be_flatten", None,
+                    idem, "would_be_flatten", None,
                     intent.model_dump_json(), payload,
                     capability_evidence=exposure["capability_evidence"],
                 )
@@ -668,33 +757,50 @@ class DemoExecutionService:
                     bracket_role="parent", state="requested",
                     requested_units=intent.delta_units,
                 ))
-            emitted.append({"kind": "flatten", "order_intent_id": intent.object_id,
-                            "units": intent.delta_units})
+            emitted.append({
+                "kind": "flatten",
+                "order_intent_id": intent.object_id,
+                "target": exposure["order_intent_id"],
+                "units": intent.delta_units,
+            })
         return emitted
 
     def _emit_cancel_pending(self, trace_id: str, now: datetime) -> list[dict[str, Any]]:
-        """Finding 047: cancel is an emitted zero-network intent per pending entry."""
+        """Findings 047/051: cancel is an emitted zero-network intent that
+        names the exact target order. Idempotent per pending entry."""
         emitted = []
         for pending in self.olap.active_reservation_intents():
+            source = self.olap.decision_intent(pending["idempotency_key"])
+            if source is None:
+                raise DemoExecutionError(
+                    f"pending reservation {pending['reservation_id']} has no "
+                    "immutable decision; cannot target a cancel"
+                )
+            idem = f"cancel:{pending['reservation_id']}"
+            if self.olap.recorded_decision(idem) is not None:
+                emitted.append({"kind": "cancel", "replayed": True,
+                                "target": source["object_id"]})
+                continue
             intent = OrderIntentV2(
                 object_id=f"oi2-cancel-{pending['reservation_id']}",
                 as_of=now,
                 producer=self._PRODUCER,
                 trace_id=trace_id,
-                account_ref=self.config.account_fingerprint,
-                asset_id="pending-entry",
-                venue=self.config.venue,
-                instrument="pending-entry",
+                account_ref=source["account_ref"],
+                asset_id=source["asset_id"],
+                venue=source["venue"],
+                instrument=source["instrument"],
                 intent_class="risk_reducing",
                 reduce_action="cancel",
+                reduce_target_order_intent_id=source["object_id"],
                 order_type="market",
                 delta_units=0.0,
-                idempotency_key=f"cancel:{pending['reservation_id']}:{now.isoformat()}",
+                idempotency_key=idem,
             )
             payload = self.sink.serialize(intent)
             with self.olap.atomic_unit():
                 self.olap.record_decision(
-                    intent.idempotency_key, "would_be_cancel", None,
+                    idem, "would_be_cancel", None,
                     intent.model_dump_json(), payload,
                 )
                 self.olap.append_lifecycle(ExecutionReportV2(
@@ -705,7 +811,7 @@ class DemoExecutionService:
                     bracket_role="parent", state="requested",
                     requested_units=0.0,
                 ))
-            emitted.append({"kind": "cancel",
+            emitted.append({"kind": "cancel", "target": source["object_id"],
                             "reservation_id": pending["reservation_id"]})
         return emitted
 
@@ -738,6 +844,21 @@ class DemoExecutionService:
                     capability_evidence=capability.capability_evidence,
                 )
             return {"outcome": "rejected", "reason": reason, "replayed": False}
+
+        # Finding 052: the capability snapshot must bind exactly to this
+        # service's venue, account and environment; no substitution.
+        if (
+            capability.venue != self.config.venue
+            or capability.account_fingerprint != self.config.account_fingerprint
+            or capability.environment != self.config.environment
+        ):
+            return reject(
+                "capability_snapshot_mismatch: snapshot "
+                f"({capability.venue}/{capability.account_fingerprint}/"
+                f"{capability.environment}) does not bind to service "
+                f"({self.config.venue}/{self.config.account_fingerprint}/"
+                f"{self.config.environment})"
+            )
 
         halt = self.olap.get_state("halt", "none")
         if halt != "none":
@@ -935,6 +1056,28 @@ class DemoExecutionService:
             else None
         )
         row = self.olap.reservation_row(reservation_id) if reservation_id else None
+
+        def _source_identity() -> dict[str, Any]:
+            """Finding 050: exposure identity comes from the immutable
+            decision record, never from constants or the report."""
+            idem = self.olap.reservation_idempotency(reservation_id)
+            intent = self.olap.decision_intent(idem) if idem else None
+            if intent is None:
+                raise DemoExecutionError(
+                    f"no immutable decision found for {reservation_id}; "
+                    "exposure cannot be attributed"
+                )
+            return {
+                "asset_id": intent["asset_id"],
+                "instrument": intent["instrument"],
+                "venue": intent["venue"],
+                "account_fingerprint": intent["account_ref"],
+                "sign": 1.0 if intent["delta_units"] > 0 else -1.0,
+                "capability_evidence": intent.get("_capability_evidence")
+                or "unknown",
+                "day": str(intent["as_of"])[:10],
+            }
+
         with self.olap.atomic_unit():
             result["chain_hash"] = self.olap.append_lifecycle(report)
             if row is not None and row["state"] == "active":
@@ -943,35 +1086,49 @@ class DemoExecutionService:
                     self.olap.release(reservation_id, "released")
                     result["reservation"] = "released"
                 elif report.state == "partially_filled" and magnitude > 0:
-                    # Finding 044: filled part becomes open exposure; the
-                    # remaining entry keeps a scaled reservation. No double
-                    # counting, no vanished risk.
+                    # Findings 044/049: the CUMULATIVE filled share becomes
+                    # signed open exposure computed absolutely from the
+                    # immutable originals; the remaining entry keeps a
+                    # reservation set to the exact unfilled share. Repeated
+                    # cumulative partials therefore conserve the original.
+                    source = _source_identity()
                     filled_ratio = report.filled_units / magnitude
                     self.olap.open_exposure(
                         f"exp-{report.order_intent_id}",
                         report.order_intent_id,
-                        "USD.CAD",
-                        report.filled_units,
-                        row["risk_fraction"] * filled_ratio,
-                        row["gross_fraction"] * filled_ratio,
-                        row["margin_fraction"] * filled_ratio,
-                        "unknown",
+                        reservation_id,
+                        source["asset_id"],
+                        source["instrument"],
+                        source["venue"],
+                        source["account_fingerprint"],
+                        source["sign"] * report.filled_units,
+                        row["original_risk_fraction"] * filled_ratio,
+                        row["original_gross_fraction"] * filled_ratio,
+                        row["original_margin_fraction"] * filled_ratio,
+                        source["day"],
+                        source["capability_evidence"],
                     )
-                    self.olap.scale_reservation(
+                    self.olap.set_reservation_remaining(
                         reservation_id, 1.0 - filled_ratio
                     )
                     result["reservation"] = "scaled"
                     result["exposure"] = "opened_partial"
                 elif report.state == "filled":
+                    source = _source_identity()
                     self.olap.open_exposure(
                         f"exp-{report.order_intent_id}",
                         report.order_intent_id,
-                        "USD.CAD",
-                        report.filled_units,
-                        row["risk_fraction"],
-                        row["gross_fraction"],
-                        row["margin_fraction"],
-                        "unknown",
+                        reservation_id,
+                        source["asset_id"],
+                        source["instrument"],
+                        source["venue"],
+                        source["account_fingerprint"],
+                        source["sign"] * report.filled_units,
+                        row["original_risk_fraction"],
+                        row["original_gross_fraction"],
+                        row["original_margin_fraction"],
+                        source["day"],
+                        source["capability_evidence"],
                     )
                     self.olap.release(reservation_id, "consumed")
                     result["reservation"] = "consumed"
