@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -825,6 +826,32 @@ class DemoExecutionService:
             emitted.extend(self._emit_cancel_pending(due["trace_id"], now))
         self.olap.set_state("effects_due", "")
         return emitted
+
+    def request_verified_model_switch_flatten(
+        self,
+        *,
+        trace_id: str,
+        current_session_id: str,
+        next_model_artifact_sha256: str,
+        now: Optional[datetime] = None,
+    ) -> list[dict[str, Any]]:
+        """Emit exact route flattens before a verified model replacement.
+
+        This is not an owner emergency command and never changes the global
+        halt state. The caller must already have verified the replacement
+        model; its identity is carried in the trace evidence. The normal L1
+        consumer still performs all broker calls and exact reconciliation.
+        """
+        if not current_session_id or not re.fullmatch(
+            r"[0-9a-f]{64}", next_model_artifact_sha256
+        ):
+            raise DemoExecutionError("model-switch evidence is incomplete")
+        observed = now or _utc_now()
+        switch_trace = (
+            f"{trace_id}:session={current_session_id}:"
+            f"next={next_model_artifact_sha256}"
+        )
+        return self._emit_flatten_all(switch_trace, observed)
 
     def _emit_flatten_all(self, trace_id: str, now: datetime) -> list[dict[str, Any]]:
         """Findings 047/050/051: flatten is an emitted zero-network intent

@@ -1,0 +1,19 @@
+[Unit]
+Description=LTS selected-model IBKR Paper execution runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/GitHub/lts
+ExecStart=%h/anaconda3/envs/trading-stack/bin/python -m app.ibkr_model_runner --config examples/configs/ibkr_usdcad_model_runner_v1.json
+Restart=on-failure
+RestartSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/lts
+
+[Install]
+WantedBy=default.target

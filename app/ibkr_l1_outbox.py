@@ -194,10 +194,18 @@ class L1OutboxConsumer:
                 f"quantity_{magnitude}_exceeds_profile_ceiling_"
                 f"{self.profile.quantity_ceiling}_never_resized",
             )
-        if self.olap.l1_entry_count() >= self.profile.max_orders_this_activation:
+        if getattr(self.profile, "entry_budget_scope", "activation") == "utc_day":
+            budget_used = self.olap.effect_count_since(
+                "bracket_entry", f"{now.date().isoformat()}T00:00:00+00:00"
+            )
+            budget_name = "daily_entry_budget"
+        else:
+            budget_used = self.olap.l1_entry_count()
+            budget_name = "entry_budget"
+        if budget_used >= self.profile.max_orders_this_activation:
             return self._reject(
                 key, [],
-                f"entry_budget_{self.profile.max_orders_this_activation}_exhausted",
+                f"{budget_name}_{self.profile.max_orders_this_activation}_exhausted",
             )
         # age is measured from the decision's own quote evidence: a decision
         # whose market evidence has expired must never execute later
@@ -240,7 +248,13 @@ class L1OutboxConsumer:
 
         # deferrable authority: no capability is not a terminal condition
         try:
-            _, record = self.gate.load(self.profile, olap=self.olap, now=now)
+            intent_loader = getattr(self.gate, "load_for_intent", None)
+            if callable(intent_loader):
+                _, record = intent_loader(
+                    self.profile, intent, olap=self.olap, now=now
+                )
+            else:
+                _, record = self.gate.load(self.profile, olap=self.olap, now=now)
         except L1AuthorizationError as error:
             return {
                 "idempotency_key": key,

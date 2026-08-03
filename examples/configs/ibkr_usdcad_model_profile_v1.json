@@ -1,0 +1,18 @@
+{
+  "schema_version": "lts.ibkr.paper.model_profile.v1",
+  "venue": "ibkr_paper",
+  "environment": "paper",
+  "host": "127.0.0.1",
+  "port": 7497,
+  "client_id": 78,
+  "account_fingerprint_algorithm": "account_id_sha256_16",
+  "account_fingerprint": "c0ff137a3cc1a363",
+  "instrument": "USD.CAD",
+  "asset_id": "fx:USD/CAD",
+  "max_entries_per_day": 4,
+  "quantity_ceiling": 20000.0,
+  "stop_distance_price_max": 0.003,
+  "take_profit_distance_price_max": 0.006,
+  "max_spread_price": 0.0003,
+  "contract_con_id": 15016062
+}

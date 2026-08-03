@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import math
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from app.ibkr_l1_adapter import IB_ASYNC_VERSION, L1ExecutionError, L1Profile
@@ -182,3 +184,73 @@ class IbAsyncTwsClient(IbkrClientProtocol):
             "cash": values.get("TotalCashValue", 0.0),
             "available_funds": values.get("AvailableFunds", 0.0),
         }
+
+    def qualified_forex_fact(self, instrument: str) -> dict[str, Any]:
+        from ib_async import Forex
+        from app.ibkr_l1_broker import forex_pair
+
+        contract = self._qualify(Forex(forex_pair(instrument)))
+        return {
+            "contract": contract,
+            "conId": int(contract.conId),
+            "symbol": str(contract.symbol),
+            "currency": str(contract.currency),
+            "secType": str(contract.secType),
+            "exchange": str(contract.exchange),
+        }
+
+    def current_quote(self, instrument: str) -> dict[str, Any]:
+        fact = self.qualified_forex_fact(instrument)
+        tickers = self.ib.reqTickers(fact["contract"])
+        if len(tickers) != 1:
+            raise L1ExecutionError("TWS did not return exactly one FX quote")
+        ticker = tickers[0]
+        bid, ask = float(ticker.bid), float(ticker.ask)
+        if not math.isfinite(bid) or not math.isfinite(ask) or bid <= 0 or ask < bid:
+            raise L1ExecutionError("TWS FX quote is unavailable or invalid")
+        observed = ticker.time
+        if not isinstance(observed, datetime):
+            observed = datetime.now(timezone.utc)
+        elif observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        return {
+            **{key: fact[key] for key in ("conId", "symbol", "currency", "secType")},
+            "bid": bid,
+            "ask": ask,
+            "observed_at": observed.astimezone(timezone.utc),
+        }
+
+    def historical_closed_bars(
+        self, instrument: str, *, timeframe: str = "4h", count: int = 60,
+    ) -> list[dict[str, Any]]:
+        if timeframe != "4h" or not 51 <= count <= 180:
+            raise L1ExecutionError("continuous Paper runner supports 51-180 H4 bars")
+        fact = self.qualified_forex_fact(instrument)
+        bars = self.ib.reqHistoricalData(
+            fact["contract"], endDateTime="", durationStr="30 D",
+            barSizeSetting="4 hours", whatToShow="MIDPOINT", useRTH=False,
+            formatDate=2, keepUpToDate=False,
+        )
+        now = datetime.now(timezone.utc)
+        result = []
+        for bar in bars:
+            observed = bar.date
+            if isinstance(observed, str):
+                observed = datetime.fromisoformat(observed.replace("Z", "+00:00"))
+            if not isinstance(observed, datetime):
+                continue
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=timezone.utc)
+            observed = observed.astimezone(timezone.utc)
+            if observed + timedelta(hours=4) > now:
+                continue
+            result.append({
+                "time": observed.isoformat(), "open": float(bar.open),
+                "high": float(bar.high), "low": float(bar.low),
+                "close": float(bar.close),
+                "volume": max(0.0, float(bar.volume)), "complete": True,
+            })
+        result.sort(key=lambda item: item["time"])
+        if len(result) < 51:
+            raise L1ExecutionError("TWS returned fewer than 51 completed H4 bars")
+        return result[-count:]

@@ -1,0 +1,33 @@
+{
+  "schema": "lts.ibkr.model_runner.v1",
+  "profile_file": "~/Documents/GitHub/lts/examples/configs/ibkr_usdcad_model_profile_v1.json",
+  "mandate_file": "~/.config/lts/ibkr-usdcad-model-mandate.json",
+  "model": {
+    "manifest_file": "~/.local/share/prediction-provider/live/usdcad_4h_linear_v1/manifest.json",
+    "expected_timeframe": "4h",
+    "execution_tier": "demo_research_canary"
+  },
+  "route": {"minimum_units": 20000.0, "unit_step": 1000.0, "margin_rate": 1.0},
+  "strategy": {"stop_fraction": 0.0015, "take_profit_fraction": 0.003},
+  "price_decimals": 5,
+  "quantity_decimals": 0,
+  "max_decision_age_seconds": 300,
+  "loop_seconds": 60,
+  "heartbeat_path": "~/.local/state/lts/ibkr-model-runner-heartbeat.json",
+  "service": {
+    "venue": "ibkr_paper",
+    "account_fingerprint": "c0ff137a3cc1a363",
+    "environment": "paper",
+    "database_path": "~/.local/state/lts/ibkr-model-execution.sqlite",
+    "risk_fraction_at_stop": 0.00005,
+    "max_overshoot_ratio": 0.25,
+    "gross_notional_fraction_max": 0.029,
+    "margin_fraction_max": 0.029,
+    "daily_loss_budget_fraction": 0.0002,
+    "max_concurrent_positions": 1,
+    "signal_max_age_seconds": 28800,
+    "owner_issuer_allowlist": ["harvey-owner"],
+    "command_phrases": {},
+    "asset_instrument_bindings": {"fx:USD/CAD": "USD.CAD"}
+  }
+}
