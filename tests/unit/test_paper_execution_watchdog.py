@@ -169,6 +169,79 @@ def test_evaluate_reports_stale_disconnected_mt5_with_exposure() -> None:
     assert discussions == []
 
 
+def test_evaluate_accepts_reconciled_writable_mt5_exposure() -> None:
+    events, discussions = evaluate(
+        _healthy_alpaca(1785384300.0),
+        {
+            "available": True,
+            "socket": {"available": True},
+            "latest_complete": {
+                "ended_at": "2026-07-30T04:00:00+00:00",
+                "open_positions": 0,
+                "open_orders": 0,
+            },
+        },
+        None,
+        {
+            "available": True,
+            "read_only": False,
+            "execution_enabled": True,
+            "heartbeat": {
+                "connected": True,
+                "received_at": "2026-07-30T04:00:00+00:00",
+            },
+            "latest_snapshot": {"positions_total": 1, "orders_total": 0},
+            "exposure_reconciliation": {
+                "available": True,
+                "positions_total": 1,
+                "orders_total": 0,
+                "all_authorized": True,
+            },
+        },
+        now=1785384300.0,
+        stale_seconds=900,
+    )
+
+    assert events == []
+    assert discussions == []
+
+
+def test_evaluate_rejects_unreconciled_writable_mt5_exposure() -> None:
+    events, _ = evaluate(
+        _healthy_alpaca(1785384300.0),
+        {
+            "available": True,
+            "socket": {"available": True},
+            "latest_complete": {
+                "ended_at": "2026-07-30T04:00:00+00:00",
+                "open_positions": 0,
+                "open_orders": 0,
+            },
+        },
+        None,
+        {
+            "available": True,
+            "read_only": False,
+            "execution_enabled": True,
+            "heartbeat": {
+                "connected": True,
+                "received_at": "2026-07-30T04:00:00+00:00",
+            },
+            "latest_snapshot": {"positions_total": 1, "orders_total": 0},
+            "exposure_reconciliation": {
+                "available": True,
+                "positions_total": 1,
+                "orders_total": 0,
+                "all_authorized": False,
+            },
+        },
+        now=1785384300.0,
+        stale_seconds=900,
+    )
+
+    assert [event["key"] for event in events] == ["mt5_unexpected_exposure"]
+
+
 def test_read_mt5_snapshot_handles_missing_schema(tmp_path: Path) -> None:
     path = tmp_path / "empty.sqlite"
     sqlite3.connect(path).close()

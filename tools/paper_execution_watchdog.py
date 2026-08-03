@@ -577,7 +577,7 @@ def evaluate_mt5(
                 "mt5_terminal_disconnected",
                 "LTS PAPER ALERT: MT5 TERMINAL DISCONNECTED",
                 (
-                    "The read-only EA reports no broker connection. "
+                    "The EA reports no broker connection. "
                     "Inspect the Windows VM and MT5 demo session."
                 ),
                 severity="critical",
@@ -587,15 +587,25 @@ def evaluate_mt5(
     snapshot = mt5.get("latest_snapshot") or {}
     positions = int(snapshot.get("positions_total") or 0)
     orders = int(snapshot.get("orders_total") or 0)
-    if positions or orders:
+    reconciliation = mt5.get("exposure_reconciliation") or {}
+    exposure_authorized = bool(
+        mt5.get("execution_enabled")
+        and mt5.get("read_only") is False
+        and reconciliation.get("available")
+        and reconciliation.get("all_authorized")
+        and int(reconciliation.get("positions_total") or 0) == positions
+        and int(reconciliation.get("orders_total") or 0) == orders
+    )
+    if (positions or orders) and not exposure_authorized:
         events.append(
             _event(
                 "mt5_unexpected_exposure",
-                "LTS PAPER ALERT: UNEXPECTED MT5 EXPOSURE",
+                "LTS PAPER ALERT: UNVERIFIED MT5 EXPOSURE",
                 (
                     f"open positions: {positions}\n"
                     f"pending orders: {orders}\n"
-                    "The installed EA is read-only; inspect MT5 immediately."
+                    "The exposure does not reconcile to successful protected "
+                    "model commands; inspect MT5 immediately."
                 ),
                 severity="critical",
                 category="reconciliation",

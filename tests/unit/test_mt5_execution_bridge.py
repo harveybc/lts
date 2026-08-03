@@ -5,8 +5,13 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.mt5_bridge_lab import Mt5BridgeError, create_signed_headers
+from app.mt5_bridge_lab import (
+    Mt5BridgeError,
+    SnapshotPayload,
+    create_signed_headers,
+)
 from app.mt5_execution_bridge import (
+    ExecutionResultPayload,
     Mt5ExecutionConfig,
     Mt5ExecutionStore,
     _response_signature,
@@ -156,6 +161,83 @@ def test_execution_status_reports_v2_and_not_read_only(tmp_path):
     assert status["bridge_version"] == "lts.mt5.bridge.execution.v2"
     assert status["read_only"] is False
     assert status["execution_enabled"] is True
+
+
+def test_execution_status_reconciles_protected_model_position(tmp_path):
+    config = _config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    command = _enqueue(store, config)
+    store.complete(ExecutionResultPayload.model_validate({
+        "schema": "lts.mt5.execution_result.v1",
+        "command_id": command["command_id"],
+        "account_fingerprint": ACCOUNT,
+        "success": True,
+        "result_code": 10009,
+        "order_ticket": "100",
+        "deal_ticket": "101",
+        "message": "protected_entry_accepted",
+        "observed_at": datetime.now(timezone.utc),
+    }))
+    store.record_snapshot(SnapshotPayload.model_validate({
+        "schema": "lts.mt5.snapshot.v1",
+        "account_fingerprint": ACCOUNT,
+        "observed_at": datetime.now(timezone.utc),
+        "currency": "USD",
+        "balance": 10_000,
+        "equity": 10_000,
+        "margin": 10,
+        "free_margin": 9_990,
+        "positions": [{
+            "ticket": "100", "symbol": "USDCAD", "side": "long",
+            "volume": 0.01, "price_open": 1.35,
+            "stop_loss": 1.34, "take_profit": 1.36, "profit": 0,
+        }],
+    }))
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+
+    status = client.get("/v1/status").json()
+
+    assert status["exposure_reconciliation"] == {
+        "available": True,
+        "positions_total": 1,
+        "orders_total": 0,
+        "authorized_positions": 1,
+        "unexpected_positions": 0,
+        "unexpected_orders": 0,
+        "all_authorized": True,
+    }
+
+
+def test_execution_status_refuses_altered_or_foreign_position(tmp_path):
+    config = _config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    command = _enqueue(store, config)
+    store.complete(ExecutionResultPayload.model_validate({
+        "schema": "lts.mt5.execution_result.v1",
+        "command_id": command["command_id"],
+        "account_fingerprint": ACCOUNT,
+        "success": True,
+        "result_code": 10009,
+        "order_ticket": "100",
+        "observed_at": datetime.now(timezone.utc),
+    }))
+    store.record_snapshot(SnapshotPayload.model_validate({
+        "schema": "lts.mt5.snapshot.v1",
+        "account_fingerprint": ACCOUNT,
+        "observed_at": datetime.now(timezone.utc),
+        "currency": "USD", "balance": 10_000, "equity": 10_000,
+        "margin": 10, "free_margin": 9_990,
+        "positions": [{
+            "ticket": "foreign", "symbol": "USDCAD", "side": "long",
+            "volume": 0.01, "price_open": 1.35,
+            "stop_loss": 0, "take_profit": 1.36, "profit": 0,
+        }],
+    }))
+
+    reconciliation = store.exposure_reconciliation()
+
+    assert reconciliation["all_authorized"] is False
+    assert reconciliation["unexpected_positions"] == 1
 
 
 def test_wrong_account_and_unsigned_poll_never_receive_commands(tmp_path):

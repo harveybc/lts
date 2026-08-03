@@ -291,6 +291,77 @@ class Mt5ExecutionStore(Mt5BridgeStore):
             ).fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
 
+    def exposure_reconciliation(self) -> dict[str, Any]:
+        """Match current MT5 exposure to completed, model-bound commands."""
+        with self._lock:
+            snapshot = self.connection.execute(
+                "SELECT payload_json FROM account_snapshots ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            commands = self.connection.execute(
+                "SELECT action,symbol,volume,stop_loss,take_profit,result_json "
+                "FROM execution_commands WHERE state='succeeded' "
+                "ORDER BY completed_at,created_at"
+            ).fetchall()
+        if snapshot is None:
+            return {"available": False, "reason": "snapshot_missing"}
+
+        payload = json.loads(str(snapshot[0]))
+        positions = list(payload.get("positions") or [])
+        orders = list(payload.get("orders") or [])
+        authorized_by_ticket: dict[str, dict[str, Any]] = {}
+        for row in commands:
+            action, symbol = str(row[0]), str(row[1]).upper()
+            if action == "close_position":
+                authorized_by_ticket = {
+                    ticket: command
+                    for ticket, command in authorized_by_ticket.items()
+                    if command["symbol"] != symbol
+                }
+                continue
+            if action not in _OPEN_ACTIONS or not row[5]:
+                continue
+            result = json.loads(str(row[5]))
+            ticket = str(result.get("order_ticket") or "")
+            if not ticket:
+                continue
+            authorized_by_ticket[ticket] = {
+                "symbol": symbol,
+                "side": "long" if action == "open_long" else "short",
+                "volume": float(row[2]),
+                "stop_loss": float(row[3]),
+                "take_profit": float(row[4]),
+            }
+
+        authorized = 0
+        unexpected: list[str] = []
+        for position in positions:
+            ticket = str(position.get("ticket") or "")
+            command = authorized_by_ticket.get(ticket)
+            matches = command is not None and all(
+                (
+                    str(position.get("symbol") or "").upper() == command["symbol"],
+                    str(position.get("side") or "").lower() == command["side"],
+                    float(position.get("volume") or 0) == command["volume"],
+                    float(position.get("stop_loss") or 0) == command["stop_loss"],
+                    float(position.get("take_profit") or 0) == command["take_profit"],
+                    command["stop_loss"] > 0,
+                    command["take_profit"] > 0,
+                )
+            )
+            if matches:
+                authorized += 1
+            else:
+                unexpected.append(ticket or "missing_ticket")
+        return {
+            "available": True,
+            "positions_total": len(positions),
+            "orders_total": len(orders),
+            "authorized_positions": authorized,
+            "unexpected_positions": len(unexpected),
+            "unexpected_orders": len(orders),
+            "all_authorized": not unexpected and not orders,
+        }
+
 
 def _command_line(command: Mapping[str, Any]) -> str:
     values = (
@@ -351,6 +422,7 @@ def create_mt5_execution_app(
         result["read_only"] = False
         result["execution_enabled"] = True
         result["command_counts"] = store.command_counts()
+        result["exposure_reconciliation"] = store.exposure_reconciliation()
         return result
 
     @app.post("/v1/heartbeat")
