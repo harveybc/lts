@@ -53,6 +53,12 @@ def test_execution_ea_handles_empty_get_hash_and_header_case():
     assert "StringToLower(normalized_name);" in source
 
 
+def test_execution_ea_accepts_successful_zero_retcode_order_check():
+    source = EA_PATH.read_text(encoding="utf-8")
+    assert source.count("if(!OrderCheck(request, check))") == 2
+    assert "check.retcode != TRADE_RETCODE_DONE" not in source
+
+
 def _config(tmp_path):
     return Mt5ExecutionConfig(
         database_path=tmp_path / "mt5.sqlite", secret_env="SECRET",

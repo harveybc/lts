@@ -438,7 +438,9 @@ bool ExecuteOpen(
    request.comment = "lts:" + StringSubstr(command_id, 0, 20);
    request.type_filling = FillingMode(symbol);
    request.type_time = ORDER_TIME_GTC;
-   if(!OrderCheck(request, check) || check.retcode != TRADE_RETCODE_DONE)
+   // A successful OrderCheck reports retcode=0 ("Done"); trade-server
+   // retcodes such as TRADE_RETCODE_DONE belong to OrderSend's result.
+   if(!OrderCheck(request, check))
      {
       result.retcode = check.retcode;
       message = "order_check_refused:" + check.comment;
@@ -498,7 +500,7 @@ bool ExecuteClose(
    request.magic = InpMagic;
    request.comment = "lts-close:" + StringSubstr(command_id, 0, 14);
    request.type_filling = FillingMode(symbol);
-   if(!OrderCheck(request, check) || check.retcode != TRADE_RETCODE_DONE)
+   if(!OrderCheck(request, check))
      {
       result.retcode = check.retcode;
       message = "close_check_refused:" + check.comment;
