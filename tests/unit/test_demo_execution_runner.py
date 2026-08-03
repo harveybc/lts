@@ -67,6 +67,7 @@ def _runner_config(tmp_path, quote_db_path):
             "synthetic_equity": 100000.0,
             "owner_issuer_allowlist": ["owner-1"],
             "command_phrases": {"hold": "HOLD ALL DEMO TRADING NOW"},
+            "asset_instrument_bindings": {"crypto:ETH/USD": "ETH.USD"},
         },
         "policy": {
             "cell_id": "crypto:ETH/USD@1h:mech:policy",
@@ -164,6 +165,90 @@ def test_live_observed_fixture_is_refused_for_l0(tmp_path):
     fixture["capability_evidence"] = "live_observed"
     with pytest.raises(RunnerError, match="synthetic_fixture"):
         build_capability(fixture, NOW)
+
+
+def test_finding_058_future_quote_rejected_with_alert(tmp_path):
+    quotes = _quote_db(tmp_path, NOW + timedelta(hours=6))
+    runner = DemoExecutionRunner(_runner_config(tmp_path, quotes))
+    heartbeat = runner.tick(now=NOW)
+    assert heartbeat["outcome"] == "quote_invalid_future_timestamp"
+    assert "quote_future_timestamp" in heartbeat["alerts"]
+    count = runner.service.olap._con.execute(
+        "SELECT COUNT(*) FROM decisions").fetchone()[0]
+    assert count == 0
+
+
+def test_finding_056_lifecycle_driver_prevents_saturation(tmp_path):
+    quotes = _quote_db(tmp_path, NOW - timedelta(seconds=30))
+    config = _runner_config(tmp_path, quotes)
+    config["lifecycle_driver"] = {"enabled": True, "hold_bars": 1}
+    runner = DemoExecutionRunner(config)
+
+    progression = []
+    first = runner.tick(now=NOW)
+    assert first["outcome"] == "would_be_order"
+    progression += [a.get("to") for a in first["lifecycle_advanced"]]
+    second = runner.tick(now=NOW + timedelta(minutes=1))
+    progression += [a.get("to") for a in second["lifecycle_advanced"]]
+    third = runner.tick(now=NOW + timedelta(minutes=2))
+    progression += [a.get("to") for a in third["lifecycle_advanced"]]
+    assert progression[:2] == ["accepted", "filled"]   # deterministic order
+    day = NOW.date().isoformat()
+    totals = runner.service.olap.active_totals(day)
+    assert totals["positions"] == 1.0                  # exposure, conserved
+
+    # after the hold period the position closes and capacity frees;
+    # the next bar produces a NEW decision instead of repeating a cap
+    # rejection (the saturation Musashi observed live)
+    later = NOW + timedelta(hours=1, minutes=5)
+    con = sqlite3.connect(quotes)
+    con.execute(
+        "INSERT INTO quote_observations VALUES "
+        "('s-2','ETH/USD',?,?,?,?,?,0.5,2.3,1.0,1.0,'{\"raw\":2}')",
+        ((later - timedelta(seconds=20)).isoformat(),
+         (later - timedelta(seconds=20)).isoformat(), 2199.75, 2200.25, 2200.0),
+    )
+    con.commit()
+    con.close()
+    fourth = runner.tick(now=later)
+    assert any(a.get("to") == "position_closed"
+               for a in fourth["lifecycle_advanced"])
+    assert fourth["outcome"] == "would_be_order"       # new bar decided
+    assert fourth["would_be_orders_session"] == 2
+    assert runner.service.sink.network_submissions == 0
+
+
+def test_runner_resumes_journaled_effects_at_startup(tmp_path, monkeypatch):
+    """Finding 055 end-to-end: crash between kill acceptance and emission,
+    then the next runner startup completes the effects automatically."""
+    from trading_contracts import OwnerCommand
+    quotes = _quote_db(tmp_path, NOW - timedelta(seconds=30))
+    config = _runner_config(tmp_path, quotes)
+    config["service"]["command_phrases"]["kill"] = "KILL ALL DEMO TRADING NOW"
+    runner = DemoExecutionRunner(config)
+    runner.tick(now=NOW)
+
+    def explode(intent):
+        raise RuntimeError("crash during effect emission")
+
+    monkeypatch.setattr(runner.service.sink, "serialize", explode)
+    command = OwnerCommand(
+        object_id="cmd-r055", as_of=NOW,
+        producer={"name": "telegram.deterministic", "version": "0"},
+        trace_id="t-1", command="kill", issuer_id="owner-1",
+        exact_phrase="KILL ALL DEMO TRADING NOW", nonce="n-r055",
+        expires_at=NOW + timedelta(minutes=5), idempotency_key="ck-r055",
+    )
+    with pytest.raises(RuntimeError):
+        runner.service.apply_owner_command(command, now=NOW)
+    runner.service.olap.close()
+
+    reborn = DemoExecutionRunner(config)               # startup resume
+    kinds = sorted(e["kind"] for e in reborn.resumed_effects)
+    assert kinds == ["cancel"]                          # pending entry cancelled
+    assert reborn.service.olap.get_state("effects_due", "") == ""
+    heartbeat = reborn.tick(now=NOW + timedelta(minutes=1))
+    assert "halted:kill" in heartbeat["alerts"]
 
 
 def test_bar_clock_is_deterministic():

@@ -90,6 +90,9 @@ class QuoteSource:
             "observed_at": observed_at,
             "age_seconds": age,
             "stale": age > self.max_age_seconds,
+            # Finding 058: a quote from the future is corrupt evidence, not
+            # fresh evidence; 30 s of clock skew is the only tolerance.
+            "future": age < -30.0,
             "quote_hash": "sha256:"
             + hashlib.sha256(str(row[4]).encode()).hexdigest(),
         }
@@ -137,6 +140,95 @@ def bar_time(now: datetime, bar_seconds: int) -> datetime:
     return datetime.fromtimestamp(epoch - epoch % bar_seconds, tz=timezone.utc)
 
 
+class SyntheticLifecycleDriver:
+    """Finding 056: L0 has no broker, so nothing resolves a would-be order.
+
+    This driver generates a deterministic, clearly-labeled synthetic
+    lifecycle for every pending would-be order — accept, then fill with
+    confirmed protection, then position close after a hold period — so the
+    running vertical continuously exercises reservations, exposures,
+    conservation and release instead of saturating on one pending entry.
+    Zero network; every generated report says so in its producer identity.
+    """
+
+    PRODUCER = {"name": "lts.l0_synthetic_lifecycle_driver", "version": "0.1.0"}
+
+    def __init__(self, service: DemoExecutionService, hold_bars: int,
+                 bar_seconds: int):
+        self.service = service
+        self.hold_bars = hold_bars
+        self.bar_seconds = bar_seconds
+
+    def _pending_orders(self) -> list[dict[str, Any]]:
+        rows = self.service.olap._con.execute(
+            "SELECT idempotency_key, intent_json FROM decisions "
+            "WHERE outcome='would_be_order'"
+        ).fetchall()
+        orders = []
+        for idem, intent_json in rows:
+            intent = json.loads(intent_json)
+            orders.append({
+                "order_intent_id": intent["object_id"],
+                "delta_units": intent["delta_units"],
+                "protection": intent["protection"],
+                "reservation_id": intent["risk"]["reservation_id"],
+                "as_of": intent["as_of"],
+            })
+        return orders
+
+    def advance(self, now: datetime) -> list[dict[str, Any]]:
+        advanced = []
+        for order in self._pending_orders():
+            state = self.service.olap.last_state(order["order_intent_id"])
+            units = abs(order["delta_units"])
+            legs = [
+                {"leg": "stop_loss", "broker_confirmed": True,
+                 "covered_units": units},
+                {"leg": "take_profit", "broker_confirmed": True,
+                 "covered_units": units},
+            ]
+            try:
+                if state == "requested":
+                    self._apply(order, "accepted", "requested", 0.0, [], now)
+                    advanced.append({"order": order["order_intent_id"],
+                                     "to": "accepted"})
+                elif state == "accepted":
+                    self._apply(order, "filled", "accepted", units, legs, now)
+                    advanced.append({"order": order["order_intent_id"],
+                                     "to": "filled"})
+                elif state == "filled":
+                    opened = datetime.fromisoformat(order["as_of"])
+                    held = (now - opened).total_seconds()
+                    if held >= self.hold_bars * self.bar_seconds:
+                        self.service.apply_position_close(
+                            order["order_intent_id"]
+                        )
+                        advanced.append({"order": order["order_intent_id"],
+                                         "to": "position_closed"})
+            except DemoExecutionError as error:
+                advanced.append({"order": order["order_intent_id"],
+                                 "error": str(error)})
+        return advanced
+
+    def _apply(self, order, state, previous, filled, legs, now) -> None:
+        from trading_contracts import ExecutionReportV2, ProtectionLegState
+
+        self.service.apply_execution_event(ExecutionReportV2(
+            object_id=f"er-syn-{order['order_intent_id']}-{state}",
+            as_of=now,
+            producer=self.PRODUCER,
+            trace_id="l0-synthetic-lifecycle",
+            order_intent_id=order["order_intent_id"],
+            attempt_id=f"attempt-{order['reservation_id']}",
+            bracket_role="parent",
+            state=state,
+            previous_state=previous,
+            requested_units=order["delta_units"],
+            filled_units=filled,
+            protection_legs=[ProtectionLegState(**leg) for leg in legs],
+        ))
+
+
 class DemoExecutionRunner:
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -155,18 +247,60 @@ class DemoExecutionRunner:
         )
         self.instrument = config["quote_source"]["instrument"]
         self.equity = float(config["service"].get("synthetic_equity", 100_000.0))
+        driver_config = config.get("lifecycle_driver", {})
+        self.driver = (
+            SyntheticLifecycleDriver(
+                self.service,
+                int(driver_config.get("hold_bars", 2)),
+                int(config["bar_seconds"]),
+            )
+            if driver_config.get("enabled", False)
+            else None
+        )
         self._stop = False
+        # Finding 055: journaled command effects resume at startup.
+        self.resumed_effects = self.service.resume_pending_effects()
 
     def request_stop(self, *_args) -> None:
         self._stop = True
 
+    def _alerts(self, quote, outcome) -> list[str]:
+        """Automatic L0 health alerts (finding 056 acceptance demand)."""
+        alerts = []
+        if quote is None:
+            alerts.append("quote_source_unavailable")
+        elif quote.get("future"):
+            alerts.append("quote_future_timestamp")
+        elif quote.get("stale"):
+            alerts.append("quote_stale")
+        halt = self.service.olap.get_state("halt", "none")
+        if halt != "none":
+            alerts.append(f"halted:{halt}")
+        unreconciled = self.service.olap.unreconciled()
+        if unreconciled:
+            alerts.append(f"unreconciled_orders:{len(unreconciled)}")
+        if outcome.get("reason") and "cap" in str(outcome.get("reason")):
+            alerts.append("cap_saturation")
+        if self.service.olap.get_state("effects_due", ""):
+            alerts.append("command_effects_pending")
+        return alerts
+
     def tick(self, now: Optional[datetime] = None) -> dict[str, Any]:
         now = now or _utc_now()
         bar = bar_time(now, int(self.config["bar_seconds"]))
+        # Settle the past before deciding the present (finding 056): the
+        # synthetic lifecycle advances first so closed positions free their
+        # capacity for this bar's decision instead of one bar later.
+        lifecycle_advanced = self.driver.advance(now) if self.driver else []
         quote = self.quotes.latest(now)
         outcome: dict[str, Any]
         if quote is None:
             outcome = {"outcome": "no_quote_available"}
+        elif quote["future"]:
+            outcome = {
+                "outcome": "quote_invalid_future_timestamp",
+                "age_seconds": quote["age_seconds"],
+            }
         elif quote["stale"]:
             outcome = {
                 "outcome": "quote_stale",
@@ -202,6 +336,8 @@ class DemoExecutionRunner:
             "network_submissions_session": self.service.sink.network_submissions,
             "capability_evidence": "synthetic_fixture",
             "halt_state": self.service.olap.get_state("halt", "none"),
+            "lifecycle_advanced": lifecycle_advanced,
+            "alerts": self._alerts(quote, outcome),
         }
         heartbeat_path = Path(self.config["heartbeat_path"])
         heartbeat_path.parent.mkdir(parents=True, exist_ok=True)

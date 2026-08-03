@@ -20,7 +20,15 @@
       "kill": "KILL ALL DEMO TRADING NOW",
       "flatten_all": "FLATTEN ALL DEMO POSITIONS NOW",
       "cancel_pending": "CANCEL ALL PENDING DEMO ENTRIES NOW"
+    },
+    "asset_instrument_bindings": {
+      "crypto:ETH/USD": "ETH.USD"
     }
+  },
+  "lifecycle_driver": {
+    "enabled": true,
+    "hold_bars": 2,
+    "comment": "L0-only deterministic synthetic lifecycle (finding 056): accepted -> filled with confirmed protection -> position close after hold_bars; producer identity labels every generated report synthetic."
   },
   "policy": {
     "cell_id": "crypto:ETH/USD@1h:mech:policy",

@@ -78,6 +78,10 @@ def _service(tmp_path, name):
             "flatten_all": "FLATTEN ALL DEMO POSITIONS NOW",
             "cancel_pending": "CANCEL ALL PENDING DEMO ENTRIES NOW",
         },
+        "asset_instrument_bindings": {
+            "fx:USD/CAD": "USD.CAD",
+            "crypto:ETH/USD": "ETH.USD",
+        },
     })
     return DemoExecutionService(
         config, DemoExecutionOlap(config.database_path), ZeroNetworkSink()

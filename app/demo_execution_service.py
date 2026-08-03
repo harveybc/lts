@@ -79,6 +79,7 @@ class DemoExecutionConfig:
     signal_max_age_seconds: float
     owner_issuer_allowlist: tuple[str, ...]
     command_phrases: Mapping[str, str]  # command verb -> exact phrase
+    asset_instrument_bindings: Mapping[str, str]  # asset_id -> instrument
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "DemoExecutionConfig":
@@ -88,7 +89,7 @@ class DemoExecutionConfig:
             "gross_notional_fraction_max", "margin_fraction_max",
             "daily_loss_budget_fraction", "max_concurrent_positions",
             "signal_max_age_seconds", "owner_issuer_allowlist",
-            "command_phrases",
+            "command_phrases", "asset_instrument_bindings",
         ]
         missing = [key for key in required if key not in value]
         if missing:
@@ -130,6 +131,7 @@ class DemoExecutionConfig:
             signal_max_age_seconds=float(value["signal_max_age_seconds"]),
             owner_issuer_allowlist=tuple(value["owner_issuer_allowlist"]),
             command_phrases=phrases,
+            asset_instrument_bindings=dict(value["asset_instrument_bindings"]),
         )
 
 
@@ -702,18 +704,49 @@ class DemoExecutionService:
         if expected is None or command.exact_phrase != expected:
             self.olap.record_command(command, False, "phrase_mismatch")
             return {"accepted": False, "reason": "phrase_mismatch"}
-        self.olap.record_command(command, True, None)
-        result: dict[str, Any] = {"accepted": True}
-        if command.command in ("hold", "kill"):
-            self.olap.set_state("halt", command.command)
-        emitted: list[dict[str, Any]] = []
+        # Finding 055: acceptance, halt state and the effects-due journal
+        # commit atomically BEFORE any emission, so a crash between
+        # acceptance and effects is resumable from the ledger.
+        effects = []
         if command.command in ("flatten_all", "kill"):
-            emitted.extend(self._emit_flatten_all(command.trace_id, now))
+            effects.append("flatten_all")
         if command.command in ("cancel_pending", "kill"):
-            emitted.extend(self._emit_cancel_pending(command.trace_id, now))
+            effects.append("cancel_pending")
+        with self.olap.atomic_unit():
+            self.olap.record_command(command, True, None)
+            if command.command in ("hold", "kill"):
+                self.olap.set_state("halt", command.command)
+            if effects:
+                self.olap.set_state(
+                    "effects_due",
+                    json.dumps({"verbs": effects, "trace_id": command.trace_id}),
+                )
+        result: dict[str, Any] = {"accepted": True}
+        result["emitted"] = self.resume_pending_effects(now)
         result["state"] = self.olap.get_state("halt", "none")
-        result["emitted"] = emitted
         return result
+
+    def resume_pending_effects(
+        self, now: Optional[datetime] = None
+    ) -> list[dict[str, Any]]:
+        """Finding 055: replay journaled command effects after a crash.
+
+        Emissions are idempotent per target, so resuming after a partial
+        emission completes exactly the missing effects. Called by the
+        runner at startup and by ``apply_owner_command`` inline.
+        """
+        now = now or _utc_now()
+        journal = self.olap.get_state("effects_due", "")
+        if not journal:
+            return []
+        due = json.loads(journal)
+        emitted: list[dict[str, Any]] = []
+        if "flatten_all" in due["verbs"]:
+            emitted.extend(self._emit_flatten_all(due["trace_id"], now))
+        if "cancel_pending" in due["verbs"]:
+            emitted.extend(self._emit_cancel_pending(due["trace_id"], now))
+        self.olap.set_state("effects_due", "")
+        return emitted
 
     def _emit_flatten_all(self, trace_id: str, now: datetime) -> list[dict[str, Any]]:
         """Findings 047/050/051: flatten is an emitted zero-network intent
@@ -836,13 +869,21 @@ class DemoExecutionService:
             return replay
 
         def reject(reason: str) -> dict[str, Any]:
-            with self.olap.atomic_unit():
-                self.olap.record_decision(
-                    idem, "rejected", reason, intent.model_dump_json(), None,
-                    reference_price=reference_price,
-                    quote_time=quote_time.isoformat(),
-                    capability_evidence=capability.capability_evidence,
-                )
+            try:
+                with self.olap.atomic_unit():
+                    self.olap.record_decision(
+                        idem, "rejected", reason, intent.model_dump_json(), None,
+                        reference_price=reference_price,
+                        quote_time=quote_time.isoformat(),
+                        capability_evidence=capability.capability_evidence,
+                    )
+            except sqlite3.IntegrityError:
+                # Finding 053: a concurrent twin recorded this intent first;
+                # replay its decision instead of crashing.
+                recorded = self.olap.recorded_decision(idem)
+                if recorded is not None:
+                    return recorded
+                raise
             return {"outcome": "rejected", "reason": reason, "replayed": False}
 
         # Finding 052: the capability snapshot must bind exactly to this
@@ -893,6 +934,16 @@ class DemoExecutionService:
             return reject(
                 "protection_not_anchored: short requires "
                 "stop > reference > take_profit"
+            )
+
+        # Finding 057: the policy's asset must bind to the quoted instrument
+        # through the resolved configuration; a BTC policy cannot ride an
+        # ETH quote.
+        bound = self.config.asset_instrument_bindings.get(intent.asset_id)
+        if bound != instrument:
+            return reject(
+                f"asset_instrument_binding_violation: {intent.asset_id} binds "
+                f"to {bound!r}, not {instrument!r}"
             )
 
         entry = {cap.instrument: cap for cap in capability.instruments}.get(
@@ -1022,6 +1073,13 @@ class DemoExecutionService:
                     bracket_role="parent", state="requested",
                     requested_units=order.delta_units,
                 ))
+        except sqlite3.IntegrityError:
+            # Finding 053: two identical concurrent intents serialized on the
+            # database; the loser replays the winner's recorded decision.
+            recorded = self.olap.recorded_decision(idem)
+            if recorded is not None:
+                return recorded
+            raise
         except DemoExecutionError as error:
             return reject(str(error))
         except Exception as error:  # noqa: BLE001 — finding 046: the atomic
@@ -1043,12 +1101,6 @@ class DemoExecutionService:
 
     # -- lifecycle ingestion (L0: synthetic/replayed events only) -----------
     def apply_execution_event(self, report: ExecutionReportV2) -> dict[str, Any]:
-        previous = self.olap.last_state(report.order_intent_id)
-        if previous is not None and report.previous_state != previous:
-            raise DemoExecutionError(
-                f"event previous_state {report.previous_state!r} does not match "
-                f"ledger state {previous!r}; reconcile from the ledger, not memory"
-            )
         result: dict[str, Any] = {"state": report.state}
         reservation_id = (
             report.attempt_id[len("attempt-"):]
@@ -1079,6 +1131,16 @@ class DemoExecutionService:
             }
 
         with self.olap.atomic_unit():
+            # Finding 054: continuity is checked INSIDE the serialized unit,
+            # so two concurrent events cannot both read the same previous
+            # state and persist an illegal sequence.
+            previous = self.olap.last_state(report.order_intent_id)
+            if previous is not None and report.previous_state != previous:
+                raise DemoExecutionError(
+                    f"event previous_state {report.previous_state!r} does not "
+                    f"match ledger state {previous!r}; reconcile from the "
+                    "ledger, not memory"
+                )
             result["chain_hash"] = self.olap.append_lifecycle(report)
             if row is not None and row["state"] == "active":
                 magnitude = abs(report.requested_units)

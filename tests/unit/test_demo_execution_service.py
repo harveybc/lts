@@ -60,6 +60,10 @@ def _config(tmp_path, **overrides):
             "flatten_all": "FLATTEN ALL DEMO POSITIONS NOW",
             "cancel_pending": "CANCEL ALL PENDING DEMO ENTRIES NOW",
         },
+        "asset_instrument_bindings": {
+            "fx:USD/CAD": "USD.CAD",
+            "crypto:ETH/USD": "ETH.USD",
+        },
     }
     base.update(overrides)
     return DemoExecutionConfig.from_dict(base)
@@ -1023,6 +1027,158 @@ def test_trace_bracket_child_execution(tmp_path):
     outcome = service.apply_execution_event(child)
     assert outcome["state"] == "requested"
     assert outcome["chain_hash"]
+
+
+# ── Finding 053: concurrent identical intents replay, never crash ──
+
+def test_finding_053_concurrent_identical_intents_one_wins_one_replays(tmp_path):
+    import threading
+    db = str(tmp_path / "twin.sqlite")
+    DemoExecutionOlap(db).close()
+    barrier = threading.Barrier(2)
+    outcomes = {}
+
+    def worker(name):
+        service = DemoExecutionService(
+            _config(tmp_path, database_path=db), DemoExecutionOlap(db),
+            ZeroNetworkSink())
+        barrier.wait()
+        outcomes[name] = _process(service, _intent(object_id="ai-twin"))
+        service.olap.close()
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    results = sorted(o["outcome"] for o in outcomes.values())
+    assert results == ["would_be_order", "would_be_order"], outcomes
+    assert sorted(o.get("replayed", False) for o in outcomes.values()) == [
+        False, True]
+    check = DemoExecutionOlap(db)
+    assert check._con.execute(
+        "SELECT COUNT(*) FROM decisions").fetchone()[0] == 1
+    check.close()
+
+
+# ── Finding 054: conflicting concurrent reports cannot interleave ──
+
+def test_finding_054_concurrent_reports_cannot_create_illegal_sequence(tmp_path):
+    import threading
+    db = str(tmp_path / "seq.sqlite")
+    DemoExecutionOlap(db).close()
+    setup = DemoExecutionService(
+        _config(tmp_path, database_path=db), DemoExecutionOlap(db),
+        ZeroNetworkSink())
+    result = _process(setup, _intent(object_id="ai-054"))
+    units = abs(result["delta_units"])
+    setup.olap.close()
+    barrier = threading.Barrier(2)
+    errors = {}
+
+    def apply(name, state, filled, legs):
+        service = DemoExecutionService(
+            _config(tmp_path, database_path=db), DemoExecutionOlap(db),
+            ZeroNetworkSink())
+        report = _report(service, result, state, "requested",
+                         filled_units=filled, protection_legs=legs)
+        barrier.wait()
+        try:
+            service.apply_execution_event(report)
+        except DemoExecutionError as error:
+            errors[name] = str(error)
+        service.olap.close()
+
+    legs = [
+        ProtectionLegState(leg="stop_loss", broker_confirmed=True,
+                           covered_units=units),
+        ProtectionLegState(leg="take_profit", broker_confirmed=True,
+                           covered_units=units),
+    ]
+    threads = [
+        threading.Thread(target=apply, args=("fill", "filled", units, legs)),
+        threading.Thread(target=apply, args=("ack", "accepted", 0.0, [])),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(errors) == 1, errors  # exactly one loser, rejected cleanly
+    check = DemoExecutionOlap(db)
+    states = [row[0] for row in check._con.execute(
+        "SELECT state FROM lifecycle_events WHERE order_intent_id=? "
+        "ORDER BY seq", (result["order_intent_id"],)).fetchall()]
+    check.close()
+    assert states[0] == "requested" and len(states) == 2
+    from trading_contracts import is_legal_transition
+    assert is_legal_transition(states[0], states[1])
+
+
+# ── Finding 055: accepted kill resumes missing effects after a crash ──
+
+def test_finding_055_kill_effects_resume_after_crash(tmp_path, monkeypatch):
+    db = str(tmp_path / "crash.sqlite")
+    service = _service(tmp_path, database_path=db,
+                       daily_loss_budget_fraction=0.05)
+    _open_position(service, "ai-055")
+
+    def explode(intent):
+        raise RuntimeError("crash during effect emission")
+
+    monkeypatch.setattr(service.sink, "serialize", explode)
+    with pytest.raises(RuntimeError):
+        service.apply_owner_command(
+            _command(command="kill", nonce="n-055",
+                     exact_phrase="KILL ALL DEMO TRADING NOW"), now=NOW)
+    # acceptance + halt + journal survived the crash
+    assert service.olap.get_state("halt") == "kill"
+    assert service.olap.get_state("effects_due", "") != ""
+    service.olap.close()
+
+    reborn = DemoExecutionService(
+        _config(tmp_path, database_path=db), DemoExecutionOlap(db),
+        ZeroNetworkSink())
+    emitted = reborn.resume_pending_effects(now=NOW)
+    kinds = sorted(e["kind"] for e in emitted)
+    assert kinds == ["flatten"]  # the missing effect materialized
+    assert reborn.olap.get_state("effects_due", "") == ""
+
+
+# ── Finding 057: a policy cannot ride another asset's quote ──
+
+def test_finding_057_wrong_asset_for_instrument_rejects(tmp_path):
+    service = _service(tmp_path)
+    eth_intent = AssetIntent(
+        object_id="ai-057", as_of=NOW, valid_until=NOW + timedelta(hours=4),
+        producer={"name": "provider.mechanics", "version": "0"},
+        trace_id="t-1", cell_id="crypto:ETH/USD@1h:mech:policy",
+        asset_id="crypto:ETH/USD", action="target", target_exposure=0.5,
+        risk_geometry={"mode": "fixed_price", "stop_price": 0.99,
+                       "take_profit_price": 1.02},
+        artifact_hash=ARTIFACT,
+    )
+    out = service.process_intent(
+        eth_intent, _capability(), equity=100_000.0, reference_price=1.0,
+        instrument="USD.CAD", now=NOW + timedelta(seconds=1))
+    assert out["outcome"] == "rejected"
+    assert "asset_instrument_binding_violation" in out["reason"]
+
+
+def test_finding_057_unbound_asset_rejects(tmp_path):
+    service = _service(tmp_path)
+    unbound = AssetIntent(
+        object_id="ai-057b", as_of=NOW, valid_until=NOW + timedelta(hours=4),
+        producer={"name": "provider.mechanics", "version": "0"},
+        trace_id="t-1", cell_id="crypto:BTC/USD@1h:mech:policy",
+        asset_id="crypto:BTC/USD", action="target", target_exposure=0.5,
+        risk_geometry={"mode": "fixed_price", "stop_price": 0.99,
+                       "take_profit_price": 1.02},
+        artifact_hash=ARTIFACT,
+    )
+    out = service.process_intent(
+        unbound, _capability(), equity=100_000.0, reference_price=1.0,
+        instrument="USD.CAD", now=NOW + timedelta(seconds=1))
+    assert "asset_instrument_binding_violation" in out["reason"]
 
 
 # ── the structural zero-submission proof ──
