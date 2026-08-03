@@ -687,23 +687,31 @@ class L1OutboxConsumer:
             self.olap.advance_effect(effect_id, "submitted_pending_ack")
             self.olap.advance_effect(effect_id, "acknowledged")
             self.olap.advance_effect(effect_id, "terminal_flat")
-        # A flatten is risk-reducing and carries no protection legs by
-        # design; service.apply_execution_event would misread that as
-        # unprotected exposure (protection_covers_filled) and re-emit an
-        # emergency flatten. Append to the same chained ledger with the
-        # same continuity rule instead.
-        with self.olap.atomic_unit():
-            previous = self.olap.last_state(intent.object_id)
-            self.olap.append_lifecycle(ExecutionReportV2(
-                object_id=f"er-{intent.object_id}-filled", as_of=now,
-                producer=_PRODUCER, trace_id=intent.trace_id,
-                order_intent_id=intent.object_id,
-                attempt_id=f"attempt-{intent.object_id}",
-                bracket_role="parent", state="filled",
-                previous_state=previous,
-                requested_units=intent.delta_units,
-                filled_units=magnitude,
-            ))
+        # Finding 074: the reducing fill goes through the ONE accepted L0
+        # API; the service is intent-class-aware from its immutable
+        # decisions and applies exact reduction control instead of the
+        # entry protection contract.
+        fill_result = self.service.apply_execution_event(ExecutionReportV2(
+            object_id=f"er-{intent.object_id}-filled", as_of=now,
+            producer=_PRODUCER, trace_id=intent.trace_id,
+            order_intent_id=intent.object_id,
+            attempt_id=f"attempt-{intent.object_id}",
+            bracket_role="parent", state="filled",
+            previous_state=self.olap.last_state(intent.object_id),
+            requested_units=intent.delta_units,
+            filled_units=magnitude,
+        ))
+        if fill_result.get("emergency"):
+            with self.olap.atomic_unit():
+                self.olap.record_broker_fact(
+                    effect_id, "flatten_fill_violation",
+                    {"emergency": fill_result["emergency"]},
+                )
+            return {
+                "idempotency_key": key,
+                "state": self.olap.effect_row(effect_id)["state"],
+                "emergency": fill_result["emergency"],
+            }
         self.service.apply_position_close(target)
         if entry_effect is not None and entry_effect["state"] == "acknowledged":
             self.olap.advance_effect(entry_effect["effect_id"], "terminal_flat")

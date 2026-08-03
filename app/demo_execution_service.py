@@ -424,6 +424,27 @@ class DemoExecutionOlap:
         intent["_capability_evidence"] = row[1]
         return intent
 
+    def decision_intent_by_object_id(
+        self, order_intent_id: str
+    ) -> Optional[dict[str, Any]]:
+        """The immutable decision intent for one order-intent id (finding
+        074): the ledger, not the report, says what class an order was."""
+        row = self._con.execute(
+            "SELECT intent_json FROM decisions "
+            "WHERE intent_json IS NOT NULL "
+            "AND json_extract(intent_json, '$.object_id')=?",
+            (order_intent_id,),
+        ).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    def exposure_units(self, exposure_id: str) -> Optional[float]:
+        row = self._con.execute(
+            "SELECT units_open FROM exposures WHERE exposure_id=? "
+            "AND state='open'",
+            (exposure_id,),
+        ).fetchone()
+        return None if row is None else float(row[0])
+
     def release(self, reservation_id: str, terminal_state: str) -> None:
         if terminal_state not in ("released", "consumed"):
             raise DemoExecutionError("reservation terminal state invalid")
@@ -1201,12 +1222,38 @@ class DemoExecutionService:
                     self.olap.release(reservation_id, "consumed")
                     result["reservation"] = "consumed"
                     result["exposure"] = "opened"
-        if report.state in ("filled", "partially_filled") and \
-                not protection_covers_filled(report):
-            self.olap.set_state("halt", "hold")
-            emitted = self._emit_flatten_all(report.trace_id, _utc_now())
-            result["emergency"] = "unprotected_exposure_hold_and_flatten"
-            result["emitted"] = emitted
+        if report.state in ("filled", "partially_filled"):
+            decision = self.olap.decision_intent_by_object_id(
+                report.order_intent_id
+            )
+            intent_class = None if decision is None else decision.get(
+                "intent_class"
+            )
+            if intent_class == "risk_reducing":
+                # Finding 074: a reduction carries no protection legs by
+                # design; its control is exact reduction — the fill may
+                # never exceed the open target exposure (zero-crossing is
+                # additionally proven upstream before submission). A
+                # violation holds WITHOUT emitting more flatten intents:
+                # an incorrect flatten must not recursively author others.
+                target = decision.get("reduce_target_order_intent_id")
+                open_units = (
+                    None if target is None
+                    else self.olap.exposure_units(f"exp-{target}")
+                )
+                if open_units is None or (
+                    report.filled_units > abs(open_units) + 1e-9
+                ):
+                    self.olap.set_state("halt", "hold")
+                    result["emergency"] = "risk_reduction_violation_hold"
+            elif not protection_covers_filled(report):
+                # risk-increasing, or unknown provenance treated
+                # conservatively as an unprotected entry (accepted behavior
+                # preserved byte-for-byte in effect)
+                self.olap.set_state("halt", "hold")
+                emitted = self._emit_flatten_all(report.trace_id, _utc_now())
+                result["emergency"] = "unprotected_exposure_hold_and_flatten"
+                result["emitted"] = emitted
         return result
 
     def apply_position_close(self, order_intent_id: str) -> dict[str, Any]:

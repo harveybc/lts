@@ -376,6 +376,83 @@ def test_foreign_positions_never_count_toward_the_flatten(env):
     assert (ACCOUNT, "FUT", 7000.0) in survivors       # untouched
 
 
+# ── F0.5 (finding 074): one intent-class-aware L0 lifecycle path ──
+
+def _flatten_decision_count(env):
+    return env.olap._con.execute(
+        "SELECT COUNT(*) FROM decisions WHERE outcome='would_be_flatten'"
+    ).fetchone()[0]
+
+
+def test_flatten_fill_routes_through_accepted_api_without_recursion(env):
+    effect_id, order_ids = _filled_long_with_pending_flatten(env)
+    assert _flatten_decision_count(env) == 1
+    results = env.consumer.consume_flattens(now=NOW + timedelta(seconds=5))
+    assert results[0]["state"] == "terminal_flat"
+    assert env.olap.get_state("halt", "none") == "none"
+    assert _flatten_decision_count(env) == 1           # no recursive emission
+    # the reducing fill lives in the ONE chained lifecycle ledger via the
+    # accepted service API
+    flatten_intent_id = env.olap._con.execute(
+        "SELECT json_extract(intent_json, '$.object_id') FROM decisions "
+        "WHERE outcome='would_be_flatten'"
+    ).fetchone()[0]
+    assert env.olap.last_state(flatten_intent_id) == "filled"
+    assert env.olap.open_exposures() == []
+
+
+def test_reducing_overfill_holds_without_flatten_storm(env):
+    from trading_contracts import ExecutionReportV2, OrderIntentV2
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 20000.0)
+    env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    target = env.olap.effect_contract(effect_id)["intent_object_id"]
+    rogue = OrderIntentV2(
+        object_id="oi2-rogue-flatten", as_of=NOW + timedelta(seconds=4),
+        producer={"name": "t", "version": "0"}, trace_id="t-rogue",
+        account_ref=FINGERPRINT, asset_id="fx:EUR/USD", venue="ibkr_paper",
+        instrument="EUR.USD", intent_class="risk_reducing",
+        reduce_action="flatten", reduce_target_order_intent_id=target,
+        order_type="market", delta_units=-25000.0,
+        idempotency_key="flatten:rogue",
+    )
+    env.olap.record_decision(
+        "flatten:rogue", "would_be_flatten", None,
+        rogue.model_dump_json(), None,
+    )
+    result = env.service.apply_execution_event(ExecutionReportV2(
+        object_id="er-rogue", as_of=NOW + timedelta(seconds=5),
+        producer={"name": "t", "version": "0"}, trace_id="t-rogue",
+        order_intent_id="oi2-rogue-flatten", attempt_id="attempt-rogue",
+        bracket_role="parent", state="filled",
+        requested_units=-25000.0, filled_units=25000.0,
+    ))
+    assert result["emergency"] == "risk_reduction_violation_hold"
+    assert env.olap.get_state("halt") == "hold"
+    assert _flatten_decision_count(env) == 1           # NO flatten storm
+    assert "emitted" not in result
+
+
+def test_unknown_provenance_fill_remains_conservatively_unprotected(env):
+    from trading_contracts import ExecutionReportV2
+    result = env.service.apply_execution_event(ExecutionReportV2(
+        object_id="er-ghost", as_of=NOW + timedelta(seconds=5),
+        producer={"name": "t", "version": "0"}, trace_id="t-ghost",
+        order_intent_id="oi2-ghost", attempt_id="attempt-ghost",
+        bracket_role="parent", state="filled",
+        requested_units=1000.0, filled_units=1000.0,
+    ))
+    assert result["emergency"] == "unprotected_exposure_hold_and_flatten"
+    assert env.olap.get_state("halt") == "hold"
+
+
+def test_l1_no_longer_appends_lifecycle_directly():
+    from pathlib import Path
+    import app.ibkr_l1_outbox as outbox_module
+    source = Path(outbox_module.__file__).read_text()
+    assert "append_lifecycle" not in source            # finding 074 removed
+
+
 # ── schema migration: additive, never destructive ──
 
 def test_l0_ledger_migrates_additively_to_l1_schema(tmp_path):
