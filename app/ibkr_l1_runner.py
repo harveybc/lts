@@ -168,6 +168,31 @@ class IbkrL1Runner:
         olap: L1ExecutionOlap = runtime["olap"]
         consumer: L1OutboxConsumer = runtime["consumer"]
 
+        try:
+            return self._active_tick(
+                olap, consumer, heartbeat, alerts, events, now
+            )
+        except Exception as error:  # noqa: BLE001 — the runner must stay
+            # observable: a non-I/O defect becomes a journaled degraded
+            # heartbeat, never a silent crash (auditor fixture 2026-08-03)
+            heartbeat.update({
+                "state": "degraded_error",
+                "error": f"{type(error).__name__}: {error}",
+                "alerts": alerts + [f"tick_error:{type(error).__name__}"],
+                "events": events,
+            })
+            self._write_heartbeat(heartbeat)
+            return heartbeat
+
+    def _active_tick(
+        self,
+        olap: L1ExecutionOlap,
+        consumer: L1OutboxConsumer,
+        heartbeat: dict[str, Any],
+        alerts: list[str],
+        events: list[str],
+        now: datetime,
+    ) -> dict[str, Any]:
         # 1. crash recovery first: classify and re-acknowledge from facts
         for outcome in consumer.resume(now=now):
             if outcome.get("classification") == "aborted_no_call":

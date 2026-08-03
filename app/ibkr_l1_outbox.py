@@ -537,6 +537,26 @@ class L1OutboxConsumer:
         idem = self.olap.reservation_idempotency(reservation_id)
         return self.olap.effect_by_key(idem) if idem else None
 
+    @staticmethod
+    def exact_reduction_units(
+        position: float, intent_delta: float, *, epsilon: float = 1e-9
+    ) -> tuple[Optional[float], Optional[str]]:
+        """The pure finding-070 predicate: a reduction executes only when
+        the PROVEN position agrees exactly with the immutable intent delta;
+        the returned units equal the position, so the result is exactly
+        zero — never resized, never crossed."""
+        if abs(position) <= epsilon:
+            return None, (
+                "no_matching_position_to_flatten_while_intent_expects_"
+                f"{-intent_delta}"
+            )
+        if abs(position + intent_delta) > epsilon:
+            return None, (
+                f"position_{position}_disagrees_with_immutable_intent_delta_"
+                f"{intent_delta}_never_resized"
+            )
+        return position, None
+
     def _refuse_flatten(self, effect_id: str, reason: str) -> dict[str, Any]:
         """A flatten that cannot PROVE exact account, contract and position
         agreement refuses before any broker call, journals, and holds. It
@@ -593,26 +613,13 @@ class L1OutboxConsumer:
             ):
                 continue
             position += float(fact.get("units", 0.0))
-        epsilon = 1e-9
-        if abs(position) <= epsilon:
-            result = self._refuse_flatten(
-                effect_id,
-                "no_matching_position_to_flatten_while_intent_expects_"
-                f"{-intent.delta_units}",
-            )
+        flatten_units, refusal = self.exact_reduction_units(
+            position, intent.delta_units
+        )
+        if refusal is not None:
+            result = self._refuse_flatten(effect_id, refusal)
             result["idempotency_key"] = key
             return result
-        if abs(position + intent.delta_units) > epsilon:
-            result = self._refuse_flatten(
-                effect_id,
-                f"position_{position}_disagrees_with_immutable_intent_delta_"
-                f"{intent.delta_units}_never_resized",
-            )
-            result["idempotency_key"] = key
-            return result
-        # quantity and side derive from the PROVEN position; agreement with
-        # the immutable intent is exact, so zero-crossing is impossible
-        flatten_units = position
 
         try:
             # orphaned protective children must not survive the position

@@ -453,6 +453,22 @@ def test_l1_no_longer_appends_lifecycle_directly():
     assert "append_lifecycle" not in source            # finding 074 removed
 
 
+def test_kill_allows_only_exact_reduction_and_never_clears_halt(env):
+    effect_id, order_ids = _filled_long_with_pending_flatten(env)
+    env.olap.set_state("halt", "kill")                 # owner kill mid-flight
+    results = env.consumer.consume_flattens(now=NOW + timedelta(seconds=5))
+    assert results[0]["state"] == "terminal_flat"      # exact reduction runs
+    assert env.olap.get_state("halt") == "kill"        # never cleared
+    # no new risk under kill: L0 itself refuses the decision at the source
+    env.mint(now=NOW + timedelta(seconds=6))
+    decision = env.decide(_asset_intent(object_id="ai-f0-kill"),
+                          now=NOW + timedelta(seconds=7))
+    assert decision["outcome"] == "rejected"
+    assert "halted:kill" in decision["reason"]
+    assert env.consumer.consume_entries(
+        quote=QUOTE, now=NOW + timedelta(seconds=8)) == []
+
+
 # ── schema migration: additive, never destructive ──
 
 def test_l0_ledger_migrates_additively_to_l1_schema(tmp_path):

@@ -331,3 +331,20 @@ def test_heartbeat_write_is_atomic(env):
 
 def test_run_once_exits_cleanly(env):
     assert env.runner.run(once=True) == 0
+
+
+def test_runner_survives_non_io_defect_observably(env):
+    """Auditor fixture 2026-08-03: a non-I/O exception in the consumer must
+    become a degraded heartbeat, never a silent crash."""
+    env.runner.tick(now=NOW)                           # builds the runtime
+
+    def _defect(*args, **kwargs):
+        raise ValueError("adapter defect, not an I/O failure")
+
+    env.runner._runtime["consumer"].consume_entries = _defect
+    heartbeat = env.runner.tick(now=NOW + timedelta(seconds=1))
+    assert heartbeat["state"] == "degraded_error"
+    assert "tick_error:ValueError" in heartbeat["alerts"]
+    assert "adapter defect" in heartbeat["error"]
+    on_disk = json.loads(Path(env.config["heartbeat_path"]).read_text())
+    assert on_disk["state"] == "degraded_error"        # observable on disk
