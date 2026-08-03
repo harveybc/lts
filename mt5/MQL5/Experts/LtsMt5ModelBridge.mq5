@@ -665,7 +665,7 @@ string BarJson(const string symbol, const MqlRates &bar)
       "\"high\":" + DoubleToString(bar.high, 10) + ","
       "\"low\":" + DoubleToString(bar.low, 10) + ","
       "\"close\":" + DoubleToString(bar.close, 10) + ","
-      "\"volume\":" + DoubleToString((double)bar.tick_volume, 0)
+      "\"volume\":" + DoubleToString((double)bar.tick_volume, 0) +
       "}";
   }
 

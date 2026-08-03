@@ -34,6 +34,14 @@ def test_execution_ea_source_keeps_demo_native_protection_contract():
     assert "PositionGetInteger(POSITION_MAGIC) == InpMagic" in source
 
 
+def test_execution_ea_bar_json_concatenates_closing_brace():
+    source = EA_PATH.read_text(encoding="utf-8")
+    assert (
+        '"\\\"volume\\\":" + DoubleToString((double)bar.tick_volume, 0) +\n'
+        '      "}";'
+    ) in source
+
+
 def _config(tmp_path):
     return Mt5ExecutionConfig(
         database_path=tmp_path / "mt5.sqlite", secret_env="SECRET",
