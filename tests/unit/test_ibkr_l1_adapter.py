@@ -1,12 +1,13 @@
-"""Adversarial tests for the IBKR Paper L1 adapter (auditor's mandatory list).
+"""Adversarial tests for the IBKR Paper L1 venue binding (post-063/064/067).
 
-Sockets are booby-trapped module-wide: every test proves the adapter reaches
-no network unless a valid authorization exists AND dry_run is disabled — and
-no test here ever disables it.
+Sockets are booby-trapped module-wide. The former activation-phrase
+authorization and the lying ``submit_bracket`` no longer exist: submission
+lives only in ``BracketExecutor`` (see ``test_ibkr_l1_effects.py``) and
+authority only in owner capabilities (see ``test_ibkr_l1_capability.py``).
 """
 import json
 import socket
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -15,7 +16,6 @@ from trading_contracts import OrderIntentV2, ProtectiveBracket, RiskEnvelope
 
 from app.ibkr_l1_adapter import (
     IbkrPaperL1Sink,
-    L1Authorization,
     L1AuthorizationError,
     L1ExecutionError,
     L1Profile,
@@ -24,7 +24,6 @@ from app.ibkr_l1_adapter import (
 )
 
 NOW = datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc)
-PHRASE = "ACTIVATE L1 CANARY IBKR PAPER NOW"
 CAP_HASH = "sha256:" + "c" * 64
 
 
@@ -37,40 +36,26 @@ def _no_network(monkeypatch):
     monkeypatch.setattr(socket, "create_connection", _explode)
 
 
-class FakeLedger:
-    def __init__(self):
-        self.tokens = set()
-        self.journal = []
-
-    def activation_token_seen(self, token):
-        return token in self.tokens
-
-    def burn_activation_token(self, token, **kw):
-        self.tokens.add(token)
-
-    def journal_submission(self, **kw):
-        self.journal.append(kw)
-
-
 def _profile_payload(**overrides):
     payload = {
+        "schema_version": "lts.ibkr.paper.l1.profile.v2",
         "venue": "ibkr_paper",
-        "account_fingerprint": "86aa086401855219",
         "environment": "paper",
         "host": "127.0.0.1",
         "port": 7497,
         "client_id": 77,
+        "account_fingerprint_algorithm": "account_id_sha256_16",
+        "account_fingerprint": "c0ff137a3cc1a363",
         "instrument": "EUR.USD",
         "asset_id": "fx:EUR/USD",
-        "activation_phrase": PHRASE,
         "max_orders_this_activation": 2,
-        "quantity": 20000.0,
-        "stop_distance_price": 0.0020,
-        "take_profit_distance_price": 0.0040,
+        "quantity_ceiling": 20000.0,
+        "stop_distance_price_max": 0.0020,
+        "take_profit_distance_price_max": 0.0040,
         "max_spread_price": 0.0003,
     }
     payload.update(overrides)
-    return payload
+    return {k: v for k, v in payload.items() if v is not None}
 
 
 def _profile(tmp_path, **overrides):
@@ -79,21 +64,12 @@ def _profile(tmp_path, **overrides):
     return L1Profile.load(path)
 
 
-def _auth(profile, phrase=PHRASE, token="tok-1", issued_at=None):
-    # the validity window is wall-clock by design (a stale authorization must
-    # expire in reality, not in fixture time), so fresh auths use real now
-    return L1Authorization(
-        profile=profile, supplied_phrase=phrase, token=token,
-        issued_at=issued_at or datetime.now(timezone.utc),
-    )
-
-
 def _intent(instrument="EUR.USD", asset="fx:EUR/USD", units=20000.0,
             sl=1.0850, tp=1.0910):
     return OrderIntentV2(
         object_id="oi2-l1-1", as_of=NOW,
         producer={"name": "lts.demo_execution_service", "version": "0.2.0"},
-        trace_id="t-l1", account_ref="86aa086401855219", asset_id=asset,
+        trace_id="t-l1", account_ref="c0ff137a3cc1a363", asset_id=asset,
         venue="ibkr_paper", instrument=instrument,
         intent_class="risk_increasing", order_type="market",
         delta_units=units,
@@ -106,11 +82,33 @@ def _intent(instrument="EUR.USD", asset="fx:EUR/USD", units=20000.0,
     )
 
 
-# ── profile and authorization: the gate ──
+# ── strict profile v2: finding 067 ──
+
+def test_profile_v2_loads_and_hashes(tmp_path):
+    profile = _profile(tmp_path)
+    assert profile.venue == "ibkr_paper" and profile.port == 7497
+    assert profile.account_fingerprint_algorithm == "account_id_sha256_16"
+    assert len(profile.profile_hash) == 64
+
+
+def test_profile_rejects_wrong_schema_version(tmp_path):
+    with pytest.raises(L1AuthorizationError, match="schema"):
+        _profile(tmp_path, schema_version="lts.ibkr.paper.l1.profile.v1")
+
 
 def test_profile_rejects_live_environment(tmp_path):
     with pytest.raises(L1AuthorizationError, match="paper"):
         _profile(tmp_path, environment="live")
+
+
+def test_profile_rejects_arbitrary_venue(tmp_path):
+    with pytest.raises(L1AuthorizationError, match="venue"):
+        _profile(tmp_path, venue="anything")
+
+
+def test_profile_rejects_non_loopback_host(tmp_path):
+    with pytest.raises(L1AuthorizationError, match="loopback"):
+        _profile(tmp_path, host="0.0.0.0")
 
 
 def test_profile_rejects_non_paper_port(tmp_path):
@@ -118,44 +116,82 @@ def test_profile_rejects_non_paper_port(tmp_path):
         _profile(tmp_path, port=7496)
 
 
-def test_profile_rejects_order_budget_above_two(tmp_path):
-    with pytest.raises(L1AuthorizationError, match="at most 2"):
-        _profile(tmp_path, max_orders_this_activation=5)
+@pytest.mark.parametrize("client_id", [0, -1, 1000])
+def test_profile_rejects_unbounded_client_id(tmp_path, client_id):
+    with pytest.raises(L1AuthorizationError, match="client_id"):
+        _profile(tmp_path, client_id=client_id)
 
 
-def test_wrong_phrase_refuses_and_opens_no_socket(tmp_path):
-    profile = _profile(tmp_path)
-    with pytest.raises(L1AuthorizationError, match="phrase"):
-        IbkrPaperL1Sink(_auth(profile, phrase="activate l1 canary ibkr paper now"),
-                        ledger=FakeLedger())
+@pytest.mark.parametrize("budget", [0, 3, -1])
+def test_profile_rejects_order_budget_outside_one_or_two(tmp_path, budget):
+    with pytest.raises(L1AuthorizationError, match="1 or 2"):
+        _profile(tmp_path, max_orders_this_activation=budget)
 
 
-def test_missing_token_refuses(tmp_path):
-    profile = _profile(tmp_path)
-    with pytest.raises(L1AuthorizationError, match="token"):
-        IbkrPaperL1Sink(_auth(profile, token=""), ledger=FakeLedger())
+@pytest.mark.parametrize("key,value", [
+    ("quantity_ceiling", 0.0),
+    ("quantity_ceiling", -1.0),
+    ("quantity_ceiling", float("inf")),
+    ("stop_distance_price_max", -2.0),
+    ("take_profit_distance_price_max", 0.0),
+    ("max_spread_price", -4.0),
+])
+def test_profile_rejects_non_positive_or_non_finite_limits(tmp_path, key, value):
+    with pytest.raises(L1AuthorizationError, match=key):
+        _profile(tmp_path, **{key: value})
 
 
-def test_duplicate_activation_refuses_second_use(tmp_path):
-    profile = _profile(tmp_path)
-    ledger = FakeLedger()
-    IbkrPaperL1Sink(_auth(profile), ledger=ledger)
-    with pytest.raises(L1AuthorizationError, match="single-use"):
-        IbkrPaperL1Sink(_auth(profile), ledger=ledger)
+def test_profile_rejects_sanity_ceiling_breach(tmp_path):
+    with pytest.raises(L1AuthorizationError, match="sanity ceiling"):
+        _profile(tmp_path, quantity_ceiling=2_000_000.0)
 
 
-def test_expired_authorization_refuses(tmp_path):
-    profile = _profile(tmp_path)
-    stale = _auth(profile,
-                  issued_at=datetime.now(timezone.utc) - timedelta(hours=2))
-    with pytest.raises(L1AuthorizationError, match="validity window"):
-        IbkrPaperL1Sink(stale, ledger=FakeLedger())
+def test_profile_rejects_wrong_fingerprint_algorithm(tmp_path):
+    with pytest.raises(L1AuthorizationError, match="algorithm"):
+        _profile(tmp_path, account_fingerprint_algorithm="account_set_sha256_16")
+
+
+@pytest.mark.parametrize("fp", ["", "xyz", "C0FF137A3CC1A363", "c0ff137a3cc1a3"])
+def test_profile_rejects_malformed_fingerprint(tmp_path, fp):
+    with pytest.raises(L1AuthorizationError, match="fingerprint"):
+        _profile(tmp_path, account_fingerprint=fp)
+
+
+@pytest.mark.parametrize("instrument", ["EURUSD", "EUR/USD", "eur.usd", "E1.USD"])
+def test_profile_rejects_malformed_instrument(tmp_path, instrument):
+    with pytest.raises(L1AuthorizationError, match="instrument"):
+        _profile(tmp_path, instrument=instrument)
+
+
+def test_profile_rejects_asset_instrument_mismatch(tmp_path):
+    with pytest.raises(L1AuthorizationError, match="asset_id"):
+        _profile(tmp_path, asset_id="fx:USD/CAD")
+
+
+def test_profile_rejects_unknown_keys(tmp_path):
+    with pytest.raises(L1AuthorizationError, match="unknown keys"):
+        _profile(tmp_path, activation_phrase="ANY PHRASE AT ALL")
+
+
+def test_profile_rejects_missing_keys(tmp_path):
+    payload = _profile_payload()
+    del payload["max_spread_price"]
+    path = tmp_path / "p.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(L1AuthorizationError, match="missing"):
+        L1Profile.load(path)
 
 
 def test_edited_profile_changes_hash(tmp_path):
     first = _profile(tmp_path)
-    second = _profile(tmp_path, quantity=25000.0)
+    second = _profile(tmp_path, quantity_ceiling=25000.0)
     assert first.profile_hash != second.profile_hash
+
+
+def test_repository_phrase_authorization_no_longer_exists():
+    import app.ibkr_l1_adapter as adapter
+    assert not hasattr(adapter, "L1Authorization")
+    assert not hasattr(IbkrPaperL1Sink, "submit_bracket")
 
 
 # ── bracket construction: the protection contract in venue terms ──
@@ -298,63 +334,18 @@ def test_child_acknowledged_before_parent_is_not_protected():
     assert verdict["legs"]["stop_loss"]["acknowledged"] is True
 
 
-# ── submission gating: identity, budget, journal, dry-run ──
-
-def _sink(tmp_path, ledger=None, **profile_kw):
-    profile = _profile(tmp_path, **profile_kw)
-    return IbkrPaperL1Sink(_auth(profile), ledger=ledger or FakeLedger())
-
-
-def test_wrong_venue_intent_refuses(tmp_path):
-    sink = _sink(tmp_path)
-    intent = _intent()
-    bad = intent.model_copy(update={"venue": "alpaca_paper"})
-    with pytest.raises(L1ExecutionError, match="venue"):
-        sink.submit_bracket(bad, _plan())
-
-
-def test_wrong_instrument_intent_refuses(tmp_path):
-    sink = _sink(tmp_path)
-    with pytest.raises(L1ExecutionError, match="instrument"):
-        sink.submit_bracket(_intent(instrument="USD.CAD"), _plan())
-
-
-def test_wrong_asset_intent_refuses(tmp_path):
-    sink = _sink(tmp_path)
-    bad = _intent(asset="fx:USD/CAD")
-    with pytest.raises(L1ExecutionError, match="asset"):
-        sink.submit_bracket(bad, _plan())
-
-
-def test_order_budget_is_enforced(tmp_path):
-    sink = _sink(tmp_path, max_orders_this_activation=1)
-    sink.submissions = 1
-    with pytest.raises(L1AuthorizationError, match="budget exhausted"):
-        sink.submit_bracket(_intent(), _plan())
-
-
-def test_dry_run_journals_but_never_submits(tmp_path):
-    ledger = FakeLedger()
-    sink = _sink(tmp_path, ledger=ledger)
-    result = sink.submit_bracket(_intent(), _plan())
-    assert result["submitted"] is False and result["reason"] == "dry_run"
-    assert sink.network_submissions == 0
-    assert len(ledger.journal) == 1                    # journaled before effect
-    assert ledger.journal[0]["order_ids"] == [1000, 1001, 1002]
-
-
-def test_live_mode_without_connection_refuses(tmp_path):
-    sink = _sink(tmp_path)
-    sink.dry_run = False
-    with pytest.raises(L1ExecutionError, match="not connected"):
-        sink.submit_bracket(_intent(), _plan())
-    assert sink.network_submissions == 0
-
+# ── the serialize sink: same service contract as L0 ──
 
 def test_sink_interface_matches_l0_shape(tmp_path):
     from app.demo_execution_service import ZeroNetworkSink
     l0 = ZeroNetworkSink().serialize(_intent())
-    l1 = _sink(tmp_path).serialize(_intent())
+    l1 = IbkrPaperL1Sink(_profile(tmp_path)).serialize(_intent())
     assert set(l0) == set(l1)                          # same service contract
     assert l1["bracket"]["transmit_rule"] == "parent_and_children_atomic"
-    assert l1["adapter"].endswith("l1.v1")
+    assert l1["adapter"].endswith("l1.v2")
+
+
+def test_sink_holds_no_write_capable_connection_path(tmp_path):
+    sink = IbkrPaperL1Sink(_profile(tmp_path))
+    assert not hasattr(sink, "connect")            # only connect_readonly exists
+    assert hasattr(sink, "connect_readonly")

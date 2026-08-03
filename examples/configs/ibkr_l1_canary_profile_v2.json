@@ -1,0 +1,17 @@
+{
+  "schema_version": "lts.ibkr.paper.l1.profile.v2",
+  "venue": "ibkr_paper",
+  "environment": "paper",
+  "host": "127.0.0.1",
+  "port": 7497,
+  "client_id": 77,
+  "account_fingerprint_algorithm": "account_id_sha256_16",
+  "account_fingerprint": "c0ff137a3cc1a363",
+  "instrument": "EUR.USD",
+  "asset_id": "fx:EUR/USD",
+  "max_orders_this_activation": 2,
+  "quantity_ceiling": 20000.0,
+  "stop_distance_price_max": 0.002,
+  "take_profit_distance_price_max": 0.004,
+  "max_spread_price": 0.0003
+}

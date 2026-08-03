@@ -1,28 +1,28 @@
-"""IBKR Paper L1 execution adapter — the first write-capable venue path.
+"""IBKR Paper L1 venue binding: strict profile, bracket plan, serialize sink.
 
-Built behind the accepted L0 sink interface (`ZeroNetworkSink`), so the
-demo execution service, its risk engine, its contracts and its ledger are
-reused unchanged. This module adds exactly one capability the L0 sink
-lacks: transmitting a protected bracket to IBKR Paper.
+Corrected after audit `AUDIT_SATOSHI_II_IBKR_L1_ADAPTER_2026_08_03.md`:
 
-Fail-closed construction (auditor order 2026-08-02):
+- finding 063: the former ``submit_bracket()`` reported success without any
+  broker call. It is REMOVED. The only submission path is
+  ``app.ibkr_l1_executor.BracketExecutor``, which journals before every
+  broker call and never returns success without acknowledged broker facts.
+- finding 064: the former ``L1Authorization`` (repository phrase plus an
+  arbitrary local token) is REMOVED. Authority is a separately minted,
+  short-lived, single-use owner capability (``app.ibkr_l1_capability``)
+  consumed atomically in the durable L0 ledger.
+- finding 067: ``L1Profile`` is now a strict v2 schema: exact key set,
+  exact Paper venue and loopback host, bounded client id, one-or-two entry
+  budget, positive finite numeric ceilings, labeled fingerprint algorithm,
+  exact asset/instrument binding. Every retained field is enforced by the
+  executor/consumer path or was removed.
+- finding 068: the fingerprint algorithm is explicit —
+  ``account_id_sha256_16`` is ``sha256(account_id)[:16]`` of the single
+  connected account, never the double-hashed account-set digest.
 
-- the adapter cannot be instantiated without an `L1Authorization` whose
-  profile hash, venue, account and exact owner phrase all match, and whose
-  single-use token has not been consumed;
-- no LLM, Hermes process or chat text can construct one: the phrase is
-  compared against a versioned profile on disk and the token is burned in
-  the ledger before any socket exists;
-- the bracket is built in full BEFORE any transmission, in the official
-  TWS order: parent `Transmit=False`, take-profit child `Transmit=False`,
-  stop-loss child `Transmit=True` last — the final child transmits the
-  whole group atomically;
-- broker acknowledgement of parent AND both protective children is a hard
-  post-submit condition; anything missing, ambiguous or stale triggers
-  deterministic cancel/flatten plus a global hold;
-- every side effect is journaled before it is attempted (the accepted 055
-  pattern extended across broker calls), so a crash mid-flight is resumable
-  from the ledger rather than from memory.
+This module still owns the deterministic bracket translation
+(``build_bracket``) with the official TWS transmission order:
+parent ``Transmit=False``, take-profit ``Transmit=False``, stop-loss
+``Transmit=True`` last.
 
 References:
 https://interactivebrokers.github.io/tws-api/bracket_order.html
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +41,18 @@ from typing import Any, Mapping, Optional, Protocol
 from trading_contracts import OrderIntentV2
 
 IB_ASYNC_VERSION = "2.1.0"
-ADAPTER_VERSION = "lts.ibkr.paper.l1.v1"
+ADAPTER_VERSION = "lts.ibkr.paper.l1.v2"
+PROFILE_SCHEMA_VERSION = "lts.ibkr.paper.l1.profile.v2"
+FINGERPRINT_ALGORITHM = "account_id_sha256_16"
+
+_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{16}$")
+_INSTRUMENT_RE = re.compile(r"^[A-Z]{3}\.[A-Z]{3}$")
+
+# Canary-scoped sanity ceilings: a profile beyond these is a typo, not a
+# bigger canary. Raising them is an owner decision on a new profile version.
+_MAX_QUANTITY_CEILING = 1_000_000.0
+_MAX_DISTANCE_PRICE = 0.1
+_MAX_SPREAD_PRICE = 0.01
 
 
 class L1AuthorizationError(RuntimeError):
@@ -64,97 +75,143 @@ def _hash(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode()).hexdigest()
 
 
+def _positive_finite(payload: Mapping[str, Any], key: str, maximum: float) -> float:
+    try:
+        value = float(payload[key])
+    except (TypeError, ValueError) as exc:
+        raise L1AuthorizationError(f"L1 profile {key} is not numeric") from exc
+    if not value > 0.0 or value != value or value in (float("inf"), float("-inf")):
+        raise L1AuthorizationError(f"L1 profile {key} must be positive and finite")
+    if value > maximum:
+        raise L1AuthorizationError(
+            f"L1 profile {key}={value} exceeds the canary sanity ceiling {maximum}"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class L1Profile:
-    """The versioned, owner-ratified activation profile.
+    """Versioned venue/account binding. Contains NO authorization secret.
 
-    Loaded from disk; its hash is bound into the authorization, so editing
-    the file after the owner reads it invalidates any pending activation.
+    Enforcement map (finding 067 — every field enforced or removed):
+
+    - venue/environment/host/port/client_id: connection gate here and in the
+      capability validator;
+    - account_fingerprint(+algorithm): connect-time identity check and
+      capability binding;
+    - instrument/asset_id: intent binding in the outbox consumer;
+    - max_orders_this_activation: entry budget in the outbox consumer;
+    - quantity_ceiling: hard ceiling in executor and capability validator
+      (never a sizing input — sizing is L0 ``plan_units``);
+    - stop_distance_price_max / take_profit_distance_price_max: geometry
+      ceilings in the outbox consumer;
+    - max_spread_price: quote-quality gate in the outbox consumer and the
+      connected preflight.
     """
 
+    schema_version: str
     venue: str
-    account_fingerprint: str
     environment: str
     host: str
     port: int
     client_id: int
+    account_fingerprint_algorithm: str
+    account_fingerprint: str
     instrument: str
     asset_id: str
-    activation_phrase: str
     max_orders_this_activation: int
-    quantity: float
-    stop_distance_price: float
-    take_profit_distance_price: float
+    quantity_ceiling: float
+    stop_distance_price_max: float
+    take_profit_distance_price_max: float
     max_spread_price: float
     profile_hash: str
+
+    _REQUIRED = (
+        "schema_version", "venue", "environment", "host", "port", "client_id",
+        "account_fingerprint_algorithm", "account_fingerprint", "instrument",
+        "asset_id", "max_orders_this_activation", "quantity_ceiling",
+        "stop_distance_price_max", "take_profit_distance_price_max",
+        "max_spread_price",
+    )
 
     @classmethod
     def load(cls, path: str | Path) -> "L1Profile":
         payload = json.loads(Path(path).read_text())
-        required = [
-            "venue", "account_fingerprint", "environment", "host", "port",
-            "client_id", "instrument", "asset_id", "activation_phrase",
-            "max_orders_this_activation", "quantity", "stop_distance_price",
-            "take_profit_distance_price", "max_spread_price",
-        ]
-        missing = [key for key in required if key not in payload]
+        if not isinstance(payload, dict):
+            raise L1AuthorizationError("L1 profile must be a JSON object")
+        missing = [key for key in cls._REQUIRED if key not in payload]
         if missing:
             raise L1AuthorizationError(f"L1 profile missing keys: {missing}")
+        unknown = sorted(set(payload) - set(cls._REQUIRED))
+        if unknown:
+            raise L1AuthorizationError(f"L1 profile has unknown keys: {unknown}")
+        if payload["schema_version"] != PROFILE_SCHEMA_VERSION:
+            raise L1AuthorizationError(
+                f"L1 profile schema must be {PROFILE_SCHEMA_VERSION!r}"
+            )
+        if payload["venue"] != "ibkr_paper":
+            raise L1AuthorizationError("L1 profile venue must be 'ibkr_paper'")
         if payload["environment"] != "paper":
             raise L1AuthorizationError(
                 "L1 profile environment must be 'paper'; live is never an L1 concept"
             )
+        if payload["host"] != "127.0.0.1":
+            raise L1AuthorizationError("L1 profile host must be loopback 127.0.0.1")
         if int(payload["port"]) != 7497:
             raise L1AuthorizationError(
                 "L1 profile port must be the TWS Paper port 7497"
             )
-        if int(payload["max_orders_this_activation"]) > 2:
+        client_id = int(payload["client_id"])
+        if not 1 <= client_id <= 999:
+            raise L1AuthorizationError("L1 profile client_id must be in [1, 999]")
+        if payload["account_fingerprint_algorithm"] != FINGERPRINT_ALGORITHM:
             raise L1AuthorizationError(
-                "the canary activation permits at most 2 orders (one long, one short)"
+                f"L1 profile fingerprint algorithm must be {FINGERPRINT_ALGORITHM!r}"
+                " (finding 068: never the double-hashed account-set digest)"
+            )
+        fingerprint = str(payload["account_fingerprint"])
+        if not _FINGERPRINT_RE.match(fingerprint):
+            raise L1AuthorizationError(
+                "L1 profile account_fingerprint must be 16 lowercase hex chars"
+            )
+        instrument = str(payload["instrument"])
+        if not _INSTRUMENT_RE.match(instrument):
+            raise L1AuthorizationError(
+                "L1 profile instrument must be an FX pair like 'EUR.USD'"
+            )
+        base, quote = instrument.split(".")
+        if payload["asset_id"] != f"fx:{base}/{quote}":
+            raise L1AuthorizationError(
+                "L1 profile asset_id must bind exactly to the instrument "
+                f"(expected 'fx:{base}/{quote}')"
+            )
+        budget = int(payload["max_orders_this_activation"])
+        if budget not in (1, 2):
+            raise L1AuthorizationError(
+                "the canary activation permits 1 or 2 entries (one long, one short)"
             )
         return cls(
-            venue=str(payload["venue"]),
-            account_fingerprint=str(payload["account_fingerprint"]),
+            schema_version=PROFILE_SCHEMA_VERSION,
+            venue="ibkr_paper",
             environment="paper",
-            host=str(payload["host"]),
-            port=int(payload["port"]),
-            client_id=int(payload["client_id"]),
-            instrument=str(payload["instrument"]),
+            host="127.0.0.1",
+            port=7497,
+            client_id=client_id,
+            account_fingerprint_algorithm=FINGERPRINT_ALGORITHM,
+            account_fingerprint=fingerprint,
+            instrument=instrument,
             asset_id=str(payload["asset_id"]),
-            activation_phrase=str(payload["activation_phrase"]),
-            max_orders_this_activation=int(payload["max_orders_this_activation"]),
-            quantity=float(payload["quantity"]),
-            stop_distance_price=float(payload["stop_distance_price"]),
-            take_profit_distance_price=float(payload["take_profit_distance_price"]),
-            max_spread_price=float(payload["max_spread_price"]),
+            max_orders_this_activation=budget,
+            quantity_ceiling=_positive_finite(
+                payload, "quantity_ceiling", _MAX_QUANTITY_CEILING),
+            stop_distance_price_max=_positive_finite(
+                payload, "stop_distance_price_max", _MAX_DISTANCE_PRICE),
+            take_profit_distance_price_max=_positive_finite(
+                payload, "take_profit_distance_price_max", _MAX_DISTANCE_PRICE),
+            max_spread_price=_positive_finite(
+                payload, "max_spread_price", _MAX_SPREAD_PRICE),
             profile_hash=_hash(payload),
         )
-
-
-@dataclass(frozen=True)
-class L1Authorization:
-    """Single-use owner authorization. Burned in the ledger before use."""
-
-    profile: L1Profile
-    supplied_phrase: str
-    token: str
-    issued_at: datetime
-
-    def verify(self, *, ledger_token_seen, now: Optional[datetime] = None) -> None:
-        now = now or _utc_now()
-        if self.supplied_phrase != self.profile.activation_phrase:
-            raise L1AuthorizationError("activation phrase mismatch")
-        if not self.token:
-            raise L1AuthorizationError("activation token missing")
-        if ledger_token_seen(self.token):
-            raise L1AuthorizationError(
-                "activation token already consumed; authorization is single-use"
-            )
-        age = (now - self.issued_at).total_seconds()
-        if age < 0 or age > 3600:
-            raise L1AuthorizationError(
-                "authorization outside its one-hour validity window"
-            )
 
 
 class SubmissionSink(Protocol):
@@ -309,39 +366,23 @@ def verify_bracket_acknowledgement(
 
 
 class IbkrPaperL1Sink:
-    """Write-capable sink. Refuses to exist without a valid authorization.
+    """Serialize sink plus a READ-ONLY connection helper.
 
-    Construction order is deliberate: authorization is verified and burned
-    BEFORE any import of the broker library or any socket. An unauthorized
-    process therefore cannot even reach networking code.
+    This class holds no submission path (finding 063: the former lying
+    ``submit_bracket`` is removed; ``BracketExecutor`` is the only door) and
+    no self-mintable authorization (finding 064). Its connection helper is
+    hard-coded read-only: a write-capable session is a later, separately
+    audited owner activation step that does not exist in this codebase yet.
     """
 
-    def __init__(
-        self,
-        authorization: L1Authorization,
-        *,
-        ledger,
-        dry_run: bool = True,
-    ) -> None:
-        authorization.verify(ledger_token_seen=ledger.activation_token_seen)
-        ledger.burn_activation_token(
-            authorization.token,
-            profile_hash=authorization.profile.profile_hash,
-            venue=authorization.profile.venue,
-            account_fingerprint=authorization.profile.account_fingerprint,
-        )
-        self.authorization = authorization
-        self.profile = authorization.profile
-        self.ledger = ledger
-        self.dry_run = dry_run
-        self.submissions = 0
-        self.network_submissions = 0
+    def __init__(self, profile: L1Profile) -> None:
+        self.profile = profile
         self.would_be_orders = 0
         self._ib = None
 
-    # -- connection -------------------------------------------------------
-    def connect(self):
-        """Open the TWS Paper connection. Fail closed on any mismatch."""
+    # -- connection (read-only, zero-submit preflights only) ---------------
+    def connect_readonly(self):
+        """Open a READ-ONLY TWS Paper session. Fail closed on any mismatch."""
         try:
             import ib_async
             from ib_async import IB
@@ -359,7 +400,7 @@ class IbkrPaperL1Sink:
             self.profile.port,
             clientId=self.profile.client_id,
             timeout=15.0,
-            readonly=False,          # the one place readonly is False
+            readonly=True,           # zero-submit by construction
             raiseSyncErrors=True,
         )
         accounts = list(ib.managedAccounts())
@@ -375,7 +416,8 @@ class IbkrPaperL1Sink:
         if fingerprint != self.profile.account_fingerprint:
             ib.disconnect()
             raise L1ExecutionError(
-                "connected account fingerprint does not match the authorized profile"
+                "connected account fingerprint does not match the authorized "
+                f"profile ({FINGERPRINT_ALGORITHM})"
             )
         self._ib = ib
         return ib
@@ -411,54 +453,3 @@ class IbkrPaperL1Sink:
         }
         self.would_be_orders += 1
         return payload
-
-    # -- submission --------------------------------------------------------
-    def submit_bracket(
-        self,
-        intent: OrderIntentV2,
-        plan: BracketPlan,
-        *,
-        now: Optional[datetime] = None,
-    ) -> dict[str, Any]:
-        """Journal, transmit, then verify protection. Never the other order."""
-        now = now or _utc_now()
-        if self.submissions >= self.profile.max_orders_this_activation:
-            raise L1AuthorizationError(
-                "activation order budget exhausted; a new owner authorization "
-                "is required"
-            )
-        if intent.venue != self.profile.venue:
-            raise L1ExecutionError("intent venue does not match the authorized profile")
-        if intent.instrument != self.profile.instrument:
-            raise L1ExecutionError(
-                "intent instrument does not match the authorized profile"
-            )
-        if intent.asset_id != self.profile.asset_id:
-            raise L1ExecutionError("intent asset does not match the authorized profile")
-
-        # Journal BEFORE the side effect (055 pattern across broker calls).
-        self.ledger.journal_submission(
-            idempotency_key=intent.idempotency_key,
-            order_ids=[
-                plan.parent["orderId"],
-                plan.take_profit["orderId"],
-                plan.stop_loss["orderId"],
-            ],
-            profile_hash=self.profile.profile_hash,
-            submitted_at=now.isoformat(),
-        )
-        if self.dry_run:
-            return {
-                "submitted": False,
-                "reason": "dry_run",
-                "planned_order_ids": [
-                    plan.parent["orderId"],
-                    plan.take_profit["orderId"],
-                    plan.stop_loss["orderId"],
-                ],
-            }
-        if self._ib is None:
-            raise L1ExecutionError("not connected; refusing to submit")
-        self.submissions += 1
-        self.network_submissions += 1
-        return {"submitted": True, "transmitted_at": now.isoformat()}
