@@ -24,6 +24,7 @@ hold and kill, and never clears the hold itself — only the owner does.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
 from app.ibkr_l1_adapter import BracketPlan, L1ExecutionError
@@ -246,7 +247,10 @@ class BracketLifecycleController:
             )
         if not verdict["protected"]:
             verdict["recovery"] = self.recover(
-                effect_id, plan, instrument=instrument
+                effect_id,
+                plan,
+                instrument=instrument,
+                expected_con_id=expected_con_id,
             )
         return verdict
 
@@ -257,9 +261,13 @@ class BracketLifecycleController:
         plan: BracketPlan,
         *,
         instrument: str,
+        expected_con_id: Optional[int] = None,
+        now: Optional[datetime] = None,
+        acknowledgement_timeout_seconds: float = 120.0,
     ) -> dict[str, Any]:
         """Idempotent hold + cancel + flatten + reconcile. Executes effects;
         every attempt and outcome is journaled before and after."""
+        now = now or datetime.now(timezone.utc)
         effect = self.olap.effect_row(effect_id)
         if effect is None:
             raise L1ExecutionError(f"effect {effect_id} does not exist")
@@ -305,12 +313,11 @@ class BracketLifecycleController:
                 and fact.get("status") in OPEN_STATUSES
             ]
             if still_open:
-                self.olap.advance_effect(effect_id, "effect_unknown")
                 self.olap.record_broker_fact(
                     effect_id, "recovery_incomplete",
                     {"still_open": still_open},
                 )
-                return {"complete": False, "state": "effect_unknown",
+                return {"complete": False, "state": "recovering",
                         "actions": actions, "still_open": still_open}
 
             # 4. flatten residual exposure with mandatory reconciliation
@@ -322,15 +329,27 @@ class BracketLifecycleController:
                     and position.get("currency") == expected["currency"]
                     and position.get("secType") == expected["secType"]
                     and position.get("account") == plan.parent["account"]
+                    and (
+                        expected_con_id is None
+                        or (
+                            position.get("conId") is not None
+                            and int(position["conId"]) == int(expected_con_id)
+                        )
+                    )
                 ):
                     residual += float(position.get("units", 0.0))
-            had_position = residual != 0.0
-            if had_position:
+            previous_attempts = self.olap.broker_facts(
+                effect_id, "recovery_flatten_attempt"
+            )
+            previous_attempt = previous_attempts[-1] if previous_attempts else None
+            had_position = residual != 0.0 or previous_attempt is not None
+            if residual != 0.0 and previous_attempt is None:
+                flatten_id = self.client.reserve_order_ids(1)
                 contract, order = build_flatten_order(
                     instrument=instrument,
                     account=plan.parent["account"],
                     net_units=residual,
-                    order_id=self.client.reserve_order_ids(1),
+                    order_id=flatten_id,
                 )
                 self.olap.record_broker_fact(
                     effect_id, "recovery_flatten_attempt",
@@ -341,18 +360,66 @@ class BracketLifecycleController:
                     effect_id, "recovery_flatten_result", dict(result)
                 )
                 actions.append(f"flatten:{residual}")
+                previous_attempts = self.olap.broker_facts(
+                    effect_id, "recovery_flatten_attempt"
+                )
+                previous_attempt = previous_attempts[-1]
+
+            if previous_attempt is not None:
+                flatten_id = int(previous_attempt["fact"]["orderId"])
                 remaining = 0.0
                 for position in self.client.position_facts():
                     if (
                         position.get("symbol") == expected["symbol"]
                         and position.get("currency") == expected["currency"]
+                        and position.get("secType") == expected["secType"]
+                        and position.get("account") == plan.parent["account"]
+                        and (
+                            expected_con_id is None
+                            or (
+                                position.get("conId") is not None
+                                and int(position["conId"])
+                                == int(expected_con_id)
+                            )
+                        )
                     ):
                         remaining += float(position.get("units", 0.0))
                 if remaining != 0.0:
+                    order_fact = next(
+                        (
+                            fact for fact in self.client.open_order_facts()
+                            if int(fact.get("orderId", -1)) == flatten_id
+                        ),
+                        None,
+                    )
+                    elapsed = (
+                        now
+                        - datetime.fromisoformat(previous_attempt["recorded_at"])
+                    ).total_seconds()
+                    pending = (
+                        order_fact is not None
+                        and order_fact.get("status") in OPEN_STATUSES
+                    )
+                    if pending and elapsed <= acknowledgement_timeout_seconds:
+                        return {
+                            "complete": False,
+                            "state": "recovering",
+                            "actions": actions,
+                            "remaining_units": remaining,
+                            "flatten_order_id": flatten_id,
+                        }
                     self.olap.advance_effect(effect_id, "effect_unknown")
                     self.olap.record_broker_fact(
                         effect_id, "recovery_unreconciled",
-                        {"remaining_units": remaining},
+                        {
+                            "remaining_units": remaining,
+                            "flatten_order_id": flatten_id,
+                            "elapsed_seconds": elapsed,
+                            "broker_status": (
+                                None if order_fact is None
+                                else order_fact.get("status")
+                            ),
+                        },
                     )
                     return {"complete": False, "state": "effect_unknown",
                             "actions": actions, "remaining_units": remaining}

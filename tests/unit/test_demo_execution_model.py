@@ -280,10 +280,16 @@ def test_stateful_model_invariants_hold_over_random_sequences(tmp_path, seed):
                 continue
             replay = ExecutionReportV2(**json.loads(rows[0]))
             before = service.olap.active_totals(NOW.date().isoformat())
-            if replay.previous_state == replay.state:
-                continue  # self-loop replays are legal repeated evidence
-            with pytest.raises(DemoExecutionError):
-                service.apply_execution_event(replay)
+            receipt = service.olap._con.execute(
+                "SELECT 1 FROM execution_report_receipts WHERE object_id=?",
+                (replay.object_id,),
+            ).fetchone()
+            if receipt is None:
+                with pytest.raises(DemoExecutionError):
+                    service.apply_execution_event(replay)
+            else:
+                replay_result = service.apply_execution_event(replay)
+                assert replay_result["replayed"] is True
             after = service.olap.active_totals(NOW.date().isoformat())
             assert before == after
         elif action == "close":

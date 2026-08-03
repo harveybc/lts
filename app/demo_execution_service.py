@@ -229,6 +229,13 @@ CREATE TABLE IF NOT EXISTS lifecycle_events (
     prev_chain_hash TEXT NOT NULL,
     chain_hash TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS execution_report_receipts (
+    object_id TEXT PRIMARY KEY,
+    order_intent_id TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    report_sha256 TEXT,
+    result_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS commands (
     nonce TEXT PRIMARY KEY,
     received_at TEXT NOT NULL,
@@ -256,6 +263,17 @@ class DemoExecutionOlap:
         self._con = sqlite3.connect(str(path), isolation_level=None, timeout=10.0)
         self._con.execute("PRAGMA busy_timeout=10000")
         self._con.executescript(_SCHEMA)
+        receipt_columns = {
+            row[1]
+            for row in self._con.execute(
+                "PRAGMA table_info(execution_report_receipts)"
+            ).fetchall()
+        }
+        if "report_sha256" not in receipt_columns:
+            self._con.execute(
+                "ALTER TABLE execution_report_receipts "
+                "ADD COLUMN report_sha256 TEXT"
+            )
         self._in_unit = False
 
     def close(self) -> None:
@@ -583,6 +601,39 @@ class DemoExecutionOlap:
             ),
         )
         return chain
+
+    def recorded_execution_report(
+        self, report: ExecutionReportV2
+    ) -> Optional[dict[str, Any]]:
+        row = self._con.execute(
+            "SELECT report_sha256, result_json "
+            "FROM execution_report_receipts WHERE object_id=?",
+            (report.object_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        report_sha256 = content_hash(report.model_dump(mode="json"))
+        if row[0] != report_sha256:
+            raise DemoExecutionError(
+                "execution report object_id collision with different payload"
+            )
+        return json.loads(row[1])
+
+    def record_execution_report(
+        self, report: ExecutionReportV2, result: Mapping[str, Any]
+    ) -> None:
+        self._con.execute(
+            "INSERT INTO execution_report_receipts "
+            "(object_id, order_intent_id, recorded_at, report_sha256, result_json) "
+            "VALUES (?,?,?,?,?)",
+            (
+                report.object_id,
+                report.order_intent_id,
+                _utc_now().isoformat(),
+                content_hash(report.model_dump(mode="json")),
+                _canonical(dict(result)),
+            ),
+        )
 
     def last_state(self, order_intent_id: str) -> Optional[str]:
         row = self._con.execute(
@@ -1128,7 +1179,11 @@ class DemoExecutionService:
 
     # -- lifecycle ingestion (L0: synthetic/replayed events only) -----------
     def apply_execution_event(self, report: ExecutionReportV2) -> dict[str, Any]:
-        result: dict[str, Any] = {"state": report.state}
+        recorded = self.olap.recorded_execution_report(report)
+        if recorded is not None:
+            return {**recorded, "replayed": True}
+
+        result: dict[str, Any] = {"state": report.state, "replayed": False}
         reservation_id = (
             report.attempt_id[len("attempt-"):]
             if report.attempt_id.startswith("attempt-rsv-")
@@ -1158,6 +1213,11 @@ class DemoExecutionService:
             }
 
         with self.olap.atomic_unit():
+            # Recheck after taking the write lock. Concurrent delivery of one
+            # immutable broker report cannot append or apply it twice.
+            recorded = self.olap.recorded_execution_report(report)
+            if recorded is not None:
+                return {**recorded, "replayed": True}
             # Finding 054: continuity is checked INSIDE the serialized unit,
             # so two concurrent events cannot both read the same previous
             # state and persist an illegal sequence.
@@ -1222,38 +1282,42 @@ class DemoExecutionService:
                     self.olap.release(reservation_id, "consumed")
                     result["reservation"] = "consumed"
                     result["exposure"] = "opened"
-        if report.state in ("filled", "partially_filled"):
-            decision = self.olap.decision_intent_by_object_id(
-                report.order_intent_id
-            )
-            intent_class = None if decision is None else decision.get(
-                "intent_class"
-            )
-            if intent_class == "risk_reducing":
-                # Finding 074: a reduction carries no protection legs by
-                # design; its control is exact reduction — the fill may
-                # never exceed the open target exposure (zero-crossing is
-                # additionally proven upstream before submission). A
-                # violation holds WITHOUT emitting more flatten intents:
-                # an incorrect flatten must not recursively author others.
-                target = decision.get("reduce_target_order_intent_id")
-                open_units = (
-                    None if target is None
-                    else self.olap.exposure_units(f"exp-{target}")
+            if report.state in ("filled", "partially_filled"):
+                decision = self.olap.decision_intent_by_object_id(
+                    report.order_intent_id
                 )
-                if open_units is None or (
-                    report.filled_units > abs(open_units) + 1e-9
-                ):
+                intent_class = None if decision is None else decision.get(
+                    "intent_class"
+                )
+                if intent_class == "risk_reducing":
+                    # A reducing report is valid only when every immutable
+                    # quantity describes the exact move from the currently
+                    # open exposure to zero. This is the L0 defense-in-depth
+                    # counterpart to the broker-side preflight.
+                    target = decision.get("reduce_target_order_intent_id")
+                    open_units = (
+                        None if target is None
+                        else self.olap.exposure_units(f"exp-{target}")
+                    )
+                    intent_delta = float(decision.get("delta_units", 0.0))
+                    exact = (
+                        open_units is not None
+                        and report.state == "filled"
+                        and abs(float(open_units) + intent_delta) <= 1e-9
+                        and abs(report.requested_units - intent_delta) <= 1e-9
+                        and abs(report.filled_units - abs(float(open_units))) <= 1e-9
+                    )
+                    if not exact:
+                        self.olap.set_state("halt", "hold")
+                        result["emergency"] = "risk_reduction_violation_hold"
+                elif not protection_covers_filled(report):
+                    # Risk-increasing, or unknown provenance treated
+                    # conservatively as an unprotected entry.
                     self.olap.set_state("halt", "hold")
-                    result["emergency"] = "risk_reduction_violation_hold"
-            elif not protection_covers_filled(report):
-                # risk-increasing, or unknown provenance treated
-                # conservatively as an unprotected entry (accepted behavior
-                # preserved byte-for-byte in effect)
-                self.olap.set_state("halt", "hold")
-                emitted = self._emit_flatten_all(report.trace_id, _utc_now())
-                result["emergency"] = "unprotected_exposure_hold_and_flatten"
-                result["emitted"] = emitted
+                    emitted = self._emit_flatten_all(report.trace_id, _utc_now())
+                    result["emergency"] = "unprotected_exposure_hold_and_flatten"
+                    result["emitted"] = emitted
+            self.olap.record_execution_report(report, result)
         return result
 
     def apply_position_close(self, order_intent_id: str) -> dict[str, Any]:

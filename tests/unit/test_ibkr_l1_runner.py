@@ -1,9 +1,9 @@
-"""Milestone E: the disabled-by-default L1 canary runner.
+"""IBKR Paper L1 canary-runner tests.
 
-Proves fail-closed construction (disabled config never touches a client;
-the Milestone-F-less default factory degrades to an alert), deterministic
-ledger-derived heartbeats/alerts/events, and a full heartbeat-driven canary
-cycle on the fake client.
+Proves fail-closed construction (disabled config never touches a client),
+deterministic degraded behavior when construction fails, ledger-derived
+heartbeats/alerts/events, and a full heartbeat-driven canary cycle on the
+fake client.
 """
 import hashlib
 import json
@@ -26,6 +26,7 @@ from app.demo_execution_service import (
     DemoExecutionService,
     ZeroNetworkSink,
 )
+from app.ibkr_l1_adapter import L1ExecutionError
 from app.ibkr_l1_broker import FakeIbkrClient
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.ibkr_l1_runner import (
@@ -233,9 +234,13 @@ def test_disabled_runner_never_touches_a_client(tmp_path):
     assert _heartbeat_on_disk(config)["enabled"] is False
 
 
-def test_missing_milestone_f_client_degrades_to_alert(tmp_path):
+def test_unavailable_client_degrades_to_alert_without_network(tmp_path):
     config = _runner_config(tmp_path, enabled=True)
-    runner = IbkrL1Runner(config)                      # default factory
+
+    def unavailable(_profile):
+        raise L1ExecutionError("simulated TWS construction failure")
+
+    runner = IbkrL1Runner(config, client_factory=unavailable)
     heartbeat = runner.tick(now=NOW)
     assert heartbeat["state"] == "degraded_no_client"
     assert any(a.startswith("client_unavailable") for a in heartbeat["alerts"])

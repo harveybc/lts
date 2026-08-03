@@ -17,9 +17,8 @@ Fail-closed properties:
 
 - ``enabled: false`` (the default in every shipped config) produces a
   heartbeat-only loop; the broker client factory is NEVER invoked;
-- no TWS-backed ``IbkrClientProtocol`` implementation exists until
-  Milestone F: the default factory refuses deterministically, the refusal
-  becomes an alert, and the loop keeps heartbeating;
+- the TWS client is loopback/Paper-only and verifies one exact DU account;
+  disabled mode still never constructs it or opens a socket;
 - rollback is ``systemctl --user disable --now lts-ibkr-l1-canary`` plus
   the owner hold/kill command through the accepted L0 path; the runner
   honors the halt state on the next tick.
@@ -40,7 +39,7 @@ from app.demo_execution_service import (
     DemoExecutionService,
     ZeroNetworkSink,
 )
-from app.ibkr_l1_adapter import L1ExecutionError, L1Profile
+from app.ibkr_l1_adapter import L1Profile
 from app.ibkr_l1_broker import IbkrClientProtocol
 from app.ibkr_l1_capability import CapabilityGate
 from app.ibkr_l1_journal import L1ExecutionOlap
@@ -77,11 +76,10 @@ def load_l1_runner_config(path: str | Path) -> dict[str, Any]:
 
 
 def default_client_factory(profile: L1Profile) -> IbkrClientProtocol:
-    """No TWS-backed client exists until Milestone F. Refuse loudly."""
-    raise L1ExecutionError(
-        "no TWS-backed IbkrClientProtocol implementation exists yet "
-        "(Milestone F); the runner fails closed without a client"
-    )
+    """Construct the strict loopback TWS Paper client (Milestone F)."""
+    from app.ibkr_l1_tws import IbAsyncTwsClient
+
+    return IbAsyncTwsClient(profile)
 
 
 class IbkrL1Runner:
@@ -320,15 +318,21 @@ class IbkrL1Runner:
     def run(self, once: bool = False) -> int:
         signal.signal(signal.SIGTERM, self.request_stop)
         signal.signal(signal.SIGINT, self.request_stop)
-        while True:
-            self.tick()
-            if once or self._stop:
-                return 0
-            deadline = time.monotonic() + float(self.config["loop_seconds"])
-            while not self._stop and time.monotonic() < deadline:
-                time.sleep(0.25)
-            if self._stop:
-                return 0
+        try:
+            while True:
+                self.tick()
+                if once or self._stop:
+                    return 0
+                deadline = time.monotonic() + float(self.config["loop_seconds"])
+                while not self._stop and time.monotonic() < deadline:
+                    time.sleep(0.25)
+                if self._stop:
+                    return 0
+        finally:
+            if self._runtime is not None:
+                close = getattr(self._runtime["client"], "close", None)
+                if callable(close):
+                    close()
 
 
 def main() -> int:

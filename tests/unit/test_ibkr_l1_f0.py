@@ -9,7 +9,7 @@ from datetime import timedelta
 
 import pytest
 
-from app.demo_execution_service import DemoExecutionOlap
+from app.demo_execution_service import DemoExecutionError, DemoExecutionOlap
 from app.ibkr_l1_executor import EFFECT_CONTRACT_SCHEMA
 from app.ibkr_l1_journal import L1ExecutionOlap
 
@@ -376,6 +376,49 @@ def test_foreign_positions_never_count_toward_the_flatten(env):
     assert (ACCOUNT, "FUT", 7000.0) in survivors       # untouched
 
 
+def test_missing_position_con_id_refuses_when_entry_contract_pins_it(env):
+    """An absent conId is not evidence that it matches a pinned contract."""
+    import json as _json
+
+    effect_id, _ = _filled_long_with_pending_flatten(env)
+    row = env.olap._con.execute(
+        "SELECT contract_json FROM l1_effect_contracts WHERE effect_id=?",
+        (effect_id,),
+    ).fetchone()
+    contract = _json.loads(row[0])
+    contract["expected_con_id"] = 12087792
+    env.olap._con.execute(
+        "UPDATE l1_effect_contracts SET contract_json=? WHERE effect_id=?",
+        (_json.dumps(contract), effect_id),
+    )
+    places_before = _place_count(env.client)
+    result = env.consumer.consume_flattens(
+        now=NOW + timedelta(seconds=5)
+    )[0]
+    assert "no_matching_position" in result["refused"]
+    assert _place_count(env.client) == places_before
+
+
+def test_flatten_is_not_terminal_when_l0_application_fails(env, monkeypatch):
+    effect_id, _ = _filled_long_with_pending_flatten(env)
+
+    def _fail(_report):
+        raise RuntimeError("simulated L0 commit failure")
+
+    monkeypatch.setattr(env.service, "apply_execution_event", _fail)
+    result = env.consumer.consume_flattens(
+        now=NOW + timedelta(seconds=5)
+    )[0]
+    assert result["state"] == "effect_unknown"
+    flatten_effect = next(
+        item for item in env.olap.nonterminal_effects()
+        if item["kind"] == "flatten"
+    )
+    assert flatten_effect["state"] == "effect_unknown"
+    assert env.olap.exposure_state(f"exp-{env.olap.effect_contract(effect_id)['intent_object_id']}") == "open"
+    assert env.olap.get_state("halt") == "hold"
+
+
 # ── F0.5 (finding 074): one intent-class-aware L0 lifecycle path ──
 
 def _flatten_decision_count(env):
@@ -431,6 +474,74 @@ def test_reducing_overfill_holds_without_flatten_storm(env):
     assert env.olap.get_state("halt") == "hold"
     assert _flatten_decision_count(env) == 1           # NO flatten storm
     assert "emitted" not in result
+
+
+def test_reducing_underfill_is_not_accepted_as_an_exact_close(env):
+    from trading_contracts import ExecutionReportV2, OrderIntentV2
+
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 20000.0)
+    env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    target = env.olap.effect_contract(effect_id)["intent_object_id"]
+    reducing = OrderIntentV2(
+        object_id="oi2-underfill", as_of=NOW + timedelta(seconds=4),
+        producer={"name": "t", "version": "0"}, trace_id="t-underfill",
+        account_ref=FINGERPRINT, asset_id="fx:EUR/USD", venue="ibkr_paper",
+        instrument="EUR.USD", intent_class="risk_reducing",
+        reduce_action="flatten", reduce_target_order_intent_id=target,
+        order_type="market", delta_units=-20000.0,
+        idempotency_key="flatten:underfill",
+    )
+    env.olap.record_decision(
+        "flatten:underfill", "would_be_flatten", None,
+        reducing.model_dump_json(), None,
+    )
+    result = env.service.apply_execution_event(ExecutionReportV2(
+        object_id="er-underfill", as_of=NOW + timedelta(seconds=5),
+        producer={"name": "t", "version": "0"}, trace_id="t-underfill",
+        order_intent_id=reducing.object_id, attempt_id="attempt-underfill",
+        bracket_role="parent", state="partially_filled",
+        requested_units=-20000.0, filled_units=10000.0,
+    ))
+    assert result["emergency"] == "risk_reduction_violation_hold"
+    assert env.olap.exposure_state(f"exp-{target}") == "open"
+
+
+def test_execution_report_object_id_is_an_idempotent_receipt(env):
+    from trading_contracts import ExecutionReportV2
+
+    report = ExecutionReportV2(
+        object_id="er-idempotent", as_of=NOW + timedelta(seconds=5),
+        producer={"name": "t", "version": "0"}, trace_id="t-idempotent",
+        order_intent_id="oi2-idempotent", attempt_id="attempt-idempotent",
+        bracket_role="parent", state="filled",
+        requested_units=1000.0, filled_units=1000.0,
+    )
+    first = env.service.apply_execution_event(report)
+    second = env.service.apply_execution_event(report)
+    assert first["replayed"] is False
+    assert second["replayed"] is True
+    assert first["chain_hash"] == second["chain_hash"]
+    assert env.olap._con.execute(
+        "SELECT COUNT(*) FROM lifecycle_events WHERE order_intent_id=?",
+        (report.order_intent_id,),
+    ).fetchone()[0] == 1
+
+
+def test_execution_report_object_id_collision_refuses(env):
+    from trading_contracts import ExecutionReportV2
+
+    report = ExecutionReportV2(
+        object_id="er-collision", as_of=NOW + timedelta(seconds=5),
+        producer={"name": "t", "version": "0"}, trace_id="t-one",
+        order_intent_id="oi2-collision", attempt_id="attempt-collision",
+        bracket_role="parent", state="filled",
+        requested_units=1000.0, filled_units=1000.0,
+    )
+    env.service.apply_execution_event(report)
+    altered = report.model_copy(update={"trace_id": "t-two"})
+    with pytest.raises(DemoExecutionError, match="object_id collision"):
+        env.service.apply_execution_event(altered)
 
 
 def test_unknown_provenance_fill_remains_conservatively_unprotected(env):

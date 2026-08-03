@@ -164,6 +164,18 @@ class L1ExecutionOlap(DemoExecutionOlap):
         ).fetchone()
         return None if row is None else self._effect_dict(row)
 
+    def set_effect_order_ids(self, effect_id: str, order_ids: list[int]) -> None:
+        """Bind broker ids before the first call; never rewrite a non-empty set."""
+        row = self.effect_row(effect_id)
+        if row is None:
+            raise DemoExecutionError(f"effect {effect_id} does not exist")
+        if row["order_ids"] and row["order_ids"] != order_ids:
+            raise DemoExecutionError("effect order ids are immutable once bound")
+        self._con.execute(
+            "UPDATE l1_effects SET order_ids_json=?, updated_at=? WHERE effect_id=?",
+            (json.dumps(order_ids), _utc_now().isoformat(), effect_id),
+        )
+
     def nonterminal_effects(self) -> list[dict[str, Any]]:
         placeholders = ",".join("?" for _ in TERMINAL_EFFECT_STATES)
         rows = self._con.execute(

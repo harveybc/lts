@@ -58,6 +58,7 @@ _DEFAULT_QUOTE_MAX_AGE_SECONDS = 60.0
 # (stale/wide/absent quote, missing capability) merely DEFER: the decision
 # stays pending and the next tick re-evaluates it.
 _DEFAULT_DECISION_MAX_AGE_SECONDS = 300.0
+_DEFAULT_ACK_MAX_AGE_SECONDS = 120.0
 
 
 class L1OutboxConsumer:
@@ -75,6 +76,7 @@ class L1OutboxConsumer:
         quantity_decimals: int = 0,
         quote_max_age_seconds: float = _DEFAULT_QUOTE_MAX_AGE_SECONDS,
         max_decision_age_seconds: float = _DEFAULT_DECISION_MAX_AGE_SECONDS,
+        max_ack_age_seconds: float = _DEFAULT_ACK_MAX_AGE_SECONDS,
     ) -> None:
         self.service = service
         self.olap = olap
@@ -87,6 +89,7 @@ class L1OutboxConsumer:
         self.quantity_decimals = quantity_decimals
         self.quote_max_age_seconds = quote_max_age_seconds
         self.max_decision_age_seconds = max_decision_age_seconds
+        self.max_ack_age_seconds = max_ack_age_seconds
 
     # -- helpers -----------------------------------------------------------
     def _reject(
@@ -395,7 +398,12 @@ class L1OutboxConsumer:
             )
             self.olap.advance_effect(effect_id, "recovering")
         recovery = self.controller.recover(
-            effect_id, plan, instrument=contract["instrument"]
+            effect_id,
+            plan,
+            instrument=contract["instrument"],
+            expected_con_id=contract["expected_con_id"],
+            now=now,
+            acknowledgement_timeout_seconds=self.max_ack_age_seconds,
         )
         if recovery.get("complete"):
             self._reconcile_l0_after_recovery(effect_id, contract, now)
@@ -504,6 +512,13 @@ class L1OutboxConsumer:
             and p.get("currency") == expected_contract["currency"]
             and p.get("secType") == expected_contract["secType"]
             and p.get("account") == account
+            and (
+                contract["expected_con_id"] is None
+                or (
+                    p.get("conId") is not None
+                    and int(p["conId"]) == int(contract["expected_con_id"])
+                )
+            )
         )
         if abs(observed - sign * cumulative) > epsilon:
             return self._refuse_fill_sync(
@@ -524,6 +539,14 @@ class L1OutboxConsumer:
     ) -> list[dict[str, Any]]:
         now = now or datetime.now(timezone.utc)
         results = []
+        # Reconcile previously submitted asynchronous closes before creating
+        # any new effect. Real TWS market orders are not synchronously filled.
+        for effect in self.olap.nonterminal_effects():
+            if (
+                effect["kind"] == "flatten"
+                and effect["state"] == "submitted_pending_ack"
+            ):
+                results.append(self._sync_submitted_flatten(effect, now=now))
         for pending in self.olap.l1_pending_decisions("would_be_flatten"):
             results.append(self._consume_flatten(pending, now=now))
         return results
@@ -570,6 +593,166 @@ class L1OutboxConsumer:
                 self.olap.set_state("halt", "hold")
         return {"state": "effect_unknown", "refused": reason}
 
+    @staticmethod
+    def _position_units(
+        facts: list[dict[str, Any]],
+        expected: dict[str, Any],
+        account: str,
+        expected_con_id: Optional[int],
+    ) -> float:
+        return sum(
+            float(fact.get("units", 0.0))
+            for fact in facts
+            if fact.get("symbol") == expected["symbol"]
+            and fact.get("currency") == expected["currency"]
+            and fact.get("secType") == expected["secType"]
+            and fact.get("account") == account
+            and (
+                expected_con_id is None
+                or (
+                    fact.get("conId") is not None
+                    and int(fact["conId"]) == int(expected_con_id)
+                )
+            )
+        )
+
+    def _finalize_flatten(
+        self,
+        effect: dict[str, Any],
+        contract: dict[str, Any],
+        *,
+        now: datetime,
+    ) -> dict[str, Any]:
+        effect_id = effect["effect_id"]
+        intent = OrderIntentV2.model_validate(contract["intent"])
+        target = intent.reduce_target_order_intent_id
+        entry_effect = self._entry_effect_for_target(target)
+        magnitude = abs(intent.delta_units)
+        try:
+            with self.olap.atomic_unit():
+                self.olap.record_broker_fact(
+                    effect_id, "flatten_reconciled", {"remaining_units": 0.0}
+                )
+                fill_result = self.service.apply_execution_event(
+                    ExecutionReportV2(
+                        object_id=f"er-{intent.object_id}-filled",
+                        as_of=now,
+                        producer=_PRODUCER,
+                        trace_id=intent.trace_id,
+                        order_intent_id=intent.object_id,
+                        attempt_id=f"attempt-{intent.object_id}",
+                        bracket_role="parent",
+                        state="filled",
+                        previous_state=self.olap.last_state(intent.object_id),
+                        requested_units=intent.delta_units,
+                        filled_units=magnitude,
+                    )
+                )
+                if fill_result.get("emergency"):
+                    raise L1ExecutionError(fill_result["emergency"])
+                self.service.apply_position_close(target)
+                self.olap.advance_effect(effect_id, "acknowledged")
+                self.olap.advance_effect(effect_id, "terminal_flat")
+                if (
+                    entry_effect is not None
+                    and entry_effect["state"] == "acknowledged"
+                ):
+                    self.olap.advance_effect(
+                        entry_effect["effect_id"], "terminal_flat"
+                    )
+        except Exception as error:  # noqa: BLE001 - persist and stop risk
+            with self.olap.atomic_unit():
+                self.olap.record_broker_fact(
+                    effect_id,
+                    "flatten_l0_failure",
+                    {"error": f"{type(error).__name__}: {error}"},
+                )
+                if self.olap.effect_row(effect_id)["state"] != "effect_unknown":
+                    self.olap.advance_effect(effect_id, "effect_unknown")
+                self.olap.set_state("halt", "hold")
+            return {
+                "idempotency_key": effect["idempotency_key"],
+                "state": "effect_unknown",
+                "error": f"{type(error).__name__}: {error}",
+            }
+        return {
+            "idempotency_key": effect["idempotency_key"],
+            "state": "terminal_flat",
+            "target": target,
+        }
+
+    def _sync_submitted_flatten(
+        self, effect: dict[str, Any], *, now: datetime
+    ) -> dict[str, Any]:
+        effect_id = effect["effect_id"]
+        contract = self.olap.effect_contract(effect_id)
+        if contract is None or contract.get("kind") != "flatten":
+            return self._refuse_flatten(effect_id, "missing_flatten_contract")
+        account = self.client.connected_account()
+        fingerprint = (
+            None if account is None else hashlib.sha256(str(account).encode()).hexdigest()[:16]
+        )
+        if fingerprint != contract["account_fingerprint"]:
+            return self._refuse_flatten(effect_id, "connected_account_not_authorized")
+        expected = expected_contract_facts(contract["instrument"])
+        expected_con_id = contract.get("expected_con_id")
+        order_id = int(contract["order_id"])
+        remaining = self._position_units(
+            self.client.position_facts(), expected, str(account), expected_con_id
+        )
+        order = next(
+            (
+                fact for fact in self.client.open_order_facts()
+                if int(fact.get("orderId", -1)) == order_id
+            ),
+            None,
+        )
+        if order is None:
+            if abs(remaining) <= 1e-9:
+                return self._finalize_flatten(effect, contract, now=now)
+            age = (
+                now - datetime.fromisoformat(effect["updated_at"])
+            ).total_seconds()
+            if age > self.max_ack_age_seconds:
+                return self._refuse_flatten(
+                    effect_id, f"flatten_order_fact_timeout:{age:.1f}s"
+                )
+            return {
+                "idempotency_key": effect["idempotency_key"],
+                "state": "submitted_pending_ack",
+                "reason": "flatten_order_fact_pending",
+            }
+        status = order.get("status")
+        if status in ("PendingSubmit", "PreSubmitted", "Submitted"):
+            age = (
+                now - datetime.fromisoformat(effect["updated_at"])
+            ).total_seconds()
+            if age > self.max_ack_age_seconds:
+                return self._refuse_flatten(
+                    effect_id, f"flatten_ack_timeout:{age:.1f}s:{status}"
+                )
+            return {
+                "idempotency_key": effect["idempotency_key"],
+                "state": "submitted_pending_ack",
+                "broker_status": status,
+            }
+        magnitude = abs(float(contract["delta_units"]))
+        if (
+            status != "Filled"
+            or order.get("filled") is None
+            or abs(float(order["filled"]) - magnitude) > 1e-9
+            or order.get("remaining") is None
+            or abs(float(order["remaining"])) > 1e-9
+        ):
+            return self._refuse_flatten(
+                effect_id, f"flatten_order_not_exactly_filled:{status}"
+            )
+        if abs(remaining) > 1e-9:
+            return self._refuse_flatten(
+                effect_id, f"flatten_filled_but_position_remaining:{remaining}"
+            )
+        return self._finalize_flatten(effect, contract, now=now)
+
     def _consume_flatten(
         self, pending: dict[str, Any], *, now: datetime
     ) -> dict[str, Any]:
@@ -596,23 +779,9 @@ class L1OutboxConsumer:
             entry_contract = self.olap.effect_contract(entry_effect["effect_id"])
             if entry_contract is not None:
                 expected_con_id = entry_contract["expected_con_id"]
-        position = 0.0
-        for fact in self.client.position_facts():
-            if (
-                fact.get("symbol") != expected["symbol"]
-                or fact.get("currency") != expected["currency"]
-                or fact.get("secType") != expected["secType"]
-                or fact.get("account") != account
-            ):
-                continue
-            fact_con_id = fact.get("conId")
-            if (
-                expected_con_id is not None
-                and fact_con_id is not None
-                and int(fact_con_id) != int(expected_con_id)
-            ):
-                continue
-            position += float(fact.get("units", 0.0))
+        position = self._position_units(
+            self.client.position_facts(), expected, str(account), expected_con_id
+        )
         flatten_units, refusal = self.exact_reduction_units(
             position, intent.delta_units
         )
@@ -620,6 +789,28 @@ class L1OutboxConsumer:
             result = self._refuse_flatten(effect_id, refusal)
             result["idempotency_key"] = key
             return result
+
+        order_id = self.client.reserve_order_ids(1)
+        contract, order = build_flatten_order(
+            instrument=intent.instrument,
+            account=str(account),
+            net_units=flatten_units,
+            order_id=order_id,
+        )
+        flatten_contract = {
+            "schema": "lts.ibkr_l1.flatten_contract.v1",
+            "kind": "flatten",
+            "intent": intent.model_dump(mode="json"),
+            "instrument": intent.instrument,
+            "delta_units": intent.delta_units,
+            "target_order_intent_id": target,
+            "account_fingerprint": self.profile.account_fingerprint,
+            "expected_con_id": expected_con_id,
+            "order_id": order_id,
+        }
+        with self.olap.atomic_unit():
+            self.olap.set_effect_order_ids(effect_id, [order_id])
+            self.olap.store_effect_contract(effect_id, flatten_contract)
 
         try:
             # orphaned protective children must not survive the position
@@ -640,12 +831,6 @@ class L1OutboxConsumer:
                         )
                         self.client.cancel_order(int(order_id))
 
-            contract, order = build_flatten_order(
-                instrument=intent.instrument,
-                account=str(account),
-                net_units=flatten_units,
-                order_id=self.client.reserve_order_ids(1),
-            )
             self.olap.record_broker_fact(
                 effect_id, "call_attempt",
                 {"leg": "flatten", "orderId": int(order.orderId)},
@@ -654,6 +839,8 @@ class L1OutboxConsumer:
             self.olap.record_broker_fact(
                 effect_id, "call_result", {"leg": "flatten", **result}
             )
+            with self.olap.atomic_unit():
+                self.olap.advance_effect(effect_id, "submitted_pending_ack")
         except Exception as error:  # noqa: BLE001 — journal, hold, unknown
             with self.olap.atomic_unit():
                 self.olap.record_broker_fact(
@@ -664,69 +851,9 @@ class L1OutboxConsumer:
                 self.olap.set_state("halt", "hold")
             return {"idempotency_key": key, "state": "effect_unknown"}
 
-        remaining = sum(
-            float(fact.get("units", 0.0))
-            for fact in self.client.position_facts()
-            if fact.get("symbol") == expected["symbol"]
-            and fact.get("currency") == expected["currency"]
-            and fact.get("secType") == expected["secType"]
-            and fact.get("account") == account
+        return self._sync_submitted_flatten(
+            self.olap.effect_row(effect_id), now=now
         )
-        if remaining != 0.0:
-            with self.olap.atomic_unit():
-                self.olap.record_broker_fact(
-                    effect_id, "flatten_unreconciled",
-                    {"remaining_units": remaining},
-                )
-                self.olap.advance_effect(effect_id, "effect_unknown")
-                self.olap.set_state("halt", "hold")
-            return {
-                "idempotency_key": key,
-                "state": "effect_unknown",
-                "remaining_units": remaining,
-            }
-
-        magnitude = abs(intent.delta_units)
-        with self.olap.atomic_unit():
-            self.olap.record_broker_fact(
-                effect_id, "flatten_reconciled", {"remaining_units": 0.0}
-            )
-            self.olap.advance_effect(effect_id, "submitted_pending_ack")
-            self.olap.advance_effect(effect_id, "acknowledged")
-            self.olap.advance_effect(effect_id, "terminal_flat")
-        # Finding 074: the reducing fill goes through the ONE accepted L0
-        # API; the service is intent-class-aware from its immutable
-        # decisions and applies exact reduction control instead of the
-        # entry protection contract.
-        fill_result = self.service.apply_execution_event(ExecutionReportV2(
-            object_id=f"er-{intent.object_id}-filled", as_of=now,
-            producer=_PRODUCER, trace_id=intent.trace_id,
-            order_intent_id=intent.object_id,
-            attempt_id=f"attempt-{intent.object_id}",
-            bracket_role="parent", state="filled",
-            previous_state=self.olap.last_state(intent.object_id),
-            requested_units=intent.delta_units,
-            filled_units=magnitude,
-        ))
-        if fill_result.get("emergency"):
-            with self.olap.atomic_unit():
-                self.olap.record_broker_fact(
-                    effect_id, "flatten_fill_violation",
-                    {"emergency": fill_result["emergency"]},
-                )
-            return {
-                "idempotency_key": key,
-                "state": self.olap.effect_row(effect_id)["state"],
-                "emergency": fill_result["emergency"],
-            }
-        self.service.apply_position_close(target)
-        if entry_effect is not None and entry_effect["state"] == "acknowledged":
-            self.olap.advance_effect(entry_effect["effect_id"], "terminal_flat")
-        return {
-            "idempotency_key": key,
-            "state": "terminal_flat",
-            "target": target,
-        }
 
     # -- restart -----------------------------------------------------------
     def _refuse_resume(self, effect_id: str, reason: str) -> None:
@@ -753,7 +880,7 @@ class L1OutboxConsumer:
         for entry in report:
             effect = self.olap.effect_row(entry["effect_id"])
             if effect["kind"] != "bracket_entry" or effect["state"] not in (
-                "submitted_pending_ack", "effect_unknown",
+                "submitted_pending_ack", "effect_unknown", "recovering",
             ):
                 outcomes.append(entry)
                 continue
@@ -774,11 +901,25 @@ class L1OutboxConsumer:
                 entry["state"] = "effect_unknown"
                 outcomes.append(entry)
                 continue
-            verdict = self.controller.acknowledge(
-                effect["effect_id"], plan,
-                instrument=contract["instrument"],
-                expected_con_id=contract["expected_con_id"],
-            )
+            if effect["state"] == "recovering":
+                recovery = self.controller.recover(
+                    effect["effect_id"],
+                    plan,
+                    instrument=contract["instrument"],
+                    expected_con_id=contract["expected_con_id"],
+                    now=now,
+                    acknowledgement_timeout_seconds=self.max_ack_age_seconds,
+                )
+                verdict = {
+                    "protected": False,
+                    "recovery": recovery,
+                }
+            else:
+                verdict = self.controller.acknowledge(
+                    effect["effect_id"], plan,
+                    instrument=contract["instrument"],
+                    expected_con_id=contract["expected_con_id"],
+                )
             entry["reacknowledged"] = verdict["protected"]
             entry["state"] = self.olap.effect_row(effect["effect_id"])["state"]
             outcomes.append(entry)

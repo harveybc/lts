@@ -206,17 +206,25 @@ def test_partial_fill_before_protection_flattens_and_reconciles(olap):
     assert "recovery_reconciled_flat" in kinds
 
 
-def test_unreconciled_flatten_stays_unknown_and_held(olap):
+def test_async_flatten_polls_without_duplicate_then_reconciles(olap):
     client, controller, plan, effect_id = _submitted(olap)
     client.fill_parent(1000, 20000.0)                 # full fill, long 20000
     client.drop_order(1002)
     # auto_fill stays False: the flatten order is placed but never fills
     verdict = controller.acknowledge(effect_id, plan, instrument="EUR.USD")
     assert verdict["recovery"]["complete"] is False
-    assert olap.effect_row(effect_id)["state"] == "effect_unknown"
+    assert olap.effect_row(effect_id)["state"] == "recovering"
     assert olap.get_state("halt") == "hold"
-    # retry once the broker recovers: reconciliation completes
-    client.auto_fill_market_orders = True
+    assert len(_flattens(client)) == 1
+    pending = controller.recover(effect_id, plan, instrument="EUR.USD")
+    assert pending["state"] == "recovering"
+    assert len(_flattens(client)) == 1
+    attempt = olap.broker_facts(effect_id, "recovery_flatten_attempt")[-1]
+    flatten_id = attempt["fact"]["orderId"]
+    client.alter_order(
+        flatten_id, status="Filled", filled=20000.0, remaining=0.0
+    )
+    client.set_position(symbol="EUR", currency="USD", units=0.0)
     retry = controller.recover(effect_id, plan, instrument="EUR.USD")
     assert retry["complete"] is True and retry["state"] == "terminal_flat"
     assert olap.get_state("halt") == "hold"           # never cleared by code
