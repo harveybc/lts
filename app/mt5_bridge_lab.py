@@ -173,6 +173,17 @@ class SymbolSnapshot(StrictModel):
     observed_at: datetime
 
 
+class BarSnapshot(StrictModel):
+    symbol: str
+    timeframe: str
+    time: datetime
+    open: float = Field(gt=0)
+    high: float = Field(gt=0)
+    low: float = Field(gt=0)
+    close: float = Field(gt=0)
+    volume: float = Field(ge=0)
+
+
 class SnapshotPayload(StrictModel):
     schema_name: str = Field(alias="schema")
     account_fingerprint: str = Field(min_length=12, max_length=64)
@@ -185,6 +196,7 @@ class SnapshotPayload(StrictModel):
     positions: list[PositionSnapshot] = Field(default_factory=list)
     orders: list[OrderSnapshot] = Field(default_factory=list)
     symbols: list[SymbolSnapshot] = Field(default_factory=list)
+    bars: list[BarSnapshot] = Field(default_factory=list)
 
 
 class TradeEventPayload(StrictModel):
@@ -299,6 +311,21 @@ class Mt5BridgeStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_mt5_symbol_time
                     ON symbol_snapshots(symbol, terminal_observed_at);
+                CREATE TABLE IF NOT EXISTS bar_snapshots (
+                    snapshot_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    bar_time TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    PRIMARY KEY(snapshot_id,symbol,timeframe,bar_time),
+                    FOREIGN KEY(snapshot_id) REFERENCES account_snapshots(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_mt5_bar_time
+                    ON bar_snapshots(symbol,timeframe,bar_time);
                 CREATE TABLE IF NOT EXISTS trade_events (
                     event_id TEXT PRIMARY KEY,
                     account_fingerprint TEXT NOT NULL,
@@ -471,6 +498,21 @@ class Mt5BridgeStore:
                         item.observed_at.isoformat(),
                     )
                     for item in payload.symbols
+                ],
+            )
+            self.connection.executemany(
+                """
+                INSERT INTO bar_snapshots(
+                    snapshot_id,symbol,timeframe,bar_time,open,high,low,close,volume
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        snapshot_id, item.symbol, item.timeframe,
+                        item.time.isoformat(), item.open, item.high, item.low,
+                        item.close, item.volume,
+                    )
+                    for item in payload.bars
                 ],
             )
         return snapshot_id

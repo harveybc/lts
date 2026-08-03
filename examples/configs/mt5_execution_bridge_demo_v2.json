@@ -1,0 +1,17 @@
+{
+  "schema": "lts.mt5.execution_bridge_config.v2",
+  "environment": "demo",
+  "execution_enabled": true,
+  "database_path": "~/.local/state/lts/mt5-bridge.sqlite",
+  "secret_env": "LTS_MT5_BRIDGE_SECRET",
+  "bind_host": "0.0.0.0",
+  "port": 8766,
+  "max_clock_skew_seconds": 90,
+  "nonce_retention_seconds": 900,
+  "stale_heartbeat_seconds": 180,
+  "delivery_retry_seconds": 30,
+  "account_fingerprint": "c88e492afa0f8d66a3643373",
+  "allowed_symbols": ["ETHUSD"],
+  "max_volume": 0.01,
+  "max_open_commands_per_day": 4
+}

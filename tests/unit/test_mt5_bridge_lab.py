@@ -163,6 +163,18 @@ def test_snapshot_persists_reconciliation_and_symbol_cost_facts(
         "free_margin": 10005.0,
         "positions": [],
         "orders": [],
+        "bars": [
+            {
+                "symbol": "EURUSD",
+                "timeframe": "4h",
+                "time": "2026-07-30T08:00:00+00:00",
+                "open": 1.099,
+                "high": 1.101,
+                "low": 1.098,
+                "close": 1.1,
+                "volume": 1234,
+            }
+        ],
         "symbols": [
             {
                 "symbol": "EURUSD",
@@ -196,10 +208,16 @@ def test_snapshot_persists_reconciliation_and_symbol_cost_facts(
         row = connection.execute(
             "SELECT spread,spread_points FROM symbol_snapshots"
         ).fetchone()
+        bar = connection.execute(
+            "SELECT symbol,timeframe,open,high,low,close,volume "
+            "FROM bar_snapshots"
+        ).fetchone()
     finally:
         connection.close()
     assert row[0] == pytest.approx(0.0002)
     assert row[1] == pytest.approx(20.0)
+    assert tuple(bar[:2]) == ("EURUSD", "4h")
+    assert tuple(bar[2:]) == pytest.approx((1.099, 1.101, 1.098, 1.1, 1234))
 
 
 def test_trade_events_are_idempotent(tmp_path: Path) -> None:
