@@ -46,6 +46,11 @@ from app.ibkr_l1_recovery import (
 
 _PRODUCER = {"name": "lts.ibkr_l1_outbox", "version": "0.1.0"}
 _DEFAULT_QUOTE_MAX_AGE_SECONDS = 60.0
+# A decision older than this is dead evidence: it terminally rejects rather
+# than executing against a market that has moved on. Transient conditions
+# (stale/wide/absent quote, missing capability) merely DEFER: the decision
+# stays pending and the next tick re-evaluates it.
+_DEFAULT_DECISION_MAX_AGE_SECONDS = 300.0
 
 
 class L1OutboxConsumer:
@@ -62,6 +67,7 @@ class L1OutboxConsumer:
         price_decimals: int = 5,
         quantity_decimals: int = 0,
         quote_max_age_seconds: float = _DEFAULT_QUOTE_MAX_AGE_SECONDS,
+        max_decision_age_seconds: float = _DEFAULT_DECISION_MAX_AGE_SECONDS,
     ) -> None:
         self.service = service
         self.olap = olap
@@ -73,6 +79,7 @@ class L1OutboxConsumer:
         self.price_decimals = price_decimals
         self.quantity_decimals = quantity_decimals
         self.quote_max_age_seconds = quote_max_age_seconds
+        self.max_decision_age_seconds = max_decision_age_seconds
 
     # -- helpers -----------------------------------------------------------
     def _reject(
@@ -182,6 +189,19 @@ class L1OutboxConsumer:
                 key, [],
                 f"entry_budget_{self.profile.max_orders_this_activation}_exhausted",
             )
+        # age is measured from the decision's own quote evidence: a decision
+        # whose market evidence has expired must never execute later
+        evidence_time = pending["quote_time"] or pending["decided_at"]
+        anchored_at = datetime.fromisoformat(evidence_time)
+        if anchored_at.tzinfo is None:
+            anchored_at = anchored_at.replace(tzinfo=timezone.utc)
+        decision_age = (now - anchored_at).total_seconds()
+        if decision_age > self.max_decision_age_seconds:
+            return self._reject(
+                key, [],
+                f"decision_stale:{decision_age:.1f}s_exceeds_"
+                f"{self.max_decision_age_seconds}s",
+            )
         reference = pending["reference_price"]
         if reference is None:
             return self._reject(key, [], "decision_reference_price_missing")
@@ -198,9 +218,15 @@ class L1OutboxConsumer:
                 key, [],
                 f"take_profit_distance_{take_distance:.6f}_exceeds_profile_max",
             )
+        # quote problems are transient: fail closed by DEFERRING, never by
+        # destroying a decision that a fresh quote could still execute
         quote_refusal = self._quote_refusal(quote, now)
         if quote_refusal is not None:
-            return self._reject(key, [], quote_refusal)
+            return {
+                "idempotency_key": key,
+                "state": "deferred",
+                "reason": quote_refusal,
+            }
 
         # deferrable authority: no capability is not a terminal condition
         try:
@@ -312,6 +338,8 @@ class L1OutboxConsumer:
         effect = self.olap.effect_row(effect_id)
         if effect is None or effect["state"] != "acknowledged":
             return None
+        if self.olap.broker_facts(effect_id, "parent_fill_applied"):
+            return None                     # idempotent: applied exactly once
         intent = OrderIntentV2.model_validate_json(
             self.olap.decision_intent_json(effect["idempotency_key"])
         )

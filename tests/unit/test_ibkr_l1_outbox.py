@@ -290,12 +290,27 @@ def test_synthetic_capability_evidence_is_refused(env):
     ({"bid": 1.08810, "ask": 1.08790, "time": NOW}, "invalid"),
     (None, "quote_missing"),
 ])
-def test_bad_quotes_are_durable_refusals(env, quote, reason):
+def test_bad_quotes_defer_and_never_destroy_the_decision(env, quote, reason):
     env.mint()
     env.decide(_asset_intent())
     results = env.consumer.consume_entries(quote=quote, now=NOW + timedelta(seconds=2))
-    assert results[0]["state"] == "terminal_rejected"
+    assert results[0]["state"] == "deferred"
     assert reason in results[0]["reason"]
+    assert _place_calls(env.client) == []
+    assert env.olap.effect_by_key(results[0]["idempotency_key"]) is None
+    # the same pending decision executes once a healthy quote returns
+    retry = env.consumer.consume_entries(quote=QUOTE, now=NOW + timedelta(seconds=3))
+    assert retry[0]["state"] == "acknowledged"
+
+
+def test_stale_decision_is_terminally_rejected(env):
+    env.mint()
+    env.decide(_asset_intent())
+    late = NOW + timedelta(seconds=400)
+    results = env.consumer.consume_entries(
+        quote={"bid": 1.08790, "ask": 1.08810, "time": late}, now=late)
+    assert results[0]["state"] == "terminal_rejected"
+    assert "decision_stale" in results[0]["reason"]
     assert _place_calls(env.client) == []
 
 

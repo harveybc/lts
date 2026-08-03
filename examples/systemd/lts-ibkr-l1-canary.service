@@ -1,0 +1,37 @@
+# LTS IBKR Paper L1 canary runner — DISABLED BY DEFAULT.
+#
+# This unit must NOT be enabled until:
+#   1. General Musashi's independent verification of milestones A-F, and
+#   2. the owner's explicit activation command, and
+#   3. the owner has minted a one-use capability outside chat
+#      (tools/mint_paper_capability.py, interactive terminal only).
+#
+# Even then, the shipped config keeps "enabled": false; the runner then only
+# writes a heartbeat and touches no broker client. Both switches — the unit
+# AND the config flag — are deliberate.
+#
+# Deploy (does not start anything):
+#   cp examples/systemd/lts-ibkr-l1-canary.service ~/.config/systemd/user/
+#   cp examples/configs/ibkr_l1_runner.example.json \
+#      ~/.config/lts/ibkr_l1_runner.json     # keep "enabled": false
+#   systemctl --user daemon-reload
+#
+# Rollback / emergency stop:
+#   systemctl --user disable --now lts-ibkr-l1-canary.service
+#   ...then issue the owner hold/kill command through the accepted L0 path;
+#   the durable halt state blocks all new risk and recovery stays available.
+
+[Unit]
+Description=LTS IBKR Paper L1 canary runner (fail-closed, disabled by default)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/harveybc/Documents/GitHub/lts
+ExecStart=/home/harveybc/anaconda3/envs/trading-stack/bin/python -m app.ibkr_l1_runner --config %h/.config/lts/ibkr_l1_runner.json
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

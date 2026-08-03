@@ -235,7 +235,7 @@ class L1ExecutionOlap(DemoExecutionOlap):
         """
         rows = self._con.execute(
             "SELECT idempotency_key, intent_json, capability_evidence,"
-            " reference_price, quote_time FROM decisions "
+            " reference_price, quote_time, decided_at FROM decisions "
             "WHERE outcome=? AND intent_json IS NOT NULL "
             "AND idempotency_key NOT IN (SELECT idempotency_key FROM l1_effects) "
             "ORDER BY decided_at",
@@ -248,6 +248,7 @@ class L1ExecutionOlap(DemoExecutionOlap):
                 "capability_evidence": r[2],
                 "reference_price": r[3],
                 "quote_time": r[4],
+                "decided_at": r[5],
             }
             for r in rows
         ]
@@ -273,6 +274,18 @@ class L1ExecutionOlap(DemoExecutionOlap):
             "SELECT COUNT(*) FROM l1_effects WHERE kind='bracket_entry' "
             "AND state != 'terminal_rejected'"
         ).fetchone()[0]
+
+    def l1_effect_state_counts(self) -> dict[str, int]:
+        rows = self._con.execute(
+            "SELECT state, COUNT(*) FROM l1_effects GROUP BY state"
+        ).fetchall()
+        return {state: count for state, count in rows}
+
+    def l1_broker_fact_counts(self) -> dict[str, int]:
+        rows = self._con.execute(
+            "SELECT fact_kind, COUNT(*) FROM l1_broker_facts GROUP BY fact_kind"
+        ).fetchall()
+        return {kind: count for kind, count in rows}
 
     # -- capabilities (single-use, consumed atomically with an effect) -----
     def consume_capability(

@@ -1,0 +1,33 @@
+{
+  "enabled": false,
+  "service": {
+    "venue": "ibkr_paper",
+    "account_fingerprint": "c0ff137a3cc1a363",
+    "environment": "paper",
+    "database_path": "/home/harveybc/.local/state/lts/demo_execution.sqlite",
+    "risk_fraction_at_stop": 0.005,
+    "max_overshoot_ratio": 0.25,
+    "gross_notional_fraction_max": 0.10,
+    "margin_fraction_max": 0.10,
+    "daily_loss_budget_fraction": 0.02,
+    "max_concurrent_positions": 3,
+    "signal_max_age_seconds": 300.0,
+    "owner_issuer_allowlist": ["owner-1"],
+    "command_phrases": {
+      "hold": "SET BY OWNER OUTSIDE GIT",
+      "kill": "SET BY OWNER OUTSIDE GIT",
+      "flatten_all": "SET BY OWNER OUTSIDE GIT",
+      "cancel_pending": "SET BY OWNER OUTSIDE GIT"
+    },
+    "asset_instrument_bindings": {"fx:EUR/USD": "EUR.USD"}
+  },
+  "profile_path": "/home/harveybc/Documents/GitHub/lts/examples/configs/ibkr_l1_canary_profile_v2.json",
+  "quote_database_path": "/home/harveybc/.local/state/lts/ibkr_paper_lab.sqlite",
+  "quote_symbol": "EUR.USD",
+  "quote_max_age_seconds": 60.0,
+  "loop_seconds": 30.0,
+  "heartbeat_path": "/home/harveybc/.local/state/lts/ibkr_l1_runner_heartbeat.json",
+  "price_decimals": 5,
+  "quantity_decimals": 0,
+  "max_decision_age_seconds": 300.0
+}
