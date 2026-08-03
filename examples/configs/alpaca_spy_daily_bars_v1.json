@@ -1,0 +1,11 @@
+{
+  "schema": "lts.alpaca.closed_bar_fetch.v1",
+  "api_key_env": "ALPACA_PAPER_API_KEY_ID",
+  "api_secret_env": "ALPACA_PAPER_API_SECRET_KEY",
+  "symbol": "SPY",
+  "timeframe": "1Day",
+  "bar_seconds": 86400,
+  "start": "2020-01-01T00:00:00Z",
+  "timeout_seconds": 30,
+  "output_file": "~/.local/share/lts/live-data/alpaca_iex_spy_1d.csv"
+}

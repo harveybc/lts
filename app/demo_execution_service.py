@@ -1041,6 +1041,16 @@ class DemoExecutionService:
         stop_distance = abs(reference_price - sl)
         capability_hash = content_hash(capability.model_dump(mode="json"))
         reservation_id = f"rsv-{hashlib.sha256(idem.encode()).hexdigest()[:16]}"
+        input_hash = next(
+            (code.removeprefix("input:") for code in intent.reason_codes
+             if code.startswith("input:")),
+            None,
+        )
+        model_id = next(
+            (code.removeprefix("model:") for code in intent.reason_codes
+             if code.startswith("model:")),
+            intent.producer.name,
+        )
 
         def build_order(units: float, risk: RiskEnvelope) -> OrderIntentV2:
             return OrderIntentV2(
@@ -1065,6 +1075,10 @@ class DemoExecutionService:
                     "reference_price": reference_price,
                     "quote_time": quote_time.isoformat(),
                     "capability_evidence": capability.capability_evidence,
+                    "source_model_id": model_id,
+                    "source_artifact_sha256": intent.artifact_hash,
+                    "source_config_sha256": intent.config_hash,
+                    "source_input_sha256": input_hash,
                 },
             )
 

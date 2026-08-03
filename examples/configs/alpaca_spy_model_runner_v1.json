@@ -1,0 +1,30 @@
+{
+  "schema": "lts.alpaca.model_runner.v1",
+  "profile_file": "~/Documents/GitHub/lts/examples/configs/alpaca_spy_l1_profile_v1.json",
+  "secrets": {
+    "api_key_env": "ALPACA_PAPER_API_KEY_ID",
+    "api_secret_env": "ALPACA_PAPER_API_SECRET_KEY"
+  },
+  "model": {
+    "manifest_file": "~/.local/share/prediction-provider/live/spy_daily_linear_v1/manifest.json"
+  },
+  "data": {"source": "alpaca_iex", "start": "2020-01-01T00:00:00Z"},
+  "strategy": {"stop_fraction": 0.005, "take_profit_fraction": 0.01},
+  "service": {
+    "venue": "alpaca_paper",
+    "account_fingerprint": "3de2ab7a14663a11",
+    "environment": "paper",
+    "database_path": "~/.local/state/lts/alpaca-model-execution.sqlite",
+    "risk_fraction_at_stop": 0.00004,
+    "max_overshoot_ratio": 0.5,
+    "gross_notional_fraction_max": 0.01,
+    "margin_fraction_max": 0.01,
+    "daily_loss_budget_fraction": 0.001,
+    "max_concurrent_positions": 1,
+    "signal_max_age_seconds": 345600,
+    "owner_issuer_allowlist": ["harvey-owner"],
+    "command_phrases": {},
+    "asset_instrument_bindings": {"equity:SPY": "SPY"}
+  },
+  "loop_seconds": 60
+}

@@ -128,7 +128,7 @@ class L1ExecutionOlap(DemoExecutionOlap):
         effect_id: str,
         idempotency_key: str,
         kind: str,
-        order_ids: list[int],
+        order_ids: list[Any],
         capability_sha256: Optional[str] = None,
     ) -> None:
         now = _utc_now().isoformat()
@@ -164,7 +164,7 @@ class L1ExecutionOlap(DemoExecutionOlap):
         ).fetchone()
         return None if row is None else self._effect_dict(row)
 
-    def set_effect_order_ids(self, effect_id: str, order_ids: list[int]) -> None:
+    def set_effect_order_ids(self, effect_id: str, order_ids: list[Any]) -> None:
         """Bind broker ids before the first call; never rewrite a non-empty set."""
         row = self.effect_row(effect_id)
         if row is None:
@@ -319,6 +319,14 @@ class L1ExecutionOlap(DemoExecutionOlap):
             "SELECT COUNT(*) FROM l1_effects WHERE kind='bracket_entry' "
             "AND state != 'terminal_rejected'"
         ).fetchone()[0]
+
+    def effect_count_since(self, kind: str, since: str) -> int:
+        """Count non-rejected effects of one kind from an ISO-8601 boundary."""
+        return int(self._con.execute(
+            "SELECT COUNT(*) FROM l1_effects WHERE kind=? AND created_at>=? "
+            "AND state != 'terminal_rejected'",
+            (kind, since),
+        ).fetchone()[0])
 
     def l1_effect_state_counts(self) -> dict[str, int]:
         rows = self._con.execute(

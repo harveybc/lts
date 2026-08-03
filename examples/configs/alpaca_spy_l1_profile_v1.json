@@ -1,0 +1,13 @@
+{
+  "schema": "lts.alpaca.paper_l1_profile.v1",
+  "venue": "alpaca_paper",
+  "environment": "paper",
+  "asset_class": "us_equity",
+  "account_fingerprint": "3de2ab7a14663a11",
+  "symbol": "SPY",
+  "asset_id": "equity:SPY",
+  "quantity_ceiling": 1,
+  "max_orders_per_day": 4,
+  "max_risk_fraction_at_stop": 0.00005,
+  "orders": {"enabled": true}
+}

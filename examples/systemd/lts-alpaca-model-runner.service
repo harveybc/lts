@@ -1,0 +1,17 @@
+[Unit]
+Description=LTS Alpaca Paper model execution runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/GitHub/lts
+EnvironmentFile=%h/.config/lts/alpaca-paper.env
+ExecStart=%h/anaconda3/envs/trading-stack/bin/python -m app.alpaca_model_runner --config examples/configs/alpaca_spy_model_runner_v1.json
+Restart=always
+RestartSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -301,6 +301,9 @@ class AlpacaPaperClient:
         )
         return [dict(item) for item in payload]
 
+    def asset(self, symbol: str) -> Dict[str, Any]:
+        return dict(self._get(f"asset.{symbol}", f"/v2/assets/{symbol.upper()}"))
+
     def positions(self) -> list[Dict[str, Any]]:
         payload = self._get("positions", "/v2/positions")
         return [dict(item) for item in payload]
@@ -328,6 +331,47 @@ class AlpacaPaperClient:
             params={"symbols": ",".join(sorted(set(symbols)))},
         )
         return dict(payload.get("quotes", {}))
+
+    def stock_bars(
+        self,
+        symbol: str,
+        *,
+        timeframe: str,
+        start: str,
+        end: Optional[str] = None,
+        feed: str = "iex",
+        limit: int = 10000,
+        page_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if feed != "iex":
+            raise AlpacaPaperError("Only the configured IEX live-equity feed is allowed")
+        params: Dict[str, Any] = {
+            "timeframe": timeframe,
+            "start": start,
+            "feed": feed,
+            "adjustment": "raw",
+            "limit": min(max(int(limit), 1), 10000),
+        }
+        if end:
+            params["end"] = end
+        if page_token:
+            params["page_token"] = page_token
+        return dict(self._get(
+            f"stocks.{symbol}.bars",
+            f"/v2/stocks/{symbol.upper()}/bars",
+            data_api=True,
+            params=params,
+        ))
+
+    def latest_stock_quote(self, symbol: str, *, feed: str = "iex") -> Dict[str, Any]:
+        if feed != "iex":
+            raise AlpacaPaperError("Only the configured IEX live-equity feed is allowed")
+        return dict(self._get(
+            f"stocks.{symbol}.latest_quote",
+            f"/v2/stocks/{symbol.upper()}/quotes/latest",
+            data_api=True,
+            params={"feed": feed},
+        ).get("quote", {}))
 
 
 class AlpacaPaperOlap:
