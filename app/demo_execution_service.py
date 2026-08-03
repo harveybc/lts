@@ -139,9 +139,9 @@ class DemoExecutionConfig:
 class ZeroNetworkSink:
     """The adapter serialization boundary with structurally zero submissions.
 
-    Serializes the exact IBKR-bracket-shaped payload the L1 adapter will
-    send, hashes and stores it, and never imports or touches a socket. The
-    L0->L1 switch replaces only this class behind the same interface.
+    Serializes a venue-bound protected-order payload, hashes and stores it,
+    and never imports or touches a socket. The L0->L1 switch replaces only
+    this class behind the same interface.
     """
 
     def __init__(self) -> None:
@@ -153,7 +153,7 @@ class ZeroNetworkSink:
             raise DemoExecutionError("sink refuses unprotected payload")
         side = "BUY" if intent.delta_units > 0 else "SELL"
         payload = {
-            "adapter": "ibkr_paper.bracket.v1",
+            "adapter": f"{intent.venue}.protected_order.v1",
             "venue": intent.venue,
             "instrument": intent.instrument,
             "side": side,

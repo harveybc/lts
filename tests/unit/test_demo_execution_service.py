@@ -141,6 +141,7 @@ def test_protected_would_be_order_produced_with_zero_network(tmp_path):
     service = _service(tmp_path)
     result = _process(service, _intent())
     assert result["outcome"] == "would_be_order"
+    assert result["payload"]["adapter"] == "ibkr_paper.protected_order.v1"
     bracket = result["payload"]["bracket"]
     assert bracket["stop_loss_price"] == 0.99
     assert bracket["take_profit_price"] == 1.02
@@ -164,6 +165,7 @@ def test_sink_refuses_unprotected_payload(tmp_path):
     )
     payload = sink.serialize(close_only)  # risk-reducing close is legal
     assert payload["intent_class"] == "risk_reducing"
+    assert payload["adapter"] == "v.protected_order.v1"
 
 
 # ── finding 040: minimum-size overshoot and cap atomicity ──
