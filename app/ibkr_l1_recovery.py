@@ -320,6 +320,8 @@ class BracketLifecycleController:
                 if (
                     position.get("symbol") == expected["symbol"]
                     and position.get("currency") == expected["currency"]
+                    and position.get("secType") == expected["secType"]
+                    and position.get("account") == plan.parent["account"]
                 ):
                     residual += float(position.get("units", 0.0))
             had_position = residual != 0.0

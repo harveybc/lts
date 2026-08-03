@@ -502,6 +502,7 @@ class L1OutboxConsumer:
             for p in self.client.position_facts()
             if p.get("symbol") == expected_contract["symbol"]
             and p.get("currency") == expected_contract["currency"]
+            and p.get("secType") == expected_contract["secType"]
             and p.get("account") == account
         )
         if abs(observed - sign * cumulative) > epsilon:
@@ -536,6 +537,19 @@ class L1OutboxConsumer:
         idem = self.olap.reservation_idempotency(reservation_id)
         return self.olap.effect_by_key(idem) if idem else None
 
+    def _refuse_flatten(self, effect_id: str, reason: str) -> dict[str, Any]:
+        """A flatten that cannot PROVE exact account, contract and position
+        agreement refuses before any broker call, journals, and holds. It
+        never resizes, never guesses, never crosses zero."""
+        with self.olap.atomic_unit():
+            self.olap.record_broker_fact(
+                effect_id, "flatten_refusal", {"reason": reason}
+            )
+            self.olap.advance_effect(effect_id, "effect_unknown")
+            if self.olap.get_state("halt", "none") == "none":
+                self.olap.set_state("halt", "hold")
+        return {"state": "effect_unknown", "refused": reason}
+
     def _consume_flatten(
         self, pending: dict[str, Any], *, now: datetime
     ) -> dict[str, Any]:
@@ -544,9 +558,61 @@ class L1OutboxConsumer:
         target = intent.reduce_target_order_intent_id
         entry_effect = self._entry_effect_for_target(target)
         effect_id = effect_id_for(key)
-        flatten_units = -intent.delta_units  # delta closes; position is -delta
         with self.olap.atomic_unit():
             self.olap.create_effect(effect_id, key, "flatten", [], None)
+
+        # ── finding 070: exact risk-reducing preflight BEFORE any call ──
+        account = self.client.connected_account()
+        if account is None or hashlib.sha256(
+            str(account).encode()
+        ).hexdigest()[:16] != self.profile.account_fingerprint:
+            result = self._refuse_flatten(
+                effect_id, "connected_account_not_authorized")
+            result["idempotency_key"] = key
+            return result
+        expected = expected_contract_facts(intent.instrument)
+        expected_con_id = None
+        if entry_effect is not None:
+            entry_contract = self.olap.effect_contract(entry_effect["effect_id"])
+            if entry_contract is not None:
+                expected_con_id = entry_contract["expected_con_id"]
+        position = 0.0
+        for fact in self.client.position_facts():
+            if (
+                fact.get("symbol") != expected["symbol"]
+                or fact.get("currency") != expected["currency"]
+                or fact.get("secType") != expected["secType"]
+                or fact.get("account") != account
+            ):
+                continue
+            fact_con_id = fact.get("conId")
+            if (
+                expected_con_id is not None
+                and fact_con_id is not None
+                and int(fact_con_id) != int(expected_con_id)
+            ):
+                continue
+            position += float(fact.get("units", 0.0))
+        epsilon = 1e-9
+        if abs(position) <= epsilon:
+            result = self._refuse_flatten(
+                effect_id,
+                "no_matching_position_to_flatten_while_intent_expects_"
+                f"{-intent.delta_units}",
+            )
+            result["idempotency_key"] = key
+            return result
+        if abs(position + intent.delta_units) > epsilon:
+            result = self._refuse_flatten(
+                effect_id,
+                f"position_{position}_disagrees_with_immutable_intent_delta_"
+                f"{intent.delta_units}_never_resized",
+            )
+            result["idempotency_key"] = key
+            return result
+        # quantity and side derive from the PROVEN position; agreement with
+        # the immutable intent is exact, so zero-crossing is impossible
+        flatten_units = position
 
         try:
             # orphaned protective children must not survive the position
@@ -569,7 +635,7 @@ class L1OutboxConsumer:
 
             contract, order = build_flatten_order(
                 instrument=intent.instrument,
-                account=str(self.client.connected_account()),
+                account=str(account),
                 net_units=flatten_units,
                 order_id=self.client.reserve_order_ids(1),
             )
@@ -591,12 +657,13 @@ class L1OutboxConsumer:
                 self.olap.set_state("halt", "hold")
             return {"idempotency_key": key, "state": "effect_unknown"}
 
-        expected = expected_contract_facts(intent.instrument)
         remaining = sum(
-            float(position.get("units", 0.0))
-            for position in self.client.position_facts()
-            if position.get("symbol") == expected["symbol"]
-            and position.get("currency") == expected["currency"]
+            float(fact.get("units", 0.0))
+            for fact in self.client.position_facts()
+            if fact.get("symbol") == expected["symbol"]
+            and fact.get("currency") == expected["currency"]
+            and fact.get("secType") == expected["secType"]
+            and fact.get("account") == account
         )
         if remaining != 0.0:
             with self.olap.atomic_unit():

@@ -279,6 +279,103 @@ def test_position_disagreement_refuses_and_holds(env):
     assert env.olap.get_state("halt") == "hold"
 
 
+# ── F0.4 (finding 070): exact risk-reducing preflight ──
+
+def _filled_long_with_pending_flatten(env):
+    """Entry acknowledged, fully filled, exposure open, flatten_all issued."""
+    from trading_contracts import OwnerCommand
+    env.client.auto_fill_market_orders = True
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 20000.0)
+    sync = env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    assert sync["reservation"] == "consumed"
+    env.service.apply_owner_command(OwnerCommand(
+        object_id="oc-f0-1", as_of=NOW + timedelta(seconds=4),
+        producer={"name": "owner", "version": "0"}, trace_id="t-own",
+        command="flatten_all", issuer_id="owner-1",
+        exact_phrase="FLATTEN ALL DEMO POSITIONS NOW", nonce="n-f0-1",
+        expires_at=NOW + timedelta(minutes=5), idempotency_key="cmd-f0-1",
+    ), now=NOW + timedelta(seconds=4))
+    return effect_id, order_ids
+
+
+def _corrupt_flatten_delta(env, new_delta):
+    import json as _json
+    row = env.olap._con.execute(
+        "SELECT idempotency_key, intent_json FROM decisions "
+        "WHERE outcome='would_be_flatten'"
+    ).fetchone()
+    intent = _json.loads(row[1])
+    intent["delta_units"] = new_delta
+    env.olap._con.execute(
+        "UPDATE decisions SET intent_json=? WHERE idempotency_key=?",
+        (_json.dumps(intent), row[0]),
+    )
+
+
+def _place_count(client):
+    return sum(1 for name, _ in client.calls if name == "place_order")
+
+
+@pytest.mark.parametrize("corrupted_delta", [-40000.0, -10000.0, 20000.0])
+def test_corrupted_flatten_delta_refuses_and_never_touches_the_broker(
+    env, corrupted_delta
+):
+    """Musashi 070 counterexample: a -40000 flatten of a long 20000 SELL'd
+    40000 and reversed the account. Now: exact disagreement refuses with
+    zero broker calls and the position untouched."""
+    _filled_long_with_pending_flatten(env)
+    _corrupt_flatten_delta(env, corrupted_delta)
+    places_before = _place_count(env.client)
+    results = env.consumer.consume_flattens(now=NOW + timedelta(seconds=5))
+    assert "never_resized" in results[0]["refused"]
+    assert _place_count(env.client) == places_before   # zero submissions
+    assert env.client._own_cash_units("EUR") == 20000.0
+    assert env.olap.get_state("halt") == "hold"
+
+
+def test_stale_position_refuses_flatten(env):
+    _filled_long_with_pending_flatten(env)
+    env.client.set_position(symbol="EUR", currency="USD", units=15000.0)
+    places_before = _place_count(env.client)
+    results = env.consumer.consume_flattens(now=NOW + timedelta(seconds=5))
+    assert "disagrees" in results[0]["refused"]
+    assert _place_count(env.client) == places_before
+    assert env.olap.get_state("halt") == "hold"
+
+
+def test_zero_position_with_flatten_intent_refuses(env):
+    _filled_long_with_pending_flatten(env)
+    env.client.set_position(symbol="EUR", currency="USD", units=0.0)
+    results = env.consumer.consume_flattens(now=NOW + timedelta(seconds=5))
+    assert "no_matching_position" in results[0]["refused"]
+    assert env.olap.get_state("halt") == "hold"
+
+
+def test_wrong_connected_account_refuses_flatten_before_any_read(env):
+    _filled_long_with_pending_flatten(env)
+    env.client.account = "DU-OTHER-9"
+    places_before = _place_count(env.client)
+    results = env.consumer.consume_flattens(now=NOW + timedelta(seconds=5))
+    assert "not_authorized" in results[0]["refused"]
+    assert _place_count(env.client) == places_before
+
+
+def test_foreign_positions_never_count_toward_the_flatten(env):
+    _filled_long_with_pending_flatten(env)
+    env.client.set_position(symbol="EUR", currency="USD", units=5000.0,
+                            account="DU-SOMEONE-ELSE")
+    env.client.set_position(symbol="EUR", currency="USD", units=7000.0,
+                            sec_type="FUT")
+    results = env.consumer.consume_flattens(now=NOW + timedelta(seconds=5))
+    assert results[0]["state"] == "terminal_flat"      # own 20k CASH matched
+    assert env.client._own_cash_units("EUR") == 0.0
+    survivors = {(p["account"], p["secType"], p["units"])
+                 for p in env.client.position_facts()}
+    assert ("DU-SOMEONE-ELSE", "CASH", 5000.0) in survivors
+    assert (ACCOUNT, "FUT", 7000.0) in survivors       # untouched
+
+
 # ── schema migration: additive, never destructive ──
 
 def test_l0_ledger_migrates_additively_to_l1_schema(tmp_path):

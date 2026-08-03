@@ -255,10 +255,7 @@ class FakeIbkrClient:
             self._orders[fact["orderId"]]["filled"] = fact["totalQuantity"]
             self._orders[fact["orderId"]]["remaining"] = 0.0
             sign = 1.0 if fact["action"] == "BUY" else -1.0
-            existing = 0.0
-            for p in self._positions:
-                if p["symbol"] == fact["contract"]["symbol"]:
-                    existing = p["units"]
+            existing = self._own_cash_units(fact["contract"]["symbol"])
             self.set_position(
                 symbol=fact["contract"]["symbol"],
                 currency=fact["contract"]["currency"],
@@ -310,17 +307,36 @@ class FakeIbkrClient:
         self._orders.pop(int(order_id), None)
 
     def set_position(
-        self, *, symbol: str, currency: str, units: float
+        self,
+        *,
+        symbol: str,
+        currency: str,
+        units: float,
+        sec_type: str = "CASH",
+        account: Optional[str] = None,
+        con_id: Optional[int] = None,
     ) -> None:
+        """Positions are keyed by full identity: multiple accounts,
+        secTypes or conIds can coexist on one symbol (finding 070)."""
+        account = account or self.account
+        key = (symbol, currency, sec_type, account, con_id)
         self._positions = [
             p for p in self._positions
-            if not (p["symbol"] == symbol and p["currency"] == currency)
+            if (p["symbol"], p["currency"], p["secType"], p["account"],
+                p.get("conId")) != key
         ]
         if units != 0.0:
             self._positions.append(
-                {"account": self.account, "symbol": symbol,
-                 "currency": currency, "secType": "CASH", "units": units}
+                {"account": account, "symbol": symbol, "currency": currency,
+                 "secType": sec_type, "conId": con_id, "units": units}
             )
+
+    def _own_cash_units(self, symbol: str) -> float:
+        return sum(
+            p["units"] for p in self._positions
+            if p["symbol"] == symbol and p["secType"] == "CASH"
+            and p["account"] == self.account
+        )
 
     def fill_parent(self, order_id: int, units: float) -> None:
         """Simulate an incremental fill: cumulative ``filled`` grows, the
@@ -333,10 +349,7 @@ class FakeIbkrClient:
         if fact["remaining"] <= 0.0:
             fact["status"] = "Filled"
         sign = 1.0 if fact["action"] == "BUY" else -1.0
-        existing = 0.0
-        for p in self._positions:
-            if p["symbol"] == fact["contract"]["symbol"]:
-                existing = p["units"]
+        existing = self._own_cash_units(fact["contract"]["symbol"])
         self.set_position(
             symbol=fact["contract"]["symbol"],
             currency=fact["contract"]["currency"],
