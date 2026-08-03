@@ -2,7 +2,10 @@
   "schema": "lts.mt5.model_runner.v1",
   "bridge_config_file": "~/.config/lts/mt5_execution_bridge.json",
   "model": {
-    "manifest_file": "~/.local/share/prediction-provider/live/ethusdt_4h_linear_v1/manifest.json"
+    "manifest_file": "~/.local/share/prediction-provider/live/ethusdt_4h_linear_v1/manifest.json",
+    "expected_asset_id": "crypto:ETHUSD",
+    "expected_timeframe": "4h",
+    "execution_tier": "demo_research_canary"
   },
   "route": {"symbol": "ETHUSD", "timeframe": "4h"},
   "strategy": {"stop_fraction": 0.01, "take_profit_fraction": 0.02},

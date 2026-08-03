@@ -12,12 +12,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from prediction_provider_mechanics import LiveLinearPolicy, build_closed_bar_features
+from prediction_provider_mechanics import build_closed_bar_features
 from trading_contracts import AssetIntent, BrokerCapabilitySnapshot, InstrumentCapability
 
 from app.alpaca_l1 import AlpacaL1Executor, AlpacaL1Profile, AlpacaPaperTradingClient
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
+from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
 
 
 def _utc_now() -> datetime:
@@ -26,10 +27,6 @@ def _utc_now() -> datetime:
 
 def _path(value: str | Path) -> Path:
     return Path(os.path.expandvars(str(value))).expanduser()
-
-
-def _sha(path: str | Path) -> str:
-    return hashlib.sha256(_path(path).read_bytes()).hexdigest()
 
 
 class AlpacaModelRunnerError(RuntimeError):
@@ -176,14 +173,14 @@ class AlpacaModelRunner:
         )
         self.executor = AlpacaL1Executor(self.store, self.client, self.profile)
         self.sessions = ModelSessionStore(self.store._con)
-        manifest_path = _path(config["model"]["manifest_file"])
-        self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        artifact_path = _path(self.manifest["artifact_file"])
-        if _sha(artifact_path) != self.manifest["artifact_sha256"]:
-            raise AlpacaModelRunnerError("selected model artifact hash mismatch")
-        if _sha(self.manifest["config_file"]) != self.manifest["config_sha256"]:
-            raise AlpacaModelRunnerError("selected model config hash mismatch")
-        self.policy = LiveLinearPolicy.load(artifact_path, self.manifest["artifact_sha256"])
+        self.selector = SelectedLinearPolicy(
+            manifest_file=config["model"]["manifest_file"],
+            expected_asset_id=config["model"]["expected_asset_id"],
+            expected_timeframe=config["model"]["expected_timeframe"],
+            execution_tier=config["model"]["execution_tier"],
+        )
+        self.manifest = self.selector.manifest
+        self.policy = self.selector.policy
 
     def _account_facts(self) -> tuple[dict[str, Any], str]:
         account = self.client.account()
@@ -216,6 +213,13 @@ class AlpacaModelRunner:
 
     def tick(self, *, allow_execution: bool = True) -> dict[str, Any]:
         now = _utc_now()
+        selection_error = None
+        try:
+            if self.selector.refresh():
+                self.manifest = self.selector.manifest
+                self.policy = self.selector.policy
+        except LiveModelSelectionError as exc:
+            selection_error = str(exc)
         account, fingerprint = self._account_facts()
         open_orders = self.client.open_orders()
         positions = [p for p in self.client.positions() if p.get("symbol") == self.profile.symbol]
@@ -241,6 +245,9 @@ class AlpacaModelRunner:
         if current is None:
             if open_orders or positions:
                 return {"state": "blocked_foreign_exposure"}
+            if selection_error:
+                return {"state": "selection_refused", "reason": selection_error,
+                        "orders_submitted": 0}
             current = self.sessions.activate(
                 venue="alpaca_paper", account=fingerprint, symbol=self.profile.symbol,
                 model_id=self.policy.model_id,
@@ -254,7 +261,11 @@ class AlpacaModelRunner:
                 self.executor.monitor(effect["effect_id"])
         if open_orders or positions:
             return {"state": "monitoring", "model_id": self.policy.model_id,
-                    "orders": len(open_orders), "positions": len(positions)}
+                    "orders": len(open_orders), "positions": len(positions),
+                    "selection_error": selection_error}
+        if selection_error:
+            return {"state": "selection_refused", "reason": selection_error,
+                    "orders_submitted": 0}
 
         bars = _bars(self.client, self.profile.symbol, self.config["data"]["start"])
         observation = build_closed_bar_features(bars[-60:])

@@ -68,7 +68,8 @@ def test_closed_bars_drive_one_l0_checked_model_command(tmp_path):
         "model_id": "eth-test-v1", "asset_id": "crypto:ETHUSD",
         "timeframe": "4h", "artifact_file": str(artifact_path),
         "artifact_sha256": artifact_sha, "config_file": str(training_config),
-        "config_sha256": config_sha,
+        "config_sha256": config_sha, "research_validated": True,
+        "live_inference_eligible": False, "live_execution_eligible": False,
     })
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -98,7 +99,12 @@ def test_closed_bars_drive_one_l0_checked_model_command(tmp_path):
     runner_config = {
         "schema": "lts.mt5.model_runner.v1",
         "bridge_config_file": str(bridge_path),
-        "model": {"manifest_file": str(manifest_path)},
+        "model": {
+            "manifest_file": str(manifest_path),
+            "expected_asset_id": "crypto:ETHUSD",
+            "expected_timeframe": "4h",
+            "execution_tier": "demo_research_canary",
+        },
         "route": {"symbol": "ETHUSD", "timeframe": "4h"},
         "strategy": {"stop_fraction": 0.01, "take_profit_fraction": 0.02},
         "snapshot_max_age_seconds": 120, "loop_seconds": 15,

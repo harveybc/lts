@@ -11,12 +11,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from prediction_provider_mechanics import LiveLinearPolicy, build_closed_bar_features
+from prediction_provider_mechanics import build_closed_bar_features
 from trading_contracts import AssetIntent, BrokerCapabilitySnapshot, InstrumentCapability
 
 from app.alpaca_model_runner import ModelSessionStore
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
+from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
 from app.mt5_execution_bridge import Mt5ExecutionConfig, Mt5ExecutionStore
 
 
@@ -26,10 +27,6 @@ def _utc_now() -> datetime:
 
 def _path(value: str | Path) -> Path:
     return Path(os.path.expandvars(str(value))).expanduser()
-
-
-def _sha(path: str | Path) -> str:
-    return hashlib.sha256(_path(path).read_bytes()).hexdigest()
 
 
 class Mt5ModelRunnerError(RuntimeError):
@@ -65,16 +62,14 @@ class Mt5ModelRunner:
             ZeroNetworkSink(),
         )
         self.sessions = ModelSessionStore(self.l0._con)
-        manifest_path = _path(config["model"]["manifest_file"])
-        self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        artifact_path = _path(self.manifest["artifact_file"])
-        if _sha(artifact_path) != self.manifest["artifact_sha256"]:
-            raise Mt5ModelRunnerError("selected MT5 model artifact hash mismatch")
-        if _sha(self.manifest["config_file"]) != self.manifest["config_sha256"]:
-            raise Mt5ModelRunnerError("selected MT5 model config hash mismatch")
-        self.policy = LiveLinearPolicy.load(
-            artifact_path, self.manifest["artifact_sha256"]
+        self.selector = SelectedLinearPolicy(
+            manifest_file=config["model"]["manifest_file"],
+            expected_asset_id=config["model"]["expected_asset_id"],
+            expected_timeframe=config["model"]["expected_timeframe"],
+            execution_tier=config["model"]["execution_tier"],
         )
+        self.manifest = self.selector.manifest
+        self.policy = self.selector.policy
 
     def _latest_snapshot(self) -> Optional[dict[str, Any]]:
         row = self.bridge_store.connection.execute(
@@ -160,6 +155,13 @@ class Mt5ModelRunner:
 
     def tick(self) -> dict[str, Any]:
         now = _utc_now()
+        selection_error = None
+        try:
+            if self.selector.refresh():
+                self.manifest = self.selector.manifest
+                self.policy = self.selector.policy
+        except LiveModelSelectionError as exc:
+            selection_error = str(exc)
         snapshot = self._latest_snapshot()
         if snapshot is None:
             return {"state": "waiting_for_snapshot"}
@@ -203,6 +205,9 @@ class Mt5ModelRunner:
         if current is None:
             if positions or orders:
                 return {"state": "blocked_foreign_exposure"}
+            if selection_error:
+                return {"state": "selection_refused", "reason": selection_error,
+                        "commands_queued": 0}
             current = self.sessions.activate(
                 venue="mt5_demo", account=self.bridge_config.account_fingerprint,
                 symbol=symbol, model_id=self.policy.model_id,
@@ -224,9 +229,13 @@ class Mt5ModelRunner:
                 return {"state": "closing_unprotected_position",
                         "command_id": command["command_id"]}
             return {"state": "monitoring", "positions": len(positions),
-                    "orders": len(orders), "model_id": self.policy.model_id}
+                    "orders": len(orders), "model_id": self.policy.model_id,
+                    "selection_error": selection_error}
         if orders:
             return {"state": "monitoring_pending_order", "orders": len(orders)}
+        if selection_error:
+            return {"state": "selection_refused", "reason": selection_error,
+                    "commands_queued": 0}
 
         observation = build_closed_bar_features(bars[-60:])
         inference = self.policy.predict(observation)

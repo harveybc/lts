@@ -6,7 +6,10 @@
     "api_secret_env": "ALPACA_PAPER_API_SECRET_KEY"
   },
   "model": {
-    "manifest_file": "~/.local/share/prediction-provider/live/spy_daily_linear_v1/manifest.json"
+    "manifest_file": "~/.local/share/prediction-provider/live/spy_daily_linear_v1/manifest.json",
+    "expected_asset_id": "equity:SPY",
+    "expected_timeframe": "1d",
+    "execution_tier": "demo_research_canary"
   },
   "data": {"source": "alpaca_iex", "start": "2020-01-01T00:00:00Z"},
   "strategy": {"stop_fraction": 0.005, "take_profit_fraction": 0.01},
