@@ -300,69 +300,12 @@ def build_bracket(
     return BracketPlan(parent=parent, take_profit=take_profit, stop_loss=stop_loss)
 
 
-def verify_bracket_acknowledgement(
-    *,
-    plan: BracketPlan,
-    open_orders: list[Mapping[str, Any]],
-    quantity_tolerance: float = 1e-9,
-) -> dict[str, Any]:
-    """Hard post-submit condition: parent AND both children acknowledged.
-
-    Returns a verdict dict; the caller must cancel/flatten and hold on any
-    result whose ``protected`` field is False. Missing evidence is never
-    read as success (auditor: "never infer a zero or success from missing
-    alerts").
-    """
-    by_id = {}
-    for order in open_orders:
-        order_id = order.get("orderId")
-        if order_id is not None:
-            by_id[int(order_id)] = order
-    verdict: dict[str, Any] = {"protected": False, "legs": {}}
-    for name, spec in (
-        ("parent", plan.parent),
-        ("take_profit", plan.take_profit),
-        ("stop_loss", plan.stop_loss),
-    ):
-        observed = by_id.get(int(spec["orderId"]))
-        leg = {
-            "acknowledged": observed is not None,
-            "order_id": spec["orderId"],
-            "expected_action": spec["action"],
-            "expected_quantity": spec["totalQuantity"],
-        }
-        if observed is not None:
-            leg["observed_action"] = observed.get("action")
-            leg["observed_quantity"] = observed.get("totalQuantity")
-            leg["status"] = observed.get("status")
-            leg["action_matches"] = observed.get("action") == spec["action"]
-            leg["quantity_matches"] = (
-                observed.get("totalQuantity") is not None
-                and abs(
-                    float(observed["totalQuantity"]) - float(spec["totalQuantity"])
-                ) <= quantity_tolerance
-            )
-            if name != "parent":
-                leg["parent_matches"] = (
-                    observed.get("parentId") == plan.parent["orderId"]
-                )
-        verdict["legs"][name] = leg
-    children_ok = all(
-        verdict["legs"][name].get("acknowledged")
-        and verdict["legs"][name].get("action_matches")
-        and verdict["legs"][name].get("quantity_matches")
-        and verdict["legs"][name].get("parent_matches")
-        for name in ("take_profit", "stop_loss")
-    )
-    parent_ok = (
-        verdict["legs"]["parent"].get("acknowledged")
-        and verdict["legs"]["parent"].get("action_matches")
-        and verdict["legs"]["parent"].get("quantity_matches")
-    )
-    verdict["protected"] = bool(parent_ok and children_ok)
-    if not verdict["protected"]:
-        verdict["required_action"] = "cancel_flatten_and_global_hold"
-    return verdict
+# Finding 065: the former presence-only verify_bracket_acknowledgement was
+# REMOVED. The only acknowledgement authority is
+# app.ibkr_l1_recovery.verify_bracket_exact, which requires status, account,
+# contract, type, price, TIF and parent-link agreement from direct broker
+# facts, and whose controller EXECUTES cancel/flatten/hold instead of
+# returning a string recommendation.
 
 
 class IbkrPaperL1Sink:

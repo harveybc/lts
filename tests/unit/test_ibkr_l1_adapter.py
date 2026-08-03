@@ -20,7 +20,6 @@ from app.ibkr_l1_adapter import (
     L1ExecutionError,
     L1Profile,
     build_bracket,
-    verify_bracket_acknowledgement,
 )
 
 NOW = datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc)
@@ -263,75 +262,13 @@ def test_unprotected_intent_cannot_build_a_bracket():
         _plan(close_only)
 
 
-# ── acknowledgement verification: the hard post-submit condition ──
-
-def _ack(plan, drop=None, mutate=None):
-    orders = []
-    for name, spec in (("parent", plan.parent), ("take_profit", plan.take_profit),
-                       ("stop_loss", plan.stop_loss)):
-        if name == drop:
-            continue
-        entry = {
-            "orderId": spec["orderId"], "action": spec["action"],
-            "totalQuantity": spec["totalQuantity"], "status": "Submitted",
-        }
-        if "parentId" in spec:
-            entry["parentId"] = spec["parentId"]
-        if mutate and name in mutate:
-            entry.update(mutate[name])
-        orders.append(entry)
-    return orders
+# Acknowledgement verification moved to app.ibkr_l1_recovery (finding 065:
+# the presence-only verifier was removed); see test_ibkr_l1_recovery.py.
 
 
-def test_full_acknowledgement_is_protected():
-    plan = _plan()
-    verdict = verify_bracket_acknowledgement(plan=plan, open_orders=_ack(plan))
-    assert verdict["protected"] is True
-
-
-@pytest.mark.parametrize("missing", ["parent", "take_profit", "stop_loss"])
-def test_any_missing_leg_demands_cancel_flatten_and_hold(missing):
-    plan = _plan()
-    verdict = verify_bracket_acknowledgement(
-        plan=plan, open_orders=_ack(plan, drop=missing))
-    assert verdict["protected"] is False
-    assert verdict["required_action"] == "cancel_flatten_and_global_hold"
-
-
-def test_child_without_parent_link_is_not_protected():
-    plan = _plan()
-    verdict = verify_bracket_acknowledgement(
-        plan=plan, open_orders=_ack(plan, mutate={"stop_loss": {"parentId": 999}}))
-    assert verdict["protected"] is False
-
-
-def test_quantity_mismatch_is_not_protected():
-    plan = _plan()
-    verdict = verify_bracket_acknowledgement(
-        plan=plan, open_orders=_ack(plan, mutate={"take_profit": {"totalQuantity": 10000.0}}))
-    assert verdict["protected"] is False
-
-
-def test_wrong_side_child_is_not_protected():
-    plan = _plan()
-    verdict = verify_bracket_acknowledgement(
-        plan=plan, open_orders=_ack(plan, mutate={"stop_loss": {"action": "BUY"}}))
-    assert verdict["protected"] is False
-
-
-def test_empty_broker_evidence_is_never_read_as_success():
-    plan = _plan()
-    verdict = verify_bracket_acknowledgement(plan=plan, open_orders=[])
-    assert verdict["protected"] is False
-    assert verdict["required_action"] == "cancel_flatten_and_global_hold"
-
-
-def test_child_acknowledged_before_parent_is_not_protected():
-    plan = _plan()
-    verdict = verify_bracket_acknowledgement(
-        plan=plan, open_orders=_ack(plan, drop="parent"))
-    assert verdict["protected"] is False
-    assert verdict["legs"]["stop_loss"]["acknowledged"] is True
+def test_weak_acknowledgement_verifier_no_longer_exists():
+    import app.ibkr_l1_adapter as adapter
+    assert not hasattr(adapter, "verify_bracket_acknowledgement")
 
 
 # ── the serialize sink: same service contract as L0 ──

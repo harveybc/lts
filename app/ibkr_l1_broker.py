@@ -47,6 +47,10 @@ class IbkrClientProtocol(Protocol):
         """The account the session is bound to, or None when unknown."""
         ...
 
+    def next_order_id(self) -> int:
+        """A fresh broker-valid order id (TWS: reqIds/getReqId)."""
+        ...
+
 
 @dataclass(frozen=True)
 class TranslatedBracket:
@@ -202,10 +206,14 @@ class FakeIbkrClient:
     fail_cancel: bool = False
     reject_unknown_parent: bool = True
     initial_status: str = "PreSubmitted"
+    # standalone MKT orders (no parent link, transmit=True) fill immediately
+    # and move the position — the realism recovery flatten tests need
+    auto_fill_market_orders: bool = False
 
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     _orders: dict[int, dict[str, Any]] = field(default_factory=dict)
     _positions: list[dict[str, Any]] = field(default_factory=list)
+    _next_id: int = 9000
 
     # -- protocol ----------------------------------------------------------
     def place_order(self, contract: Any, order: Any) -> dict[str, Any]:
@@ -227,6 +235,24 @@ class FakeIbkrClient:
                 f"fake TWS: parent order {fact['parentId']} unknown"
             )
         self._orders[fact["orderId"]] = dict(fact)
+        if (
+            self.auto_fill_market_orders
+            and fact["orderType"] == "MKT"
+            and fact["transmit"]
+            and not fact["parentId"]
+        ):
+            self._orders[fact["orderId"]]["status"] = "Filled"
+            sign = 1.0 if fact["action"] == "BUY" else -1.0
+            existing = 0.0
+            for p in self._positions:
+                if p["symbol"] == fact["contract"]["symbol"]:
+                    existing = p["units"]
+            self.set_position(
+                symbol=fact["contract"]["symbol"],
+                currency=fact["contract"]["currency"],
+                units=existing + sign * fact["totalQuantity"],
+            )
+            return {"orderId": fact["orderId"], "status": "Filled"}
         return {"orderId": fact["orderId"], "status": self.initial_status}
 
     def cancel_order(self, order_id: int) -> dict[str, Any]:
@@ -249,6 +275,10 @@ class FakeIbkrClient:
 
     def connected_account(self) -> Optional[str]:
         return self.account
+
+    def next_order_id(self) -> int:
+        self._next_id += 1
+        return self._next_id
 
     # -- test manipulation (broker-side reality injection) -----------------
     def _place_calls(self) -> int:
