@@ -501,6 +501,12 @@ class DemoExecutionOlap:
             ),
         )
 
+    def exposure_state(self, exposure_id: str) -> Optional[str]:
+        row = self._con.execute(
+            "SELECT state FROM exposures WHERE exposure_id=?", (exposure_id,)
+        ).fetchone()
+        return row[0] if row else None
+
     def close_exposure(self, exposure_id: str) -> None:
         cur = self._con.execute(
             "UPDATE exposures SET state='closed', closed_at=? "

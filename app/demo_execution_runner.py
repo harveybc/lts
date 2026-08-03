@@ -197,6 +197,11 @@ class SyntheticLifecycleDriver:
                     advanced.append({"order": order["order_intent_id"],
                                      "to": "filled"})
                 elif state == "filled":
+                    exposure_state = self.service.olap.exposure_state(
+                        f"exp-{order['order_intent_id']}"
+                    )
+                    if exposure_state != "open":
+                        continue  # already closed; a settled past stays quiet
                     opened = datetime.fromisoformat(order["as_of"])
                     held = (now - opened).total_seconds()
                     if held >= self.hold_bars * self.bar_seconds:

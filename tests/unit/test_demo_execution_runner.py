@@ -217,6 +217,13 @@ def test_finding_056_lifecycle_driver_prevents_saturation(tmp_path):
     assert fourth["would_be_orders_session"] == 2
     assert runner.service.sink.network_submissions == 0
 
+    # a settled past stays quiet: later ticks never retry the closed
+    # exposure and never emit error entries (live-observed noise bug)
+    fifth = runner.tick(now=later + timedelta(minutes=1))
+    closed_retries = [a for a in fifth["lifecycle_advanced"]
+                      if a.get("error") or a.get("to") == "position_closed"]
+    assert closed_retries == []
+
 
 def test_runner_resumes_journaled_effects_at_startup(tmp_path, monkeypatch):
     """Finding 055 end-to-end: crash between kill acceptance and emission,
