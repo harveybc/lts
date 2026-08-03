@@ -16,6 +16,7 @@ from trading_contracts import AssetIntent, BrokerCapabilitySnapshot, InstrumentC
 
 from app.alpaca_model_runner import ModelSessionStore
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
+from app.ibkr_l1_adapter import L1ExecutionError
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.ibkr_l1_outbox import L1OutboxConsumer
 from app.ibkr_model_authority import ContinuousPaperGate, ContinuousPaperProfile
@@ -214,7 +215,16 @@ class IbkrModelRunner:
         self.sessions.record_inference(current["session_id"], inference)
         if inference["action"] == "hold":
             return {"state": "hold", "inference": inference, "l1": monitoring}
-        quote = self.client.current_quote(self.profile.instrument)
+        try:
+            quote = self.client.current_quote(self.profile.instrument)
+        except L1ExecutionError as exc:
+            return {
+                "state": "waiting_for_quote",
+                "reason": str(exc),
+                "inference": inference,
+                "orders_submitted": 0,
+                "l1": monitoring,
+            }
         decision_now = _utc_now()
         reference = (float(quote["bid"]) + float(quote["ask"])) / 2.0
         side = 1.0 if inference["action"] == "long" else -1.0

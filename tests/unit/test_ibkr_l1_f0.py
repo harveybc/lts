@@ -235,6 +235,19 @@ def test_cumulative_partial_fills_with_duplicates_and_restart(env):
     assert abs(totals["day_risk"] - reservation["original_risk_fraction"]) < 1e-12
 
 
+def test_terminal_fill_is_canonicalized_within_numeric_tolerance(env):
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 19999.999999999996)
+
+    sync = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=3)
+    )
+
+    assert sync["cumulative"] == 20000.0
+    assert sync["reservation"] == "consumed"
+    assert env.olap.open_exposures()[0]["units_open"] == 20000.0
+
+
 def test_partial_fill_then_broker_cancel_recovers_and_releases_remainder(env):
     env.client.auto_fill_market_orders = True
     effect_id, order_ids = _entered(env)

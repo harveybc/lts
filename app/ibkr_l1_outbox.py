@@ -479,6 +479,14 @@ class L1OutboxConsumer:
         magnitude = abs(float(contract["delta_units"]))
         applied = self._applied_cumulative(effect_id)
         epsilon = 1e-9
+        if abs(cumulative - magnitude) <= epsilon:
+            cumulative = magnitude
+        if abs(applied - magnitude) <= epsilon:
+            applied = magnitude
+        if cumulative < -epsilon:
+            return self._refuse_fill_sync(
+                effect_id, f"broker_cumulative_{cumulative}_is_negative"
+            )
         if cumulative > magnitude + epsilon:
             return self._refuse_fill_sync(
                 effect_id, f"filled_{cumulative}_exceeds_requested_{magnitude}"
