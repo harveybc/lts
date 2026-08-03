@@ -347,6 +347,8 @@ def create_mt5_execution_app(
     @app.get("/v1/status")
     def status() -> dict[str, Any]:
         result = store.operational_status(config.stale_heartbeat_seconds)
+        result["bridge_version"] = EXECUTION_BRIDGE_VERSION
+        result["read_only"] = False
         result["execution_enabled"] = True
         result["command_counts"] = store.command_counts()
         return result

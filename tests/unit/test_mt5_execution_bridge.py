@@ -42,6 +42,17 @@ def test_execution_ea_bar_json_concatenates_closing_brace():
     ) in source
 
 
+def test_execution_ea_handles_empty_get_hash_and_header_case():
+    source = EA_PATH.read_text(encoding="utf-8")
+    assert (
+        "e3b0c44298fc1c149afbf4c8996fb924"
+        "27ae41e4649b934ca495991b7852b855"
+    ) in source
+    assert 'if(value == "")' in source
+    assert "StringToLower(normalized_headers);" in source
+    assert "StringToLower(normalized_name);" in source
+
+
 def _config(tmp_path):
     return Mt5ExecutionConfig(
         database_path=tmp_path / "mt5.sqlite", secret_env="SECRET",
@@ -127,6 +138,18 @@ def test_signed_delivery_and_exact_result_lifecycle(tmp_path):
     assert response.status_code == 200
     assert response.json()["state"] == "succeeded"
     assert store.command_counts() == {"succeeded": 1}
+
+
+def test_execution_status_reports_v2_and_not_read_only(tmp_path):
+    config = _config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+
+    status = client.get("/v1/status").json()
+
+    assert status["bridge_version"] == "lts.mt5.bridge.execution.v2"
+    assert status["read_only"] is False
+    assert status["execution_enabled"] is True
 
 
 def test_wrong_account_and_unsigned_poll_never_receive_commands(tmp_path):

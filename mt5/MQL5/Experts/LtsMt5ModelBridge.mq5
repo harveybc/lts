@@ -20,6 +20,7 @@ input int InpMaximumDeviationPoints = 20;
 input long InpMagic = 26080301;
 
 string ADAPTER_VERSION = "lts.mt5.ea.execution.v2";
+string EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 string account_fingerprint = "";
 string server_fingerprint = "";
 int timer_counter = 0;
@@ -104,6 +105,11 @@ string HexEncode(const uchar &source[])
 
 bool Sha256String(const string value, string &digest_hex)
   {
+   if(value == "")
+     {
+      digest_hex = EMPTY_SHA256;
+      return true;
+     }
    uchar source[];
    uchar digest[];
    if(!Utf8Bytes(value, source) || !Sha256(source, digest))
@@ -162,6 +168,8 @@ bool HmacSha256(const string key_text, const string message, string &digest_hex)
 bool CryptoSelfTest()
   {
    string digest = "";
+   if(!Sha256String("", digest) || digest != EMPTY_SHA256)
+      return false;
    if(!HmacSha256(
       "key",
       "The quick brown fox jumps over the lazy dog",
@@ -236,8 +244,12 @@ bool SignedPost(const string path, const string body)
 
 string HeaderValue(const string headers, const string name)
   {
-   string marker = name + ":";
-   int start = StringFind(headers, marker);
+   string normalized_headers = headers;
+   string normalized_name = name;
+   StringToLower(normalized_headers);
+   StringToLower(normalized_name);
+   string marker = normalized_name + ":";
+   int start = StringFind(normalized_headers, marker);
    if(start < 0)
       return "";
    start += StringLen(marker);
