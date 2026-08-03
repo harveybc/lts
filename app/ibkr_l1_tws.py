@@ -118,6 +118,55 @@ class IbAsyncTwsClient(IbkrClientProtocol):
         self.ib.sleep(self.settle_seconds)
         return list(by_id.values())
 
+    @staticmethod
+    def _completed_execution_facts(
+        completed_orders: list[Any], fills: list[Any]
+    ) -> list[dict[str, Any]]:
+        """Join completed orders to executions without inventing restart facts.
+
+        TWS reports a completed order with ``orderId=0`` after reconnect, while
+        its execution retains both the original order id and the same permanent
+        id.  Only that direct ``permId`` match is sufficient to reconstruct the
+        filled parent used by protection and cumulative-fill reconciliation.
+        """
+        orders_by_perm_id = {
+            int(trade.order.permId): trade
+            for trade in completed_orders
+            if int(getattr(trade.order, "permId", 0) or 0) > 0
+        }
+        executions_by_order: dict[int, list[Any]] = {}
+        for fill in fills:
+            execution = fill.execution
+            perm_id = int(getattr(execution, "permId", 0) or 0)
+            order_id = int(getattr(execution, "orderId", 0) or 0)
+            if perm_id in orders_by_perm_id and order_id > 0:
+                executions_by_order.setdefault(order_id, []).append(fill)
+
+        facts = []
+        for order_id, matched_fills in executions_by_order.items():
+            perm_ids = {int(fill.execution.permId) for fill in matched_fills}
+            if len(perm_ids) != 1:
+                continue
+            completed = orders_by_perm_id[next(iter(perm_ids))]
+            cumulative = max(float(fill.execution.cumQty) for fill in matched_fills)
+            filled_quantity = float(
+                getattr(completed.order, "filledQuantity", 0.0) or 0.0
+            )
+            total = max(cumulative, filled_quantity)
+            fact = order_fact(
+                completed.contract,
+                completed.order,
+                str(getattr(completed.orderStatus, "status", "") or "Unknown"),
+            )
+            fact.update({
+                "orderId": order_id,
+                "totalQuantity": total,
+                "filled": cumulative,
+                "remaining": max(0.0, total - cumulative),
+            })
+            facts.append(fact)
+        return facts
+
     def place_order(self, contract: Any, order: Any) -> dict[str, Any]:
         if not self.ib.isConnected():
             raise ConnectionError("TWS Paper session is disconnected")
@@ -144,7 +193,15 @@ class IbAsyncTwsClient(IbkrClientProtocol):
         return {"orderId": int(order_id), "status": status}
 
     def open_order_facts(self) -> list[dict[str, Any]]:
-        return [self._trade_fact(trade) for trade in self._known_trades()]
+        facts = {
+            int(fact["orderId"]): fact
+            for fact in (self._trade_fact(trade) for trade in self._known_trades())
+        }
+        completed = self.ib.reqCompletedOrders(apiOnly=False)
+        self.ib.sleep(self.settle_seconds)
+        for fact in self._completed_execution_facts(completed, list(self.ib.fills())):
+            facts.setdefault(int(fact["orderId"]), fact)
+        return list(facts.values())
 
     def position_facts(self) -> list[dict[str, Any]]:
         self.ib.sleep(0)

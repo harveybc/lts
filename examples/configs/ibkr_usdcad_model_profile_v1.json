@@ -10,7 +10,7 @@
   "instrument": "USD.CAD",
   "asset_id": "fx:USD/CAD",
   "max_entries_per_day": 4,
-  "quantity_ceiling": 20000.0,
+  "quantity_ceiling": 25000.0,
   "stop_distance_price_max": 0.003,
   "take_profit_distance_price_max": 0.006,
   "max_spread_price": 0.0003,

@@ -123,7 +123,8 @@ def test_selected_model_reaches_one_exact_protected_ibkr_paper_bracket(tmp_path)
         "heartbeat_path": str(tmp_path / "heartbeat.json"),
         "service": {
             "venue": "ibkr_paper", "account_fingerprint": FINGERPRINT,
-            "environment": "paper", "database_path": str(tmp_path / "runner.sqlite"),
+            "environment": "paper",
+            "database_path": str(tmp_path / "new-state" / "runner.sqlite"),
             "risk_fraction_at_stop": 0.00005, "max_overshoot_ratio": 0.25,
             "gross_notional_fraction_max": 0.029, "margin_fraction_max": 0.029,
             "daily_loss_budget_fraction": 0.0002, "max_concurrent_positions": 1,
@@ -133,8 +134,10 @@ def test_selected_model_reaches_one_exact_protected_ibkr_paper_bracket(tmp_path)
         },
     }
     broker = ModelBroker(account=ACCOUNT)
+    assert not (tmp_path / "new-state").exists()
     runner = IbkrModelRunner(config, client_factory=lambda _profile: broker)
     try:
+        assert (tmp_path / "new-state" / "runner.sqlite").is_file()
         result = runner.tick()
         assert result["state"] == "decided"
         assert result["decision"]["outcome"] == "would_be_order"

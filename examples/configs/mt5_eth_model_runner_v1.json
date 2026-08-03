@@ -11,6 +11,7 @@
   "strategy": {"stop_fraction": 0.01, "take_profit_fraction": 0.02},
   "snapshot_max_age_seconds": 120,
   "loop_seconds": 15,
+  "heartbeat_path": "~/.local/state/lts/mt5-model-runner-heartbeat.json",
   "service": {
     "venue": "mt5_demo",
     "account_fingerprint": "c88e492afa0f8d66a3643373",

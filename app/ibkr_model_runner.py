@@ -4,8 +4,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import signal
-import time
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -19,6 +20,7 @@ from app.ibkr_l1_journal import L1ExecutionOlap
 from app.ibkr_l1_outbox import L1OutboxConsumer
 from app.ibkr_model_authority import ContinuousPaperGate, ContinuousPaperProfile
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
+from app.model_runner_heartbeat import write_runner_heartbeat
 
 
 _OPEN_STATUSES = {"PendingSubmit", "PendingCancel", "PreSubmitted", "Submitted"}
@@ -30,6 +32,10 @@ class IbkrModelRunnerError(RuntimeError):
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _path(value: str | Path) -> Path:
+    return Path(os.path.expandvars(str(value))).expanduser()
 
 
 def _client(profile: ContinuousPaperProfile):
@@ -48,6 +54,9 @@ class IbkrModelRunner:
             Path(config["profile_file"]).expanduser()
         )
         self.client = (client_factory or _client)(self.profile)
+        database_path = _path(config["service"]["database_path"])
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        config["service"]["database_path"] = str(database_path)
         service_config = DemoExecutionConfig.from_dict(config["service"])
         self.olap = L1ExecutionOlap(service_config.database_path)
         self.service = DemoExecutionService(service_config, self.olap, ZeroNetworkSink())
@@ -255,19 +264,11 @@ class IbkrModelRunner:
             self.olap.close()
 
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
-        path = Path(self.config["heartbeat_path"]).expanduser()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        body = {
-            "schema": "lts.ibkr.model_runner.heartbeat.v1",
-            "observed_at": _utc_now().isoformat(),
-            **payload,
-        }
-        temporary.write_text(
-            json.dumps(body, sort_keys=True, indent=1, default=str),
-            encoding="utf-8",
+        write_runner_heartbeat(
+            self.config["heartbeat_path"],
+            schema="lts.ibkr.model_runner.heartbeat.v1",
+            payload=payload,
         )
-        temporary.replace(path)
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -284,16 +285,15 @@ def main() -> int:
     args = parser.parse_args()
     config = load_config(args.config)
     runner = IbkrModelRunner(config)
-    stopped = False
+    stopped = threading.Event()
 
     def stop(*_args):
-        nonlocal stopped
-        stopped = True
+        stopped.set()
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        while not stopped:
+        while not stopped.is_set():
             try:
                 result = runner.tick()
                 runner.write_heartbeat(result)
@@ -307,7 +307,7 @@ def main() -> int:
                 raise
             if args.once:
                 break
-            time.sleep(float(config["loop_seconds"]))
+            stopped.wait(float(config["loop_seconds"]))
     finally:
         runner.close()
     return 0

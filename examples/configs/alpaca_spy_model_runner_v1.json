@@ -29,5 +29,6 @@
     "command_phrases": {},
     "asset_instrument_bindings": {"equity:SPY": "SPY"}
   },
-  "loop_seconds": 60
+  "loop_seconds": 60,
+  "heartbeat_path": "~/.local/state/lts/alpaca-model-runner-heartbeat.json"
 }

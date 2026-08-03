@@ -7,7 +7,7 @@ import json
 import os
 import signal
 import sqlite3
-import time
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +19,7 @@ from app.alpaca_l1 import AlpacaL1Executor, AlpacaL1Profile, AlpacaPaperTradingC
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
+from app.model_runner_heartbeat import write_runner_heartbeat
 
 
 def _utc_now() -> datetime:
@@ -165,6 +166,9 @@ class AlpacaModelRunner:
         self.profile = AlpacaL1Profile.load(_path(config["profile_file"]))
         config["service"]["database_path"] = str(
             _path(config["service"]["database_path"])
+        )
+        Path(config["service"]["database_path"]).parent.mkdir(
+            parents=True, exist_ok=True
         )
         self.store = L1ExecutionOlap(config["service"]["database_path"])
         self.service = DemoExecutionService(
@@ -321,6 +325,15 @@ class AlpacaModelRunner:
     def close(self) -> None:
         self.store.close()
 
+    def write_heartbeat(self, payload: dict[str, Any]) -> None:
+        write_runner_heartbeat(
+            self.config.get(
+                "heartbeat_path", "~/.local/state/lts/alpaca-model-runner-heartbeat.json"
+            ),
+            schema="lts.alpaca.model_runner.heartbeat.v1",
+            payload=payload,
+        )
+
 
 def load_config(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -337,21 +350,27 @@ def main() -> int:
     args = parser.parse_args()
     config = load_config(args.config)
     runner = AlpacaModelRunner(config)
-    stopped = False
+    stopped = threading.Event()
     def stop(*_args):
-        nonlocal stopped
-        stopped = True
+        stopped.set()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        while not stopped:
-            print(json.dumps(
-                runner.tick(allow_execution=not args.inference_only),
-                sort_keys=True, default=str,
-            ), flush=True)
+        while not stopped.is_set():
+            try:
+                result = runner.tick(allow_execution=not args.inference_only)
+                runner.write_heartbeat(result)
+                print(json.dumps(result, sort_keys=True, default=str), flush=True)
+            except Exception as exc:
+                runner.write_heartbeat({
+                    "state": "degraded_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "orders_submitted": None,
+                })
+                raise
             if args.once:
                 break
-            time.sleep(float(config["loop_seconds"]))
+            stopped.wait(float(config["loop_seconds"]))
     finally:
         runner.close()
     return 0
