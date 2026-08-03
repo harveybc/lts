@@ -143,11 +143,11 @@ class Env:
         )
         self._nonce_counter = 0
 
-    def mint(self, ceiling=20000.0, now=None):
+    def mint(self, ceiling=20000.0, now=None, contract_con_id=None):
         payload = mint_payload(
             self.profile, quantity_ceiling=ceiling,
             max_risk_fraction_at_stop=0.005, validity_seconds=900,
-            contract_con_id=None, now=now or NOW,
+            contract_con_id=contract_con_id, now=now or NOW,
         )
         return write_capability(payload, self.store)
 

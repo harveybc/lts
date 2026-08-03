@@ -170,6 +170,18 @@ class IbkrL1Runner:
 
         # 1. crash recovery first: classify and re-acknowledge from facts
         for outcome in consumer.resume(now=now):
+            if outcome.get("classification") == "aborted_no_call":
+                events.append(
+                    f"l1_effect_aborted_no_call:{outcome['effect_id']}"
+                )
+                alerts.append(
+                    f"effect_aborted_no_call:{outcome['effect_id']}"
+                )
+            if outcome.get("resume_refused"):
+                alerts.append(
+                    f"resume_refused:{outcome['effect_id']}:"
+                    f"{outcome['resume_refused']}"
+                )
             if outcome.get("reacknowledged") is not None:
                 events.append(
                     f"l1_effect_resumed:{outcome['effect_id']}:"

@@ -298,10 +298,13 @@ def test_resume_distinguishes_pre_effect_from_unknown(olap):
     olap.record_broker_fact("l1e-amb", "call_attempt", {"leg": "parent", "orderId": 4})
     report = {r["effect_id"]: r for r in
               BracketExecutor(olap, FakeIbkrClient(account=ACCOUNT)).resume_report()}
-    assert report["l1e-pre"]["classification"] == "consumed_before_effect"
+    # finding 073: proven zero-call crashes resolve TERMINALLY and visibly
+    assert report["l1e-pre"]["classification"] == "aborted_no_call"
+    assert olap.effect_row("l1e-pre")["state"] == "terminal_aborted_no_call"
+    kinds = [f["fact_kind"] for f in olap.broker_facts("l1e-pre")]
+    assert "no_call_abort" in kinds
     assert report["l1e-amb"]["classification"] == "effect_unknown"
     assert olap.effect_row("l1e-amb")["state"] == "effect_unknown"  # durable
-    assert olap.effect_row("l1e-pre")["state"] == "journaled_pending"
 
 
 def test_resume_reports_awaiting_acknowledgement_after_full_submission(olap):

@@ -31,12 +31,18 @@ from trading_contracts import (
 from app.demo_execution_service import DemoExecutionService
 from app.ibkr_l1_adapter import (
     L1AuthorizationError,
+    L1ExecutionError,
     L1Profile,
     build_bracket,
 )
 from app.ibkr_l1_broker import IbkrClientProtocol
 from app.ibkr_l1_capability import CapabilityGate
-from app.ibkr_l1_executor import BracketExecutor, L1EffectUnknown, effect_id_for
+from app.ibkr_l1_executor import (
+    BracketExecutor,
+    L1EffectUnknown,
+    effect_id_for,
+    plan_from_contract,
+)
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.ibkr_l1_recovery import (
     BracketLifecycleController,
@@ -267,7 +273,12 @@ class L1OutboxConsumer:
             quantity_decimals=self.quantity_decimals,
         )
         try:
-            submit = self.executor.submit_bracket(intent, plan, record)
+            submit = self.executor.submit_bracket(
+                intent, plan, record,
+                expected_con_id=record.metadata.get("contract_con_id"),
+                price_decimals=self.price_decimals,
+                quantity_decimals=self.quantity_decimals,
+            )
         except L1EffectUnknown as error:
             return {
                 "idempotency_key": key,
@@ -509,11 +520,24 @@ class L1OutboxConsumer:
         }
 
     # -- restart -----------------------------------------------------------
+    def _refuse_resume(self, effect_id: str, reason: str) -> None:
+        """A resume that cannot prove its bindings journals, demotes to
+        unknown and holds. It never guesses from current configuration."""
+        with self.olap.atomic_unit():
+            self.olap.record_broker_fact(
+                effect_id, "resume_refusal", {"reason": reason}
+            )
+            if self.olap.effect_row(effect_id)["state"] != "effect_unknown":
+                self.olap.advance_effect(effect_id, "effect_unknown")
+            if self.olap.get_state("halt", "none") == "none":
+                self.olap.set_state("halt", "hold")
+
     def resume(self, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
         """After a crash: classify every effect from durable facts, then
         drive entry effects that were submitted-but-unacknowledged (or
-        ambiguous) through exact acknowledgement, which recovers on any
-        unproven protection. Nothing is promoted without direct facts."""
+        ambiguous) through exact acknowledgement AGAINST THE IMMUTABLE
+        EFFECT CONTRACT (finding 072) — never against current profile,
+        rounding or account configuration."""
         now = now or datetime.now(timezone.utc)
         report = self.executor.resume_report()
         outcomes = []
@@ -524,23 +548,28 @@ class L1OutboxConsumer:
             ):
                 outcomes.append(entry)
                 continue
-            intent_json = self.olap.decision_intent_json(effect["idempotency_key"])
-            if intent_json is None:
+            entry = dict(entry)
+            contract = self.olap.effect_contract(effect["effect_id"])
+            if contract is None:
+                self._refuse_resume(effect["effect_id"], "missing_effect_contract")
+                entry["resume_refused"] = "missing_effect_contract"
+                entry["state"] = "effect_unknown"
                 outcomes.append(entry)
                 continue
-            intent = OrderIntentV2.model_validate_json(intent_json)
             account = self.client.connected_account()
-            plan = build_bracket(
-                intent,
-                parent_order_id=effect["order_ids"][0],
-                account=str(account),
-                price_decimals=self.price_decimals,
-                quantity_decimals=self.quantity_decimals,
-            )
+            try:
+                plan = plan_from_contract(contract, account=str(account))
+            except L1ExecutionError as error:
+                self._refuse_resume(effect["effect_id"], str(error))
+                entry["resume_refused"] = str(error)
+                entry["state"] = "effect_unknown"
+                outcomes.append(entry)
+                continue
             verdict = self.controller.acknowledge(
-                effect["effect_id"], plan, instrument=self.profile.instrument
+                effect["effect_id"], plan,
+                instrument=contract["instrument"],
+                expected_con_id=contract["expected_con_id"],
             )
-            entry = dict(entry)
             entry["reacknowledged"] = verdict["protected"]
             entry["state"] = self.olap.effect_row(effect["effect_id"])["state"]
             outcomes.append(entry)

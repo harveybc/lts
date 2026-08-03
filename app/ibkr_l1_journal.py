@@ -37,6 +37,10 @@ EFFECT_STATES = frozenset({
     "terminal_cancelled",
     "terminal_rejected",
     "terminal_failed_held",
+    # finding 073: attempts are journaled BEFORE every broker call, so zero
+    # attempt facts PROVE no broker effect; the crash resolves terminally
+    # while the consumed capability stays burned.
+    "terminal_aborted_no_call",
 })
 
 TERMINAL_EFFECT_STATES = frozenset({
@@ -44,6 +48,7 @@ TERMINAL_EFFECT_STATES = frozenset({
     "terminal_cancelled",
     "terminal_rejected",
     "terminal_failed_held",
+    "terminal_aborted_no_call",
 })
 
 # Success is only reachable through acknowledged; unknown never jumps to a
@@ -51,7 +56,8 @@ TERMINAL_EFFECT_STATES = frozenset({
 LEGAL_EFFECT_TRANSITIONS: dict[str, frozenset[str]] = {
     "journaled_pending": frozenset(
         {"effect_unknown", "submitted_pending_ack", "recovering",
-         "terminal_cancelled", "terminal_rejected"}
+         "terminal_cancelled", "terminal_rejected",
+         "terminal_aborted_no_call"}
     ),
     "effect_unknown": frozenset(
         {"recovering", "submitted_pending_ack", "effect_unknown",
@@ -71,6 +77,7 @@ LEGAL_EFFECT_TRANSITIONS: dict[str, frozenset[str]] = {
     "terminal_cancelled": frozenset(),
     "terminal_rejected": frozenset(),
     "terminal_failed_held": frozenset(),
+    "terminal_aborted_no_call": frozenset(),
 }
 
 
@@ -99,6 +106,11 @@ CREATE TABLE IF NOT EXISTS l1_capabilities (
     consumed_at TEXT NOT NULL,
     consumed_effect_id TEXT NOT NULL,
     metadata_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS l1_effect_contracts (
+    effect_id TEXT PRIMARY KEY,
+    contract_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 """
 
@@ -153,11 +165,12 @@ class L1ExecutionOlap(DemoExecutionOlap):
         return None if row is None else self._effect_dict(row)
 
     def nonterminal_effects(self) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in TERMINAL_EFFECT_STATES)
         rows = self._con.execute(
             "SELECT effect_id, idempotency_key, kind, state, capability_sha256,"
             " order_ids_json, created_at, updated_at FROM l1_effects "
-            "WHERE state NOT IN ('terminal_flat','terminal_cancelled',"
-            "'terminal_rejected','terminal_failed_held') ORDER BY created_at"
+            f"WHERE state NOT IN ({placeholders}) ORDER BY created_at",
+            tuple(sorted(TERMINAL_EFFECT_STATES)),
         ).fetchall()
         return [self._effect_dict(row) for row in rows]
 
@@ -190,6 +203,26 @@ class L1ExecutionOlap(DemoExecutionOlap):
                 "UPDATE l1_effects SET state=?, updated_at=? WHERE effect_id=?",
                 (target, _utc_now().isoformat(), effect_id),
             )
+
+    # -- immutable effect contracts (finding 072) --------------------------
+    def store_effect_contract(self, effect_id: str, contract: dict[str, Any]) -> None:
+        """Persist the canonical submitted plan and its bindings BEFORE any
+        broker call. Immutable: a second store for the same effect refuses."""
+        self._con.execute(
+            "INSERT INTO l1_effect_contracts VALUES (?,?,?)",
+            (
+                effect_id,
+                json.dumps(contract, sort_keys=True),
+                _utc_now().isoformat(),
+            ),
+        )
+
+    def effect_contract(self, effect_id: str) -> Optional[dict[str, Any]]:
+        row = self._con.execute(
+            "SELECT contract_json FROM l1_effect_contracts WHERE effect_id=?",
+            (effect_id,),
+        ).fetchone()
+        return None if row is None else json.loads(row[0])
 
     # -- broker facts (append-only) ----------------------------------------
     def record_broker_fact(
