@@ -86,6 +86,7 @@ def build_effect_contract(
     return {
         "schema": EFFECT_CONTRACT_SCHEMA,
         "kind": "bracket_entry",
+        "trace_id": intent.trace_id,
         "intent_object_id": intent.object_id,
         "instrument": intent.instrument,
         "asset_id": intent.asset_id,

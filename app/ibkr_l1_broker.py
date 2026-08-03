@@ -164,13 +164,19 @@ def _price_or_none(value: Any) -> Optional[float]:
 
 
 def order_fact(contract: Any, order: Any, status: str) -> dict[str, Any]:
-    """Immutable snapshot of one broker order as a plain fact dict."""
+    """Immutable snapshot of one broker order as a plain fact dict.
+
+    ``filled``/``remaining`` are the direct cumulative execution facts
+    (finding 071): consumers must read them, never infer them from status.
+    """
     return {
         "orderId": int(order.orderId),
         "parentId": int(order.parentId),
         "action": str(order.action),
         "orderType": str(order.orderType),
         "totalQuantity": float(order.totalQuantity),
+        "filled": 0.0,
+        "remaining": float(order.totalQuantity),
         "lmtPrice": _price_or_none(order.lmtPrice),
         "auxPrice": _price_or_none(order.auxPrice),
         "tif": str(order.tif),
@@ -246,6 +252,8 @@ class FakeIbkrClient:
             and not fact["parentId"]
         ):
             self._orders[fact["orderId"]]["status"] = "Filled"
+            self._orders[fact["orderId"]]["filled"] = fact["totalQuantity"]
+            self._orders[fact["orderId"]]["remaining"] = 0.0
             sign = 1.0 if fact["action"] == "BUY" else -1.0
             existing = 0.0
             for p in self._positions:
@@ -315,10 +323,15 @@ class FakeIbkrClient:
             )
 
     def fill_parent(self, order_id: int, units: float) -> None:
-        """Simulate a (partial) fill: parent gains filled units and the
-        account gains a signed FX position."""
+        """Simulate an incremental fill: cumulative ``filled`` grows, the
+        ``remaining`` shrinks, status becomes Filled only at completion, and
+        the account gains the signed FX position delta."""
         fact = self._orders[int(order_id)]
-        fact["status"] = "Filled" if units >= fact["totalQuantity"] else fact["status"]
+        increment = min(float(units), fact["remaining"])
+        fact["filled"] += increment
+        fact["remaining"] = fact["totalQuantity"] - fact["filled"]
+        if fact["remaining"] <= 0.0:
+            fact["status"] = "Filled"
         sign = 1.0 if fact["action"] == "BUY" else -1.0
         existing = 0.0
         for p in self._positions:
@@ -327,7 +340,7 @@ class FakeIbkrClient:
         self.set_position(
             symbol=fact["contract"]["symbol"],
             currency=fact["contract"]["currency"],
-            units=existing + sign * units,
+            units=existing + sign * increment,
         )
 
 

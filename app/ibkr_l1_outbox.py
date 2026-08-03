@@ -48,6 +48,7 @@ from app.ibkr_l1_recovery import (
     BracketLifecycleController,
     build_flatten_order,
     expected_contract_facts,
+    verify_bracket_exact,
 )
 
 _PRODUCER = {"name": "lts.ibkr_l1_outbox", "version": "0.1.0"}
@@ -339,55 +340,181 @@ class L1OutboxConsumer:
             },
         ))
 
-    # -- fills -------------------------------------------------------------
+    # -- fills (findings 069/071) ------------------------------------------
+    def _refuse_fill_sync(self, effect_id: str, reason: str) -> dict[str, Any]:
+        """A fill sync that cannot prove its facts journals, demotes to
+        unknown and holds. A missing fact is never read as zero."""
+        with self.olap.atomic_unit():
+            self.olap.record_broker_fact(
+                effect_id, "fill_sync_refusal", {"reason": reason}
+            )
+            if self.olap.effect_row(effect_id)["state"] != "effect_unknown":
+                self.olap.advance_effect(effect_id, "effect_unknown")
+            if self.olap.get_state("halt", "none") == "none":
+                self.olap.set_state("halt", "hold")
+        return {"refused": reason, "state": "effect_unknown"}
+
+    def _applied_cumulative(self, effect_id: str) -> float:
+        facts = self.olap.broker_facts(effect_id, "fill_applied")
+        return float(facts[-1]["fact"]["cumulative"]) if facts else 0.0
+
+    def _reconcile_l0_after_recovery(
+        self, effect_id: str, contract: dict[str, Any], now: datetime
+    ) -> None:
+        """After executed recovery: release any remaining L0 reservation and
+        close any open exposure THROUGH the accepted service API."""
+        reservation_id = contract["reservation_id"]
+        intent_id = contract["intent_object_id"]
+        row = self.olap.reservation_row(reservation_id)
+        if row is not None and row["state"] == "active":
+            self.service.apply_execution_event(ExecutionReportV2(
+                object_id=f"er-cxl-{reservation_id}", as_of=now,
+                producer=_PRODUCER, trace_id=contract["trace_id"],
+                order_intent_id=intent_id,
+                attempt_id=f"attempt-{reservation_id}",
+                bracket_role="parent", state="cancelled",
+                previous_state=self.olap.last_state(intent_id),
+                requested_units=contract["delta_units"],
+                filled_units=self._applied_cumulative(effect_id),
+            ))
+        if self.olap.exposure_state(f"exp-{intent_id}") == "open":
+            self.service.apply_position_close(intent_id)
+
+    def _handle_protection_loss(
+        self,
+        effect_id: str,
+        contract: dict[str, Any],
+        plan,
+        verdict: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        with self.olap.atomic_unit():
+            self.olap.record_broker_fact(
+                effect_id, "protection_health_failure",
+                {"failures": verdict["failures"]},
+            )
+            self.olap.advance_effect(effect_id, "recovering")
+        recovery = self.controller.recover(
+            effect_id, plan, instrument=contract["instrument"]
+        )
+        if recovery.get("complete"):
+            self._reconcile_l0_after_recovery(effect_id, contract, now)
+        return {
+            "protection_lost": True,
+            "failures": verdict["failures"],
+            "recovery": recovery,
+        }
+
     def sync_parent_fill(
         self, effect_id: str, *, now: Optional[datetime] = None
     ) -> Optional[dict[str, Any]]:
-        """Direct broker fill facts become the L0 filled lifecycle event,
-        which consumes the reservation and opens the exposure."""
+        """One monitoring pass over an acknowledged effect:
+
+        1. re-verify SL/TP protection from CURRENT direct broker facts
+           against the immutable contract (finding 069) — any deviation
+           executes recovery and reconciles L0;
+        2. read the parent's direct cumulative ``filled`` fact (finding
+           071) and apply the idempotent cumulative delta through the
+           accepted L0 service API; and
+        3. reconcile the direct broker position against the applied
+           cumulative after every update.
+        """
         now = now or datetime.now(timezone.utc)
         effect = self.olap.effect_row(effect_id)
         if effect is None or effect["state"] != "acknowledged":
             return None
-        if self.olap.broker_facts(effect_id, "parent_fill_applied"):
-            return None                     # idempotent: applied exactly once
-        intent = OrderIntentV2.model_validate_json(
-            self.olap.decision_intent_json(effect["idempotency_key"])
+        contract = self.olap.effect_contract(effect_id)
+        if contract is None:
+            return self._refuse_fill_sync(effect_id, "missing_effect_contract")
+        account = self.client.connected_account()
+        try:
+            plan = plan_from_contract(contract, account=str(account))
+        except L1ExecutionError as error:
+            return self._refuse_fill_sync(effect_id, str(error))
+
+        snapshot = self.client.open_order_facts()
+        verdict = verify_bracket_exact(
+            plan=plan, open_orders=snapshot,
+            instrument=contract["instrument"],
+            expected_con_id=contract["expected_con_id"],
         )
-        parent_id = effect["order_ids"][0]
+        if not verdict["protected"]:
+            return self._handle_protection_loss(
+                effect_id, contract, plan, verdict, now
+            )
+
         parent_fact = next(
-            (
-                fact for fact in self.client.open_order_facts()
-                if int(fact.get("orderId", -1)) == int(parent_id)
-            ),
+            (f for f in snapshot
+             if int(f.get("orderId", -1)) == int(effect["order_ids"][0])),
             None,
         )
-        if parent_fact is None or parent_fact.get("status") != "Filled":
-            return None
-        magnitude = abs(intent.delta_units)
-        plan = build_bracket(
-            intent, parent_order_id=parent_id,
-            account=str(parent_fact["account"]),
-            price_decimals=self.price_decimals,
-            quantity_decimals=self.quantity_decimals,
+        cumulative_raw = None if parent_fact is None else parent_fact.get("filled")
+        if cumulative_raw is None:
+            return self._refuse_fill_sync(
+                effect_id, "broker_filled_fact_missing_never_zero"
+            )
+        cumulative = float(cumulative_raw)
+        magnitude = abs(float(contract["delta_units"]))
+        applied = self._applied_cumulative(effect_id)
+        epsilon = 1e-9
+        if cumulative > magnitude + epsilon:
+            return self._refuse_fill_sync(
+                effect_id, f"filled_{cumulative}_exceeds_requested_{magnitude}"
+            )
+        if cumulative < applied - epsilon:
+            return self._refuse_fill_sync(
+                effect_id,
+                f"broker_cumulative_{cumulative}_below_applied_{applied}",
+            )
+
+        result: dict[str, Any] = {"cumulative": cumulative, "applied": applied}
+        if cumulative > applied + epsilon:
+            state = "filled" if cumulative >= magnitude - epsilon else (
+                "partially_filled"
+            )
+            intent_id = contract["intent_object_id"]
+            reservation_id = contract["reservation_id"]
+            report = ExecutionReportV2(
+                object_id=f"er-fill-{reservation_id}-{int(cumulative)}",
+                as_of=now, producer=_PRODUCER,
+                trace_id=contract["trace_id"],
+                order_intent_id=intent_id,
+                attempt_id=f"attempt-{reservation_id}",
+                bracket_role="parent", state=state,
+                previous_state=self.olap.last_state(intent_id),
+                requested_units=contract["delta_units"],
+                filled_units=cumulative,
+                protection_legs=self._protection_legs(plan, cumulative),
+            )
+            result = dict(self.service.apply_execution_event(report))
+            with self.olap.atomic_unit():
+                self.olap.record_broker_fact(
+                    effect_id, "fill_applied",
+                    {"cumulative": cumulative, "state": state},
+                )
+            result["cumulative"] = cumulative
+
+        # 3. mandatory position reconciliation against direct facts
+        expected_contract = expected_contract_facts(contract["instrument"])
+        sign = 1.0 if contract["delta_units"] > 0 else -1.0
+        observed = sum(
+            float(p.get("units", 0.0))
+            for p in self.client.position_facts()
+            if p.get("symbol") == expected_contract["symbol"]
+            and p.get("currency") == expected_contract["currency"]
+            and p.get("account") == account
         )
-        reservation_id = intent.risk.reservation_id
-        report = ExecutionReportV2(
-            object_id=f"er-fill-{reservation_id}", as_of=now,
-            producer=_PRODUCER, trace_id=intent.trace_id,
-            order_intent_id=intent.object_id,
-            attempt_id=f"attempt-{reservation_id}",
-            bracket_role="parent", state="filled",
-            previous_state="accepted",
-            requested_units=intent.delta_units,
-            filled_units=magnitude,
-            protection_legs=self._protection_legs(plan, magnitude),
-        )
-        result = self.service.apply_execution_event(report)
+        if abs(observed - sign * cumulative) > epsilon:
+            return self._refuse_fill_sync(
+                effect_id,
+                f"position_{observed}_disagrees_with_cumulative_"
+                f"{sign * cumulative}",
+            )
         self.olap.record_broker_fact(
-            effect_id, "parent_fill_applied",
-            {"filled_units": magnitude, "reservation": result.get("reservation")},
+            effect_id, "position_reconciled",
+            {"observed_units": observed, "cumulative": cumulative},
         )
+        result["position_reconciled"] = True
         return result
 
     # -- flattens ----------------------------------------------------------

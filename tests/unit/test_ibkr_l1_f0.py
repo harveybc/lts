@@ -151,6 +151,134 @@ def test_zero_call_crash_resolves_terminally_and_unblocks_the_gate(env):
     assert result["state"] == "acknowledged"
 
 
+# ── F0.3 (findings 069/071): protection health + cumulative fills ──
+
+def _entered(env, con_id=None):
+    env.mint(contract_con_id=con_id)
+    env.decide(_asset_intent())
+    result = env.consumer.consume_entries(
+        quote=QUOTE, now=NOW + timedelta(seconds=2))[0]
+    assert result["state"] == "acknowledged"
+    return result["effect_id"], result["order_ids"]
+
+
+def test_stop_vanishing_after_fill_executes_recovery_and_reconciles_l0(env):
+    """Musashi 069 counterexample: SL removed post-ack, parent filled —
+    previously produced an unprotected position with halt=none."""
+    env.client.auto_fill_market_orders = True
+    effect_id, order_ids = _entered(env)
+    env.client.drop_order(order_ids[2])                # stop loss vanishes
+    env.client.fill_parent(order_ids[0], 20000.0)
+    sync = env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    assert sync["protection_lost"] is True
+    assert env.olap.get_state("halt") == "hold"
+    assert env.client.position_facts() == []           # flattened, reconciled
+    assert env.olap.effect_row(effect_id)["state"] == "terminal_flat"
+    assert env.olap.open_exposures() == []
+    contract = env.olap.effect_contract(effect_id)
+    assert env.olap.reservation_row(
+        contract["reservation_id"])["state"] == "released"
+
+
+def test_stop_alteration_after_partial_fill_recovers(env):
+    env.client.auto_fill_market_orders = True
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 5000.0)
+    first = env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    assert first["exposure"] == "opened_partial"
+    env.client.alter_order(order_ids[2], auxPrice=1.0000)   # protection altered
+    sync = env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=4))
+    assert sync["protection_lost"] is True
+    assert env.olap.get_state("halt") == "hold"
+    assert env.client.position_facts() == []
+    assert env.olap.effect_row(effect_id)["state"] == "terminal_flat"
+    contract = env.olap.effect_contract(effect_id)
+    assert env.olap.reservation_row(
+        contract["reservation_id"])["state"] == "released"
+    assert env.olap.open_exposures() == []
+
+
+def test_cumulative_partial_fills_with_duplicates_and_restart(env):
+    from app.ibkr_l1_outbox import L1OutboxConsumer
+    effect_id, order_ids = _entered(env)
+    parent = order_ids[0]
+
+    env.client.fill_parent(parent, 5000.0)
+    first = env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    assert first["cumulative"] == 5000.0
+    assert first["exposure"] == "opened_partial"
+
+    duplicate = env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=4))
+    assert duplicate["cumulative"] == 5000.0
+    assert "exposure" not in duplicate                 # no double application
+
+    env.client.fill_parent(parent, 7000.0)
+    second = env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=5))
+    assert second["cumulative"] == 12000.0
+
+    restarted = L1OutboxConsumer(                      # process restart
+        env.service, env.olap, env.client, env.profile, env.gate)
+    env.client.fill_parent(parent, 8000.0)
+    third = restarted.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=6))
+    assert third["cumulative"] == 20000.0
+    assert third["reservation"] == "consumed"
+
+    assert env.olap.open_exposures()[0]["units_open"] == 20000.0
+    applied = [f["fact"]["cumulative"]
+               for f in env.olap.broker_facts(effect_id, "fill_applied")]
+    assert applied == [5000.0, 12000.0, 20000.0]       # monotone, no dups
+    # conservation (finding 049 discipline): day risk equals the immutable
+    # original reservation risk exactly once
+    contract = env.olap.effect_contract(effect_id)
+    reservation = env.olap.reservation_row(contract["reservation_id"])
+    totals = env.olap.active_totals("2026-08-03")
+    assert abs(totals["day_risk"] - reservation["original_risk_fraction"]) < 1e-12
+
+
+def test_partial_fill_then_broker_cancel_recovers_and_releases_remainder(env):
+    env.client.auto_fill_market_orders = True
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 5000.0)
+    env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    env.client.alter_order(order_ids[0], status="Cancelled")  # entry cancelled
+    sync = env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=4))
+    assert sync["protection_lost"] is True
+    assert env.client.position_facts() == []           # 5k residual flattened
+    assert env.olap.effect_row(effect_id)["state"] == "terminal_flat"
+    contract = env.olap.effect_contract(effect_id)
+    assert env.olap.reservation_row(
+        contract["reservation_id"])["state"] == "released"
+    assert env.olap.open_exposures() == []
+
+
+def test_missing_filled_fact_is_never_read_as_zero(env):
+    effect_id, order_ids = _entered(env)
+    parent = order_ids[0]
+    real = env.client.open_order_facts
+
+    def stripped():
+        facts = real()
+        for fact in facts:
+            if fact["orderId"] == parent:
+                fact.pop("filled", None)
+        return facts
+
+    env.client.open_order_facts = stripped
+    sync = env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    assert "never_zero" in sync["refused"]
+    assert env.olap.effect_row(effect_id)["state"] == "effect_unknown"
+    assert env.olap.get_state("halt") == "hold"
+
+
+def test_position_disagreement_refuses_and_holds(env):
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 5000.0)
+    env.client.set_position(symbol="EUR", currency="USD", units=9000.0)  # drift
+    sync = env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    assert "disagrees" in sync["refused"]
+    assert env.olap.get_state("halt") == "hold"
+
+
 # ── schema migration: additive, never destructive ──
 
 def test_l0_ledger_migrates_additively_to_l1_schema(tmp_path):
