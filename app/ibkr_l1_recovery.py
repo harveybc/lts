@@ -328,7 +328,7 @@ class BracketLifecycleController:
                     instrument=instrument,
                     account=plan.parent["account"],
                     net_units=residual,
-                    order_id=self.client.next_order_id(),
+                    order_id=self.client.reserve_order_ids(1),
                 )
                 self.olap.record_broker_fact(
                     effect_id, "recovery_flatten_attempt",

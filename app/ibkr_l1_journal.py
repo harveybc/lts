@@ -226,6 +226,54 @@ class L1ExecutionOlap(DemoExecutionOlap):
             for r in rows
         ]
 
+    def l1_pending_decisions(self, outcome: str) -> list[dict[str, Any]]:
+        """Committed L0 decisions of one outcome that have no L1 effect yet.
+
+        The outbox is the decisions table itself (finding 066: no parallel
+        source of truth): a decision becomes consumed exactly when an
+        ``l1_effects`` row exists for its idempotency key.
+        """
+        rows = self._con.execute(
+            "SELECT idempotency_key, intent_json, capability_evidence,"
+            " reference_price, quote_time FROM decisions "
+            "WHERE outcome=? AND intent_json IS NOT NULL "
+            "AND idempotency_key NOT IN (SELECT idempotency_key FROM l1_effects) "
+            "ORDER BY decided_at",
+            (outcome,),
+        ).fetchall()
+        return [
+            {
+                "idempotency_key": r[0],
+                "intent_json": r[1],
+                "capability_evidence": r[2],
+                "reference_price": r[3],
+                "quote_time": r[4],
+            }
+            for r in rows
+        ]
+
+    def decision_intent_json(self, idempotency_key: str) -> Optional[str]:
+        row = self._con.execute(
+            "SELECT intent_json FROM decisions WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def exposure_reservation(self, order_intent_id: str) -> Optional[str]:
+        row = self._con.execute(
+            "SELECT source_reservation_id FROM exposures "
+            "WHERE order_intent_id=?",
+            (order_intent_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def l1_entry_count(self) -> int:
+        """Entries that consumed activation budget (refusals do not)."""
+        return self._con.execute(
+            "SELECT COUNT(*) FROM l1_effects WHERE kind='bracket_entry' "
+            "AND state != 'terminal_rejected'"
+        ).fetchone()[0]
+
     # -- capabilities (single-use, consumed atomically with an effect) -----
     def consume_capability(
         self,

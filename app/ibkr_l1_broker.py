@@ -51,6 +51,10 @@ class IbkrClientProtocol(Protocol):
         """A fresh broker-valid order id (TWS: reqIds/getReqId)."""
         ...
 
+    def reserve_order_ids(self, count: int) -> int:
+        """First id of a contiguous, never-reused block of ``count`` ids."""
+        ...
+
 
 @dataclass(frozen=True)
 class TranslatedBracket:
@@ -277,8 +281,12 @@ class FakeIbkrClient:
         return self.account
 
     def next_order_id(self) -> int:
-        self._next_id += 1
-        return self._next_id
+        return self.reserve_order_ids(1)
+
+    def reserve_order_ids(self, count: int) -> int:
+        first = self._next_id
+        self._next_id += count
+        return first
 
     # -- test manipulation (broker-side reality injection) -----------------
     def _place_calls(self) -> int:
