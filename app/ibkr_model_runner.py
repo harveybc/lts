@@ -44,6 +44,65 @@ def _client(profile: ContinuousPaperProfile):
     return IbAsyncTwsClient(profile)
 
 
+def reconcile_terminal_exposures(
+    olap: L1ExecutionOlap,
+    *,
+    instrument: str,
+    route_position_units: float,
+) -> list[dict[str, Any]]:
+    """IBKR analog of the Alpaca ``bc974d5`` repair.
+
+    A fail-closed recovery can terminalize an L1 effect (e.g.
+    ``terminal_flat`` after a flatten) without closing its L0 exposure
+    row, leaving ``max_concurrent_positions`` permanently consumed by a
+    position the broker no longer holds. This closes an open exposure
+    and releases its reservation ONLY when the linked effect is terminal
+    AND the broker's route position is proven flat by direct evidence
+    this tick. Idempotent; submits nothing; unknown linkage is skipped,
+    never guessed.
+    """
+    from app.demo_execution_service import DemoExecutionError
+
+    if route_position_units != 0.0:
+        return []
+    repaired: list[dict[str, Any]] = []
+    for exposure in olap.open_exposures():
+        if (exposure["instrument"] != instrument
+                or exposure["venue"] != "ibkr_paper"):
+            continue
+        reservation_id = olap.exposure_reservation(
+            exposure["order_intent_id"])
+        idempotency_key = (
+            None if reservation_id is None
+            else olap.reservation_idempotency(reservation_id)
+        )
+        effect = (
+            None if idempotency_key is None
+            else olap.effect_by_key(idempotency_key)
+        )
+        if effect is None or not str(effect["state"]).startswith("terminal_"):
+            continue
+        with olap.atomic_unit():
+            olap.close_exposure(exposure["exposure_id"])
+            if reservation_id is not None:
+                try:
+                    olap.release(reservation_id, "consumed")
+                except DemoExecutionError:
+                    pass  # reservation already terminal — closure stands
+            olap.record_broker_fact(effect["effect_id"], "l0_exposure_closed", {
+                "exposure_id": exposure["exposure_id"],
+                "reservation_id": reservation_id,
+                "units_open": exposure["units_open"],
+                "route_position_units": route_position_units,
+            })
+        repaired.append({
+            "exposure_id": exposure["exposure_id"],
+            "effect_id": effect["effect_id"],
+            "reservation_id": reservation_id,
+        })
+    return repaired
+
+
 class IbkrModelRunner:
     def __init__(
         self,
@@ -113,7 +172,13 @@ class IbkrModelRunner:
                 if result is not None:
                     fills.append({"effect_id": effect["effect_id"], "result": result})
         flattens = self.consumer.consume_flattens(now=now)
-        return {"resumed": resumed, "fills": fills, "flattens": flattens}
+        reconciled = reconcile_terminal_exposures(
+            self.olap,
+            instrument=self.profile.instrument,
+            route_position_units=self._route_position(),
+        )
+        return {"resumed": resumed, "fills": fills, "flattens": flattens,
+                "exposures_reconciled": reconciled}
 
     def _capability(
         self, quote: dict[str, Any], now: datetime,
