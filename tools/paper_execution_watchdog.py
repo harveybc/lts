@@ -12,6 +12,8 @@ import os
 import socket
 import sqlite3
 import statistics
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -1266,9 +1268,10 @@ def process_events(
     *,
     now: float,
     repeat_seconds: float,
-) -> list[str]:
+) -> list[dict[str, Any]]:
+    """Return due structured emissions: {kind: observe|recover, ...}."""
     event_state = state.setdefault("events", {})
-    messages: list[str] = []
+    emissions: list[dict[str, Any]] = []
     current = {str(item["key"]): item for item in events}
     for key, item in current.items():
         previous = event_state.get(key) or {}
@@ -1281,7 +1284,16 @@ def process_events(
             or now - float(previous.get("last_sent_at", 0)) >= repeat_seconds
         )
         if due:
-            messages.append(f"{item['title']}\n{item['detail']}")
+            emissions.append(
+                {
+                    "kind": "observe",
+                    "key": key,
+                    "title": str(item["title"]),
+                    "detail": str(item["detail"]),
+                    "severity": str(item["severity"]),
+                    "category": str(item["category"]),
+                }
+            )
             transition = "activated" if not previous.get("active") else "repeated"
             store.record(item, transition, now)
             previous["last_sent_at"] = now
@@ -1305,10 +1317,106 @@ def process_events(
                 "category": previous.get("category", "operations"),
                 "discussion": False,
             }
-            messages.append(f"{recovery['title']}\n{recovery['detail']}")
+            emissions.append(
+                {
+                    "kind": "recover",
+                    "key": key,
+                    "title": recovery["title"],
+                    "detail": recovery["detail"],
+                    "severity": "info",
+                    "category": str(recovery["category"]),
+                }
+            )
             store.record(recovery, "recovered", now)
             previous.update({"active": False, "last_sent_at": now})
-    return messages
+    return emissions
+
+
+# Fleet-ledger severity contract (Musashi order 2026-08-04): exposure and
+# order-violation events page P0; other critical venue conditions are P1;
+# warnings are P2; informational events are P3 (ledger digest only).
+P0_EVENT_KEYS = {
+    "capital_demo_unexpected_exposure",
+    "oanda_unexpected_exposure",
+    "multi_venue_shadow_order_violation",
+}
+
+
+def ledger_severity(key: str, severity: str) -> str:
+    if key in P0_EVENT_KEYS:
+        return "P0"
+    return {"critical": "P1", "warning": "P2"}.get(severity, "P3")
+
+
+def emit_to_incident_ledger(
+    emissions: Sequence[Mapping[str, Any]],
+    *,
+    repo: Path,
+    config: Path,
+    machine: str,
+    db_override: Path | None = None,
+    runner=subprocess.run,
+) -> int:
+    """Deliver structured emissions through the fleet incident-ledger CLI.
+
+    Returns the number of failed deliveries; never raises."""
+    script = str(repo / "tools" / "incident_ledger.py")
+    failures = 0
+    evidence_at = _utc_now()
+    for item in emissions:
+        base = [sys.executable, script, "--config", str(config)]
+        if db_override is not None:
+            base += ["--db", str(db_override)]
+        identity = [
+            "--source",
+            "lts_paper_watchdog",
+            "--front",
+            "front2",
+            "--machine",
+            machine,
+            "--event-code",
+            str(item["key"]),
+            "--object",
+            "-",
+        ]
+        if item["kind"] == "observe":
+            payload = {
+                "summary": item["title"][:200],
+                "detail": item["detail"][:1500],
+                "category": item["category"],
+            }
+            command = base + [
+                "observe",
+                *identity,
+                "--severity",
+                ledger_severity(str(item["key"]), str(item["severity"])),
+                "--evidence-at",
+                evidence_at,
+                "--payload-json",
+                json.dumps(payload, sort_keys=True),
+            ]
+        else:
+            command = base + [
+                "recover",
+                *identity,
+                "--evidence-json",
+                json.dumps({"summary": item["detail"][:300]}, sort_keys=True),
+            ]
+        try:
+            result = runner(
+                command, capture_output=True, text=True, timeout=30
+            )
+            returncode = result.returncode
+            stderr = (result.stderr or "").strip()
+        except Exception as exc:  # emission must never kill the collector
+            returncode, stderr = 1, str(exc)
+        if returncode != 0:
+            failures += 1
+            print(
+                f"incident emission failed ({item['key']}): {stderr[:300]}",
+                file=sys.stderr,
+            )
+    return failures
 
 
 def main() -> int:
@@ -1348,7 +1456,18 @@ def main() -> int:
         ),
     )
     parser.add_argument("--mt5-only", action="store_true")
-    parser.add_argument("--no-telegram", action="store_true")
+    parser.add_argument(
+        "--no-telegram",
+        action="store_true",
+        help="disable incident-ledger emission (name kept for unit compat)",
+    )
+    parser.add_argument(
+        "--incident-repo",
+        type=Path,
+        default=Path.home() / "Documents/GitHub/agent-multi",
+    )
+    parser.add_argument("--incident-config", type=Path, default=None)
+    parser.add_argument("--machine", default=socket.gethostname())
     args = parser.parse_args()
 
     args.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1407,19 +1526,21 @@ def main() -> int:
             )
         store = MonitorStore(args.monitor_db)
         try:
-            messages = process_events(
+            emissions = process_events(
                 [*events, *discussions],
                 state,
                 store,
                 now=now,
                 repeat_seconds=args.repeat_minutes * 60.0,
             )
+            # Periodic summaries are local evidence only (owner decision 3,
+            # 2026-08-04): printed to the journal, never sent to Telegram.
             last_summary = float(state.get("last_summary_at", 0))
             if now - last_summary >= args.summary_hours * 3600.0:
                 if args.mt5_only:
-                    messages.append(format_mt5_summary(mt5))
+                    print(format_mt5_summary(mt5))
                 else:
-                    messages.append(
+                    print(
                         format_summary(
                             alpaca, ibkr, oanda, mt5, shadow, capital
                         )
@@ -1461,8 +1582,18 @@ def main() -> int:
             }
             _atomic_json(args.discussion_file, packet)
             _atomic_json(args.latest_file, latest)
-            if messages and not args.no_telegram:
-                _send_telegram("\n\n".join(messages))
+            emission_failures = 0
+            if emissions and not args.no_telegram:
+                incident_config = args.incident_config or (
+                    args.incident_repo
+                    / "examples/configs/incident_ledger_v1.json"
+                )
+                emission_failures = emit_to_incident_ledger(
+                    emissions,
+                    repo=args.incident_repo,
+                    config=incident_config,
+                    machine=args.machine,
+                )
             state["last_run_at"] = now
             _atomic_json(args.state_file, state)
             print(
@@ -1470,13 +1601,14 @@ def main() -> int:
                     {
                         "active_events": len(events),
                         "discussion_events": len(discussions),
-                        "notifications": len(messages),
-                        "telegram_enabled": not args.no_telegram,
+                        "emissions": len(emissions),
+                        "emission_failures": emission_failures,
+                        "emission_enabled": not args.no_telegram,
                     },
                     sort_keys=True,
                 )
             )
-            return 0
+            return 0 if emission_failures == 0 else 1
         finally:
             store.close()
 

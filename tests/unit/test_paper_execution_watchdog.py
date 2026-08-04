@@ -603,9 +603,13 @@ def test_process_events_deduplicates_and_records_recovery(tmp_path: Path) -> Non
     finally:
         store.close()
 
-    assert first == ["IBKR offline\nStart TWS Paper."]
+    assert [(e["kind"], e["title"], e["detail"]) for e in first] == [
+        ("observe", "IBKR offline", "Start TWS Paper.")
+    ]
     assert duplicate == []
-    assert recovered == ["LTS PAPER RECOVERED\nevent cleared: ibkr_paper_offline"]
+    assert [(e["kind"], e["key"]) for e in recovered] == [
+        ("recover", "ibkr_paper_offline")
+    ]
 
     connection = sqlite3.connect(store_path)
     try:
@@ -618,3 +622,87 @@ def test_process_events_deduplicates_and_records_recovery(tmp_path: Path) -> Non
     finally:
         connection.close()
     assert transitions == ["activated", "recovered"]
+
+
+def test_ledger_severity_contract() -> None:
+    from tools.paper_execution_watchdog import ledger_severity
+
+    assert ledger_severity("capital_demo_unexpected_exposure", "critical") == "P0"
+    assert ledger_severity("oanda_unexpected_exposure", "critical") == "P0"
+    assert (
+        ledger_severity("multi_venue_shadow_order_violation", "critical")
+        == "P0"
+    )
+    assert ledger_severity("ibkr_observer_stale", "critical") == "P1"
+    assert ledger_severity("anything", "warning") == "P2"
+    assert ledger_severity("anything", "info") == "P3"
+
+
+def test_emit_to_incident_ledger_builds_cli_calls(tmp_path: Path) -> None:
+    from tools.paper_execution_watchdog import emit_to_incident_ledger
+
+    calls: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+        stderr = ""
+
+    def fake_runner(command, **_kwargs):
+        calls.append(command)
+        return _Result()
+
+    failures = emit_to_incident_ledger(
+        [
+            {
+                "kind": "observe",
+                "key": "oanda_unexpected_exposure",
+                "title": "foreign exposure",
+                "detail": "unauthorized ticket",
+                "severity": "critical",
+                "category": "execution",
+            },
+            {
+                "kind": "recover",
+                "key": "ibkr_observer_stale",
+                "title": "LTS PAPER RECOVERED",
+                "detail": "event cleared: ibkr_observer_stale",
+                "severity": "info",
+                "category": "operations",
+            },
+        ],
+        repo=tmp_path,
+        config=tmp_path / "config.json",
+        machine="omega",
+        runner=fake_runner,
+    )
+    assert failures == 0
+    assert len(calls) == 2
+    observe_call = calls[0]
+    assert "observe" in observe_call
+    assert observe_call[observe_call.index("--severity") + 1] == "P0"
+    assert "recover" in calls[1]
+
+
+def test_emit_failures_are_counted_not_raised(tmp_path: Path) -> None:
+    from tools.paper_execution_watchdog import emit_to_incident_ledger
+
+    def broken_runner(command, **_kwargs):
+        raise OSError("no interpreter")
+
+    failures = emit_to_incident_ledger(
+        [
+            {
+                "kind": "observe",
+                "key": "k",
+                "title": "t",
+                "detail": "d",
+                "severity": "warning",
+                "category": "c",
+            }
+        ],
+        repo=tmp_path,
+        config=tmp_path / "config.json",
+        machine="omega",
+        runner=broken_runner,
+    )
+    assert failures == 1
