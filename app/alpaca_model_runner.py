@@ -411,7 +411,12 @@ def main() -> int:
                     "error": f"{type(exc).__name__}: {exc}",
                     "orders_submitted": None,
                 })
-                raise
+                if args.once:
+                    raise
+                # 091 doctrine (parity with the IBKR runner): a failed tick
+                # degrades the heartbeat and keeps the service alive with
+                # its normal cadence instead of crash-looping systemd; the
+                # ledger's idempotency makes the next tick safe.
             if args.once:
                 break
             stopped.wait(float(config["loop_seconds"]))
