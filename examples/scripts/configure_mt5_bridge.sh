@@ -47,6 +47,9 @@ systemctl --user daemon-reload
 # The v1 read-only bridge and v2 execution bridge bind the same port. Keeping
 # both enabled creates a permanent restart loop even though the EA appears live.
 systemctl --user disable --now lts-mt5-bridge.service 2>/dev/null || true
+rm -f "${HOME}/.config/systemd/user/lts-mt5-bridge.service"
+systemctl --user daemon-reload
+systemctl --user mask lts-mt5-bridge.service
 systemctl --user enable --now lts-mt5-execution-bridge.service
 systemctl --user enable --now lts-mt5-bridge-watchdog.timer
 
