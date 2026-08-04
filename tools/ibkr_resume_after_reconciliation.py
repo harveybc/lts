@@ -32,8 +32,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.ibkr_l1_adapter import L1AuthorizationError, L1Profile  # noqa: E402
+from app.ibkr_l1_adapter import L1AuthorizationError  # noqa: E402
 from app.ibkr_l1_journal import L1ExecutionOlap  # noqa: E402
+from app.ibkr_model_authority import ContinuousPaperProfile  # noqa: E402
 from app.ibkr_l1_resume import (  # noqa: E402
     ResumeGate,
     resume_after_reconciliation,
@@ -44,7 +45,7 @@ EVIDENCE_CLIENT_ID_OFFSET = 91
 VENUE_EVENT_CODES = {"tws_unavailable", "decision_clock_stale"}
 
 
-def gather_broker_evidence(profile: L1Profile) -> dict:
+def gather_broker_evidence(profile: ContinuousPaperProfile) -> dict:
     """Read-only TWS session: positions, open orders, account identity."""
     import ib_async
     from ib_async import IB
@@ -149,7 +150,8 @@ def main() -> int:
     if config.get("schema") != "lts.ibkr.model_runner.v1":
         print("REFUSED: runner config schema mismatch", file=sys.stderr)
         return 2
-    profile = L1Profile.load(os.path.expanduser(config["profile_file"]))
+    profile = ContinuousPaperProfile.load(
+        os.path.expanduser(config["profile_file"]))
     ledger_path = Path(os.path.expanduser(
         config["service"]["database_path"]))
     olap = L1ExecutionOlap(ledger_path)

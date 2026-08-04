@@ -20,8 +20,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.ibkr_l1_adapter import FINGERPRINT_ALGORITHM, L1Profile  # noqa: E402
+from app.ibkr_l1_adapter import FINGERPRINT_ALGORITHM  # noqa: E402
 from app.ibkr_l1_capability import capability_digest  # noqa: E402
+from app.ibkr_model_authority import ContinuousPaperProfile  # noqa: E402
 from app.ibkr_l1_resume import (  # noqa: E402
     MAX_RESUME_VALIDITY_SECONDS,
     RESUME_OPERATION,
@@ -34,7 +35,7 @@ CONFIRMATION_PHRASE = "resume ibkr paper after reconciliation"
 DEFAULT_VALIDITY_SECONDS = 600
 
 
-def mint_payload(profile: L1Profile, *, resume_of_effect_id: str,
+def mint_payload(profile: ContinuousPaperProfile, *, resume_of_effect_id: str,
                  validity_seconds: int) -> dict:
     now = datetime.now(timezone.utc)
     return {
@@ -86,7 +87,7 @@ def main() -> int:
         )
         return 2
 
-    profile = L1Profile.load(args.profile)
+    profile = ContinuousPaperProfile.load(args.profile)
     payload = mint_payload(
         profile,
         resume_of_effect_id=args.resume_of_effect_id,
