@@ -346,12 +346,21 @@ class AlpacaModelRunner:
         self.store.close()
 
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
+        runtime = {
+            **payload,
+            "venue": "alpaca_paper",
+            "environment": "paper",
+            "read_only": False,
+            "account_binding_verified": True,
+            "account_fingerprint": self.profile.account_fingerprint,
+            "instrument": self.profile.symbol,
+        }
         write_runner_heartbeat(
             self.config.get(
                 "heartbeat_path", "~/.local/state/lts/alpaca-model-runner-heartbeat.json"
             ),
             schema="lts.alpaca.model_runner.heartbeat.v1",
-            payload=payload,
+            payload=runtime,
         )
 
 

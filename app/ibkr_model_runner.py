@@ -274,10 +274,19 @@ class IbkrModelRunner:
             self.olap.close()
 
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
+        runtime = {
+            **payload,
+            "venue": "ibkr_paper",
+            "environment": "paper",
+            "read_only": False,
+            "account_binding_verified": True,
+            "account_fingerprint": self.profile.account_fingerprint,
+            "instrument": self.profile.instrument,
+        }
         write_runner_heartbeat(
             self.config["heartbeat_path"],
             schema="lts.ibkr.model_runner.heartbeat.v1",
-            payload=payload,
+            payload=runtime,
         )
 
 

@@ -279,7 +279,8 @@ class IbkrTwsPaperClient:
 
             account_values = self._measure("account_summary", ib.accountSummary)
             positions = self._measure("positions", ib.positions)
-            open_orders = self._measure("orders.open", ib.openOrders)
+            open_trades = self._measure("orders.all_open", ib.reqAllOpenOrders)
+            open_orders = [trade.order for trade in open_trades]
 
             selection_by_cell = {
                 selection.cell_id: selection for selection in selections

@@ -8,6 +8,7 @@ from tools.paper_execution_watchdog import (
     MonitorStore,
     evaluate,
     process_events,
+    read_execution_runtime,
     read_ibkr_snapshot,
     read_mt5_remote_status,
     read_mt5_snapshot,
@@ -20,6 +21,7 @@ def _healthy_alpaca(now: float) -> dict:
         "status": "complete",
         "ended_at": "2026-07-30T04:00:00+00:00",
         "detail": {
+            "account_fingerprint": "0123456789abcdef",
             "account_blocked": False,
             "trading_blocked": False,
             "missing_cells": [],
@@ -62,6 +64,169 @@ def test_evaluate_reports_no_event_for_healthy_online_venues() -> None:
 
     assert events == []
     assert discussions == []
+
+
+def test_evaluate_accepts_account_bound_alpaca_execution() -> None:
+    now = 1785384300.0
+    alpaca = _healthy_alpaca(now)
+    alpaca["detail"].update({"open_positions": 0, "open_orders": 1})
+    alpaca["execution_runtime"] = {
+        "available": True,
+        "venue": "alpaca_paper",
+        "environment": "paper",
+        "read_only": False,
+        "account_binding_verified": True,
+        "account_fingerprint": alpaca["detail"]["account_fingerprint"],
+        "instrument": "SPY",
+        "model_id": "spy-daily-linear-live-v1",
+        "selection_error": None,
+        "state": "monitoring",
+        "positions": 0,
+        "orders": 1,
+    }
+    events, _ = evaluate(
+        alpaca,
+        {
+            "available": True,
+            "socket": {"available": True},
+            "latest_complete": {
+                "ended_at": "2026-07-30T04:00:00+00:00",
+                "open_positions": 0,
+                "open_orders": 0,
+            },
+        },
+        now=now,
+        stale_seconds=900,
+    )
+
+    assert events == []
+
+
+def test_evaluate_rejects_unbound_alpaca_execution() -> None:
+    now = 1785384300.0
+    alpaca = _healthy_alpaca(now)
+    alpaca["detail"]["open_orders"] = 1
+    alpaca["execution_runtime"] = {"available": True, "orders": 1}
+
+    events, _ = evaluate(
+        alpaca,
+        {
+            "available": True,
+            "socket": {"available": True},
+            "latest_complete": {
+                "ended_at": "2026-07-30T04:00:00+00:00",
+                "open_positions": 0,
+                "open_orders": 0,
+            },
+        },
+        now=now,
+        stale_seconds=900,
+    )
+
+    assert [item["key"] for item in events] == ["alpaca_unexpected_exposure"]
+
+
+def test_evaluate_accepts_reconciled_ibkr_model_exposure() -> None:
+    now = 1785384300.0
+    events, _ = evaluate(
+        _healthy_alpaca(now),
+        {
+            "available": True,
+            "socket": {"available": True},
+            "latest_complete": {
+                "ended_at": "2026-07-30T04:00:00+00:00",
+                "open_positions": 1,
+                "open_orders": 2,
+            },
+            "execution_runtime": {
+                "available": True,
+                "venue": "ibkr_paper",
+                "environment": "paper",
+                "read_only": False,
+                "account_binding_verified": True,
+                "account_fingerprint": "0123456789abcdef",
+                "instrument": "USD.CAD",
+                "model_id": "usdcad-4h-linear-live-v1",
+                "selection_error": None,
+                "state": "monitoring",
+                "position": -25000,
+                "orders": 2,
+                "l1": {"fills": [{"result": {"position_reconciled": True}}]},
+            },
+        },
+        now=now,
+        stale_seconds=900,
+    )
+
+    assert events == []
+
+
+def test_evaluate_rejects_ibkr_exposure_without_reconciled_fill() -> None:
+    now = 1785384300.0
+    events, _ = evaluate(
+        _healthy_alpaca(now),
+        {
+            "available": True,
+            "socket": {"available": True},
+            "latest_complete": {
+                "ended_at": "2026-07-30T04:00:00+00:00",
+                "open_positions": 1,
+                "open_orders": 2,
+            },
+            "execution_runtime": {
+                "available": True,
+                "venue": "ibkr_paper",
+                "environment": "paper",
+                "read_only": False,
+                "account_binding_verified": True,
+                "account_fingerprint": "0123456789abcdef",
+                "instrument": "USD.CAD",
+                "model_id": "usdcad-4h-linear-live-v1",
+                "selection_error": None,
+                "state": "monitoring",
+                "position": -25000,
+                "orders": 2,
+                "l1": {"fills": []},
+            },
+        },
+        now=now,
+        stale_seconds=900,
+    )
+
+    assert [item["key"] for item in events] == ["ibkr_unexpected_exposure"]
+
+
+def test_read_execution_runtime_requires_fresh_expected_schema(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "heartbeat.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "lts.ibkr.model_runner.heartbeat.v1",
+                "observed_at": "2026-07-30T04:00:00+00:00",
+                "state": "monitoring",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fresh = read_execution_runtime(
+        path,
+        "lts.ibkr.model_runner.heartbeat.v1",
+        now=1785384300.0,
+        stale_seconds=900,
+    )
+    stale = read_execution_runtime(
+        path,
+        "lts.ibkr.model_runner.heartbeat.v1",
+        now=1785385301.0,
+        stale_seconds=900,
+    )
+
+    assert fresh["available"] is True
+    assert stale["available"] is False
+    assert stale["reason"] == "heartbeat_stale"
 
 
 def test_evaluate_reports_missing_alpaca_and_offline_ibkr() -> None:

@@ -31,7 +31,13 @@ EXPECTED_ALPACA_SYMBOLS = {
     "XRP/USD",
 }
 DEFAULT_ALPACA_DB = Path.home() / ".local/state/lts/alpaca-paper-lab.sqlite"
+DEFAULT_ALPACA_RUNTIME = (
+    Path.home() / ".local/state/lts/alpaca-model-runner-heartbeat.json"
+)
 DEFAULT_IBKR_DB = Path.home() / ".local/state/lts/ibkr-paper-lab.sqlite"
+DEFAULT_IBKR_RUNTIME = (
+    Path.home() / ".local/state/lts/ibkr-model-runner-heartbeat.json"
+)
 DEFAULT_OANDA_DB = Path.home() / ".local/state/lts/oanda-practice-lab.sqlite"
 DEFAULT_OANDA_ENV = Path.home() / ".config/lts/oanda-practice.env"
 DEFAULT_MT5_DB = Path.home() / ".local/state/lts/mt5-bridge.sqlite"
@@ -77,6 +83,80 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def read_execution_runtime(
+    path: Path,
+    expected_schema: str,
+    *,
+    now: float,
+    stale_seconds: float,
+) -> dict[str, Any]:
+    payload = _read_json(path)
+    if not payload:
+        return {"available": False, "reason": "heartbeat_missing"}
+    if payload.get("schema") != expected_schema:
+        return {"available": False, "reason": "schema_mismatch"}
+    observed_at = _parse_time(payload.get("observed_at"))
+    if observed_at is None:
+        return {"available": False, "reason": "observed_at_missing"}
+    age_seconds = max(0.0, now - observed_at)
+    return {
+        **payload,
+        "available": age_seconds <= stale_seconds,
+        "reason": None if age_seconds <= stale_seconds else "heartbeat_stale",
+        "age_seconds": age_seconds,
+    }
+
+
+def _alpaca_exposure_authorized(
+    detail: Mapping[str, Any], runtime: Mapping[str, Any]
+) -> bool:
+    positions = int(detail.get("open_positions") or 0)
+    orders = int(detail.get("open_orders") or 0)
+    return bool(
+        runtime.get("available")
+        and runtime.get("venue") == "alpaca_paper"
+        and runtime.get("environment") == "paper"
+        and runtime.get("read_only") is False
+        and runtime.get("account_binding_verified") is True
+        and runtime.get("account_fingerprint") == detail.get("account_fingerprint")
+        and runtime.get("instrument")
+        and runtime.get("model_id")
+        and runtime.get("selection_error") is None
+        and runtime.get("state") in {"decided", "monitoring"}
+        and int(runtime.get("positions") or 0) == positions
+        and int(runtime.get("orders") or 0) == orders
+    )
+
+
+def _ibkr_exposure_authorized(
+    latest: Mapping[str, Any], runtime: Mapping[str, Any]
+) -> bool:
+    positions = int(latest.get("open_positions") or 0)
+    observer_orders = int(latest.get("open_orders") or 0)
+    runtime_position = float(runtime.get("position") or 0.0)
+    runtime_orders = int(runtime.get("orders") or 0)
+    reconciled_fill = any(
+        bool((item.get("result") or {}).get("position_reconciled"))
+        for item in (runtime.get("l1") or {}).get("fills") or []
+        if isinstance(item, Mapping)
+    )
+    return bool(
+        runtime.get("available")
+        and runtime.get("venue") == "ibkr_paper"
+        and runtime.get("environment") == "paper"
+        and runtime.get("read_only") is False
+        and runtime.get("account_binding_verified") is True
+        and runtime.get("account_fingerprint")
+        and runtime.get("instrument")
+        and runtime.get("model_id")
+        and runtime.get("selection_error") is None
+        and runtime.get("state") == "monitoring"
+        and positions == int(runtime_position != 0.0)
+        and observer_orders <= runtime_orders
+        and (positions == 0 or (runtime_orders >= 2 and reconciled_fill))
+    )
 
 
 def _load_env_file(path: Path) -> None:
@@ -700,7 +780,10 @@ def evaluate(
             )
         positions = int(detail.get("open_positions") or 0)
         orders = int(detail.get("open_orders") or 0)
-        if positions or orders:
+        runtime = alpaca.get("execution_runtime") or {}
+        if (positions or orders) and not _alpaca_exposure_authorized(
+            detail, runtime
+        ):
             events.append(
                 _event(
                     "alpaca_unexpected_exposure",
@@ -708,7 +791,8 @@ def evaluate(
                     (
                         f"open positions: {positions}\n"
                         f"open orders: {orders}\n"
-                        "The observer is read-only; inspect the account manually."
+                        "Exposure is not reconciled to a fresh account-bound "
+                        "writable model runner."
                     ),
                     severity="critical",
                     category="reconciliation",
@@ -775,7 +859,8 @@ def evaluate(
                 "LTS PAPER ACTION REQUIRED: IBKR TWS OFFLINE",
                 (
                     f"endpoint: {ibkr_socket.get('host')}:{ibkr_socket.get('port')}\n"
-                    "Start TWS in Paper mode, enable socket clients and retain Read-Only API."
+                    "Start TWS in Paper mode and enable socket clients; the execution "
+                    "runner independently verifies its writable Paper mandate."
                 ),
                 severity="warning",
                 category="operations",
@@ -817,7 +902,10 @@ def evaluate(
             )
         positions = int(latest_complete.get("open_positions") or 0)
         orders = int(latest_complete.get("open_orders") or 0)
-        if positions or orders:
+        runtime = ibkr.get("execution_runtime") or {}
+        if (positions or orders) and not _ibkr_exposure_authorized(
+            latest_complete, runtime
+        ):
             events.append(
                 _event(
                     "ibkr_unexpected_exposure",
@@ -825,7 +913,8 @@ def evaluate(
                     (
                         f"open positions: {positions}\n"
                         f"open orders: {orders}\n"
-                        "The observer is read-only; inspect TWS immediately."
+                        "Exposure is not reconciled to a fresh account-bound "
+                        "writable model runner."
                     ),
                     severity="critical",
                     category="reconciliation",
@@ -1225,7 +1314,11 @@ def process_events(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--alpaca-db", type=Path, default=DEFAULT_ALPACA_DB)
+    parser.add_argument(
+        "--alpaca-runtime", type=Path, default=DEFAULT_ALPACA_RUNTIME
+    )
     parser.add_argument("--ibkr-db", type=Path, default=DEFAULT_IBKR_DB)
+    parser.add_argument("--ibkr-runtime", type=Path, default=DEFAULT_IBKR_RUNTIME)
     parser.add_argument("--oanda-db", type=Path, default=DEFAULT_OANDA_DB)
     parser.add_argument("--oanda-env", type=Path, default=DEFAULT_OANDA_ENV)
     parser.add_argument("--mt5-db", type=Path, default=DEFAULT_MT5_DB)
@@ -1281,10 +1374,22 @@ def main() -> int:
             discussions: list[dict[str, Any]] = []
         else:
             alpaca = read_alpaca_snapshot(args.alpaca_db, now)
+            alpaca["execution_runtime"] = read_execution_runtime(
+                args.alpaca_runtime,
+                "lts.alpaca.model_runner.heartbeat.v1",
+                now=now,
+                stale_seconds=args.stale_minutes * 60.0,
+            )
             ibkr = read_ibkr_snapshot(
                 args.ibkr_db,
                 args.ibkr_host,
                 args.ibkr_port,
+            )
+            ibkr["execution_runtime"] = read_execution_runtime(
+                args.ibkr_runtime,
+                "lts.ibkr.model_runner.heartbeat.v1",
+                now=now,
+                stale_seconds=args.stale_minutes * 60.0,
             )
             oanda = read_oanda_snapshot(args.oanda_db, args.oanda_env)
             shadow = read_shadow_snapshot(args.shadow_db)
