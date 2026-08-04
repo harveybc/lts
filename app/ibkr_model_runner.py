@@ -297,13 +297,71 @@ def load_config(path: Path) -> dict[str, Any]:
     return data
 
 
+def build_runner_with_backoff(
+    config: dict[str, Any],
+    stopped: threading.Event,
+    *,
+    runner_factory: Callable[[dict[str, Any]], "IbkrModelRunner"] = None,
+    max_backoff_seconds: float = None,
+) -> Optional["IbkrModelRunner"]:
+    """Construct the runner, absorbing connection refusal into an advancing
+    degraded heartbeat loop with bounded backoff (AUD-F2-20260804-091).
+
+    TWS being down must never crash-loop the service with a frozen
+    heartbeat: each failed attempt writes a fresh ``degraded_error``
+    heartbeat (one incident identity for the continuity monitor, which
+    collapses restart churn into a single incident) and waits with
+    exponential backoff capped by config ``connect_backoff_max_seconds``.
+    Zero broker submissions are possible in this loop; when TWS returns,
+    construction succeeds and the first tick resumes and reconciles from
+    the durable ledger. Returns None only when stopped.
+    """
+    factory = runner_factory or IbkrModelRunner
+    backoff = float(config["loop_seconds"])
+    ceiling = float(
+        max_backoff_seconds
+        if max_backoff_seconds is not None
+        else config.get("connect_backoff_max_seconds", 300.0)
+    )
+    while not stopped.is_set():
+        try:
+            return factory(config)
+        except Exception as exc:
+            write_runner_heartbeat(
+                config["heartbeat_path"],
+                schema="lts.ibkr.model_runner.heartbeat.v1",
+                payload={
+                    "state": "degraded_error",
+                    "phase": "connect",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "venue": "ibkr_paper",
+                    "environment": "paper",
+                    "read_only": False,
+                    "account_binding_verified": False,
+                    "orders_submitted": None,
+                    "next_retry_seconds": backoff,
+                },
+            )
+            print(
+                json.dumps(
+                    {"state": "degraded_error", "phase": "connect",
+                     "error": f"{type(exc).__name__}: {exc}",
+                     "next_retry_seconds": backoff},
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            stopped.wait(backoff)
+            backoff = min(backoff * 2.0, ceiling)
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
-    runner = IbkrModelRunner(config)
     stopped = threading.Event()
 
     def stop(*_args):
@@ -311,6 +369,9 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    runner = build_runner_with_backoff(config, stopped)
+    if runner is None:
+        return 0
     try:
         while not stopped.is_set():
             try:
@@ -323,7 +384,20 @@ def main() -> int:
                     "error": f"{type(exc).__name__}: {exc}",
                     "orders_submitted": None,
                 })
-                raise
+                if args.once:
+                    raise
+                # 091: a mid-loop failure (TWS logoff, API loss) tears the
+                # session down and re-enters the bounded connect/backoff
+                # loop in-process; the next successful construction resumes
+                # and reconciles from the durable ledger.
+                try:
+                    runner.close()
+                except Exception:
+                    pass
+                runner = build_runner_with_backoff(config, stopped)
+                if runner is None:
+                    return 0
+                continue
             if args.once:
                 break
             stopped.wait(float(config["loop_seconds"]))
