@@ -173,6 +173,18 @@ class L1ExecutionOlap(DemoExecutionOlap):
             is not None
         )
 
+    def supersede_decision(self, idempotency_key: str, reason: str) -> bool:
+        """Terminalize a queued would_be_order decision whose signal is
+        already satisfied by an existing effect. This is the legitimate
+        code path for retiring defect-era duplicates — production state is
+        never cleared by direct SQLite manipulation."""
+        cursor = self._con.execute(
+            "UPDATE decisions SET outcome='superseded', reason=? "
+            "WHERE idempotency_key=? AND outcome='would_be_order'",
+            (reason, idempotency_key),
+        )
+        return cursor.rowcount == 1
+
     def effect_by_key(self, idempotency_key: str) -> Optional[dict[str, Any]]:
         row = self._con.execute(
             "SELECT effect_id, idempotency_key, kind, state, capability_sha256,"

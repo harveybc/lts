@@ -87,3 +87,34 @@ def test_effect_prefix_query_escapes_like_wildcards(tmp_path):
     assert not store.effect_exists_with_key_prefix("model_wild")
     assert not store.effect_exists_with_key_prefix("modelXwild")
     store.close()
+
+
+def test_consumer_supersedes_satisfied_retry_decisions(tmp_path):
+    """Defense in depth: a queued retry-class decision whose bar already
+    has an effect is superseded at the ledger and never submitted (the
+    defect-era queue must drain without a fifth duplicate)."""
+    from app.ibkr_l1_journal import L1ExecutionOlap
+
+    store = L1ExecutionOlap(tmp_path / "ledger.sqlite")
+    bar = "2026-08-03T04:00:00+00:00"
+    model = "spy-daily-linear-live-v1"
+    stale_key = f"{model}:{bar}:l0-reconciled-65674b982b73:2026-08-03T20:00:00+00:00"
+    store._con.execute(
+        "INSERT INTO decisions (idempotency_key, decided_at, outcome)"
+        " VALUES (?, ?, 'would_be_order')",
+        (stale_key, "2026-08-04T17:49:08+00:00"),
+    )
+    store.create_effect(
+        "alpaca-90c86e116676d016",
+        f"{model}:{bar}:l0-reconciled-3a1b803dd058:2026-08-03T20:00:00+00:00",
+        "alpaca_bracket_entry", [])
+
+    assert store.effect_exists_with_key_prefix(f"{model}:{bar}")
+    assert store.supersede_decision(stale_key, "superseded: satisfied")
+    row = store._con.execute(
+        "SELECT outcome, reason FROM decisions WHERE idempotency_key=?",
+        (stale_key,)).fetchone()
+    assert row[0] == "superseded"
+    # Idempotent: a second supersede finds nothing pending.
+    assert not store.supersede_decision(stale_key, "again")
+    store.close()

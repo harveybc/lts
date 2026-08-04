@@ -316,6 +316,22 @@ class AlpacaL1Executor:
         """Consume accepted L0 orders; direct callers never bypass L0 risk."""
         results = []
         for pending in self.store.l1_pending_decisions("would_be_order"):
+            key = str(pending["idempotency_key"])
+            if ":l0-" in key:
+                # Exactly-once, consumer side: a retry-class decision whose
+                # bar identity already produced ANY effect is satisfied and
+                # must never submit (2026-08-04 duplicate-lifecycle defect;
+                # also retires defect-era queued duplicates at the ledger).
+                base_prefix = key.split(":l0-")[0]
+                if self.store.effect_exists_with_key_prefix(base_prefix):
+                    self.store.supersede_decision(
+                        key,
+                        "superseded: bar signal already satisfied by an"
+                        " existing broker effect",
+                    )
+                    results.append({"idempotency_key": key,
+                                    "superseded": True})
+                    continue
             intent = OrderIntentV2.model_validate_json(pending["intent_json"])
             if intent.venue != self.profile.venue:
                 continue
