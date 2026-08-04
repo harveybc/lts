@@ -38,3 +38,52 @@ def test_old_model_must_be_drained_before_a_different_session_activates():
             model_id="model-b", artifact_sha256="c" * 64,
             config_sha256="d" * 64, balance=100_000.0, equity=100_000.0,
         )
+
+
+def test_l0_retry_gate_is_exactly_once(tmp_path):
+    """Regression for the 2026-08-04 duplicate-lifecycle defect: one bar's
+    signal produced four bracket lifecycles because every reconciliation
+    minted a fresh idempotency identity. The gate must (a) never retry a
+    satisfied bar, (b) mint one deterministic identity for a genuinely
+    blocked bar, and (c) collapse repeated repairs into that identity."""
+    from app.alpaca_model_runner import l0_retry_suffix
+    from app.ibkr_l1_journal import L1ExecutionOlap
+
+    store = L1ExecutionOlap(tmp_path / "ledger.sqlite")
+    bar = "2026-08-03T04:00:00+00:00"
+    model = "spy-daily-linear-live-v1"
+    repairs = [{"reservation_id": "rsv-1"}]
+
+    # No reconciliations: never a retry identity.
+    assert l0_retry_suffix(store, model, bar, []) == ""
+
+    # Blocked bar with no effect ever: exactly one deterministic retry.
+    first = l0_retry_suffix(store, model, bar, repairs)
+    second = l0_retry_suffix(store, model, bar,
+                             [{"reservation_id": "rsv-2"}])
+    assert first == second == ":l0-retry-1"       # repairs cannot mint more
+
+    # Once ANY effect exists for the bar (here: the retry's own effect),
+    # the signal is satisfied — no further retry identity, ever.
+    store.create_effect(
+        "alpaca-deadbeefdeadbeef",
+        f"{model}:{bar}:l0-retry-1:2026-08-03T20:00:00+00:00",
+        "alpaca_bracket_entry", [])
+    assert l0_retry_suffix(store, model, bar, repairs) == ""
+
+    # A different bar is independent.
+    assert l0_retry_suffix(
+        store, model, "2026-08-04T04:00:00+00:00", repairs
+    ) == ":l0-retry-1"
+    store.close()
+
+
+def test_effect_prefix_query_escapes_like_wildcards(tmp_path):
+    from app.ibkr_l1_journal import L1ExecutionOlap
+
+    store = L1ExecutionOlap(tmp_path / "ledger.sqlite")
+    store.create_effect("e-1", "model%wild:2026-08-03", "kind", [])
+    assert store.effect_exists_with_key_prefix("model%wild")
+    assert not store.effect_exists_with_key_prefix("model_wild")
+    assert not store.effect_exists_with_key_prefix("modelXwild")
+    store.close()

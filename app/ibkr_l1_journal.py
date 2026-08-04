@@ -155,6 +155,24 @@ class L1ExecutionOlap(DemoExecutionOlap):
         ).fetchone()
         return None if row is None else self._effect_dict(row)
 
+    def effect_exists_with_key_prefix(self, prefix: str) -> bool:
+        """True when ANY effect (any state, terminal included) exists whose
+        idempotency key starts with ``prefix``. Used by the exactly-once
+        retry gate: a bar whose signal already produced an effect is
+        satisfied — reconciliation repairs must never mint a new identity
+        for it (duplicate-lifecycle defect, 2026-08-04)."""
+        escaped = (
+            prefix.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        )
+        return (
+            self._con.execute(
+                "SELECT 1 FROM l1_effects WHERE idempotency_key LIKE ? "
+                "ESCAPE '\\' LIMIT 1",
+                (escaped + "%",),
+            ).fetchone()
+            is not None
+        )
+
     def effect_by_key(self, idempotency_key: str) -> Optional[dict[str, Any]]:
         row = self._con.execute(
             "SELECT effect_id, idempotency_key, kind, state, capability_sha256,"

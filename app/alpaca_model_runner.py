@@ -34,6 +34,25 @@ class AlpacaModelRunnerError(RuntimeError):
     pass
 
 
+def l0_retry_suffix(store, model_id: str, last_closed_bar: str,
+                    reconciliations: list) -> str:
+    """Exactly-once retry gate for L0-reconciliation repairs.
+
+    A signal may be retried only when it never reached the broker: if ANY
+    effect (any state, terminal included) exists for this bar's identity,
+    the signal is satisfied and reconciliation must not mint a new one.
+    The retry identity is deterministic per bar, so repeated repairs
+    collapse into one replayed decision. A per-repair hashed suffix let
+    every reconciliation mint a fresh idempotency key, producing four
+    duplicate SPY lifecycles from one signal on 2026-08-04.
+    """
+    if not reconciliations:
+        return ""
+    if store.effect_exists_with_key_prefix(f"{model_id}:{last_closed_bar}"):
+        return ""
+    return ":l0-retry-1"
+
+
 class ModelSessionStore:
     """Persist model ownership and broker-derived starting/ending balances."""
 
@@ -296,14 +315,10 @@ class AlpacaModelRunner:
         take = reference * (1.0 + side * take_fraction)
         bar_start = datetime.fromisoformat(inference["last_closed_bar"])
         decided_at = bar_start + timedelta(hours=16)
-        retry_suffix = ""
-        if reconciliations:
-            repaired = "|".join(sorted(
-                str(item.get("reservation_id", "")) for item in reconciliations
-            ))
-            retry_suffix = ":l0-reconciled-" + hashlib.sha256(
-                repaired.encode()
-            ).hexdigest()[:12]
+        retry_suffix = l0_retry_suffix(
+            self.store, self.policy.model_id, inference["last_closed_bar"],
+            reconciliations,
+        )
         intent = AssetIntent(
             object_id=(
                 f"{self.policy.model_id}:{inference['last_closed_bar']}"
