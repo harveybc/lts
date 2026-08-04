@@ -111,7 +111,7 @@ Omega currently runs four five-minute user timers:
   Dragon's fleet-safe `/v1/status` evidence rather than expecting a local copy
   of Dragon's SQLite database.
 
-Dragon runs `lts-mt5-bridge.service` plus an independent five-minute
+Dragon runs `lts-mt5-execution-bridge.service` plus an independent five-minute
 `lts-mt5-bridge-watchdog.timer`. The bridge listens on TCP `8766`, with host
 firewall access restricted to the libvirt NAT subnet and Tailscale. Its local
 watchdog reports missing/stale heartbeats, broker disconnection and unexpected

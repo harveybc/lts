@@ -1,7 +1,7 @@
 [Unit]
 Description=LTS MT5 bridge deterministic watchdog
-After=lts-mt5-bridge.service
-Wants=lts-mt5-bridge.service
+After=lts-mt5-execution-bridge.service
+Wants=lts-mt5-execution-bridge.service
 
 [Service]
 Type=oneshot
@@ -12,4 +12,3 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.local/state/lts
-

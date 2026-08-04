@@ -7,6 +7,7 @@ if [[ "$(hostname -s)" != "dragon" ]]; then
 fi
 
 target="${HOME}/.config/lts/mt5-bridge.env"
+config_target="${HOME}/.config/lts/mt5_execution_bridge.json"
 environment_python="${HOME}/anaconda3/envs/trading-stack/bin/python"
 repository="${HOME}/Documents/GitHub/lts"
 
@@ -27,8 +28,14 @@ if [[ ! -s "${target}" ]]; then
 fi
 chmod 600 "${target}"
 
-unit_source="${HOME}/Documents/GitHub/lts/examples/systemd/lts-mt5-bridge.service"
-unit_target="${HOME}/.config/systemd/user/lts-mt5-bridge.service"
+if [[ ! -s "${config_target}" ]]; then
+  install -m 600 \
+    "${repository}/examples/configs/mt5_execution_bridge_demo_v2.json" \
+    "${config_target}"
+fi
+
+unit_source="${repository}/examples/systemd/lts-mt5-execution-bridge.service"
+unit_target="${HOME}/.config/systemd/user/lts-mt5-execution-bridge.service"
 install -m 644 "${unit_source}" "${unit_target}"
 install -m 644 \
   "${repository}/examples/systemd/lts-mt5-bridge-watchdog.service" \
@@ -37,9 +44,13 @@ install -m 644 \
   "${repository}/examples/systemd/lts-mt5-bridge-watchdog.timer" \
   "${HOME}/.config/systemd/user/lts-mt5-bridge-watchdog.timer"
 systemctl --user daemon-reload
-systemctl --user enable --now lts-mt5-bridge.service
+# The v1 read-only bridge and v2 execution bridge bind the same port. Keeping
+# both enabled creates a permanent restart loop even though the EA appears live.
+systemctl --user disable --now lts-mt5-bridge.service 2>/dev/null || true
+systemctl --user enable --now lts-mt5-execution-bridge.service
 systemctl --user enable --now lts-mt5-bridge-watchdog.timer
 
 printf 'MT5 bridge secret is stored at %s (mode 600).\n' "${target}"
+printf 'MT5 execution config is stored at %s (mode 600).\n' "${config_target}"
 printf 'The value must be entered locally in the MT5 EA; do not paste it in chat.\n'
-printf 'Bridge health: http://192.168.122.1:8766/health\n'
+printf 'Bridge status: http://192.168.122.1:8766/v1/status\n'
