@@ -211,6 +211,10 @@ class CapabilityGate:
     changes nothing about validation or permission enforcement.
     """
 
+    #: validator hook — subclasses (e.g. the resume gate) bind their own
+    #: strict schema while inheriting the store/permission/uniqueness rules.
+    _validate = staticmethod(validate_capability)
+
     def __init__(self, store_dir: Optional[Path] = None) -> None:
         self.store_dir = Path(store_dir) if store_dir else CAPABILITY_STORE
 
@@ -246,7 +250,7 @@ class CapabilityGate:
             try:
                 self._check_permissions(path, 0o600, "file")
                 payload = json.loads(path.read_text())
-                record = validate_capability(payload, profile=profile, now=now)
+                record = self._validate(payload, profile=profile, now=now)
                 if olap is not None and (
                     olap.capability_row(record.capability_sha256) is not None
                     or olap.nonce_consumed(record.nonce_sha256)
