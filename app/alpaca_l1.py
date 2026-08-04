@@ -16,14 +16,15 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import requests
-from trading_contracts import OrderIntentV2
+from trading_contracts import ExecutionReportV2, OrderIntentV2, ProtectionLegState
 
 from app.alpaca_paper_lab import AlpacaPaperClient, AlpacaPaperError
-from app.demo_execution_service import DemoExecutionError
+from app.demo_execution_service import DemoExecutionError, DemoExecutionService
 from app.ibkr_l1_journal import L1ExecutionOlap
 
 
 ALPACA_L1_VERSION = "lts.alpaca.paper.l1.v1"
+_PRODUCER = {"name": "lts.alpaca_l1", "version": "0.2.0"}
 _TERMINAL_ORDER_STATES = {
     "canceled", "expired", "failed", "filled", "rejected", "replaced",
 }
@@ -216,10 +217,12 @@ class AlpacaL1Executor:
         store: L1ExecutionOlap,
         client: AlpacaPaperTradingClient,
         profile: AlpacaL1Profile,
+        service: Optional[DemoExecutionService] = None,
     ) -> None:
         self.store = store
         self.client = client
         self.profile = profile
+        self.service = service
 
     def _account(self) -> dict[str, Any]:
         account = self.client.account()
@@ -242,6 +245,7 @@ class AlpacaL1Executor:
         take_profit_price: Decimal,
         risk_fraction_at_stop: Decimal,
         model_evidence: Mapping[str, Any],
+        l0_context: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         existing = self.store.effect_by_key(idempotency_key)
         if existing is not None:
@@ -283,6 +287,8 @@ class AlpacaL1Executor:
             "client_order_id": client_order_id,
             "model_evidence": dict(model_evidence),
         }
+        if l0_context is not None:
+            contract["l0"] = dict(l0_context)
         with self.store.atomic_unit():
             self.store.create_effect(effect_id, idempotency_key, "alpaca_bracket_entry", [])
             self.store.store_effect_contract(effect_id, contract)
@@ -337,6 +343,232 @@ class AlpacaL1Executor:
                 take_profit_price=_decimal(intent.protection.take_profit_price),
                 risk_fraction_at_stop=_decimal(intent.risk.risk_fraction_at_stop),
                 model_evidence=evidence,
+                l0_context={
+                    "reservation_id": intent.risk.reservation_id,
+                    "order_intent_id": intent.object_id,
+                    "trace_id": intent.trace_id,
+                    "delta_units": intent.delta_units,
+                },
+            ))
+        return results
+
+    def _l0_context(
+        self, effect: Mapping[str, Any], contract: Mapping[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        stored = contract.get("l0")
+        if isinstance(stored, Mapping):
+            return dict(stored)
+        for pending in self.store.active_reservation_intents():
+            if pending["idempotency_key"] != effect["idempotency_key"]:
+                continue
+            intent = self.store.decision_intent(pending["idempotency_key"])
+            if intent is None:
+                return None
+            return {
+                "reservation_id": pending["reservation_id"],
+                "order_intent_id": intent["object_id"],
+                "trace_id": intent["trace_id"],
+                "delta_units": intent["delta_units"],
+            }
+        return None
+
+    def _effective_contract(
+        self, effect_id: str, contract: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        effective = dict(contract)
+        if effective.get("time_in_force"):
+            return effective
+        for fact in self.store.broker_facts(effect_id):
+            observed = fact.get("fact", {})
+            if observed.get("time_in_force"):
+                effective["time_in_force"] = observed["time_in_force"]
+                break
+        return effective
+
+    @staticmethod
+    def _protection_legs(
+        order: Mapping[str, Any], contract: Mapping[str, Any], covered: float
+    ) -> list[ProtectionLegState]:
+        legs = order.get("legs")
+        if not isinstance(legs, list):
+            return []
+        result = []
+        for leg_name, types, price_key in (
+            ("stop_loss", {"stop", "stop_limit"}, "stop_price"),
+            ("take_profit", {"limit"}, "limit_price"),
+        ):
+            matches = [leg for leg in legs if leg.get("type") in types]
+            if len(matches) != 1:
+                return []
+            leg = matches[0]
+            result.append(ProtectionLegState(
+                leg=leg_name,
+                broker_confirmed=True,
+                broker_leg_id=str(leg.get("id")),
+                price=float(leg[price_key]),
+                covered_units=covered,
+            ))
+        return result
+
+    def _apply_l0_snapshot(
+        self,
+        effect: Mapping[str, Any],
+        contract: Mapping[str, Any],
+        order: Mapping[str, Any],
+        *,
+        positions_open: bool,
+    ) -> dict[str, Any]:
+        if self.service is None:
+            return {"reconciled": False, "reason": "service_unavailable"}
+        context = self._l0_context(effect, contract)
+        if context is None:
+            return {"reconciled": False, "reason": "l0_context_unavailable"}
+        reservation_id = str(context["reservation_id"])
+        intent_id = str(context["order_intent_id"])
+        requested = float(context["delta_units"])
+        trace_id = str(context["trace_id"])
+        now = datetime.now(timezone.utc)
+        previous = self.store.last_state(intent_id)
+        changed = False
+        broker_ids = {"parent": str(order.get("id", effect["order_ids"][0]))}
+        for leg in order.get("legs") or []:
+            if leg.get("type") in {"stop", "stop_limit"}:
+                broker_ids["stop_loss"] = str(leg.get("id"))
+            elif leg.get("type") == "limit":
+                broker_ids["take_profit"] = str(leg.get("id"))
+        if previous == "requested":
+            self.service.apply_execution_event(ExecutionReportV2(
+                object_id=f"er-alpaca-ack-{reservation_id}", as_of=now,
+                producer=_PRODUCER, trace_id=trace_id,
+                order_intent_id=intent_id,
+                attempt_id=f"attempt-{reservation_id}",
+                bracket_role="parent", state="accepted",
+                previous_state="requested", requested_units=requested,
+                broker_ids=broker_ids,
+            ))
+            previous = "accepted"
+            changed = True
+
+        filled = float(order.get("filled_qty") or 0.0)
+        requested_abs = abs(requested)
+        applied = abs(self.store.exposure_units(f"exp-{intent_id}") or 0.0)
+        if filled > requested_abs + 1e-9:
+            raise DemoExecutionError("Alpaca cumulative fill exceeds immutable quantity")
+        if filled > applied + 1e-9 and previous not in {"filled", "closed"}:
+            effective = self._effective_contract(str(effect["effect_id"]), contract)
+            verdict = verify_native_bracket(order, effective)
+            protection = self._protection_legs(order, effective, filled)
+            if not verdict["protected"] or len(protection) != 2:
+                raise DemoExecutionError(
+                    "Alpaca fill lacks exact broker-native protection evidence"
+                )
+            state = "filled" if abs(filled - requested_abs) <= 1e-9 else "partially_filled"
+            digest = hashlib.sha256(str(filled).encode()).hexdigest()[:12]
+            self.service.apply_execution_event(ExecutionReportV2(
+                object_id=f"er-alpaca-fill-{reservation_id}-{digest}", as_of=now,
+                producer=_PRODUCER, trace_id=trace_id,
+                order_intent_id=intent_id,
+                attempt_id=f"attempt-{reservation_id}",
+                bracket_role="parent", state=state,
+                previous_state=previous, requested_units=requested,
+                filled_units=filled,
+                filled_price=(
+                    None if order.get("filled_avg_price") is None
+                    else float(order["filled_avg_price"])
+                ),
+                protection_legs=protection, broker_ids=broker_ids,
+            ))
+            previous = state
+            changed = True
+
+        status = str(order.get("status", ""))
+        if filled == 0 and status in _TERMINAL_ORDER_STATES and previous in {
+            "requested", "accepted"
+        }:
+            state = "expired" if status == "expired" else (
+                "rejected" if status in {"failed", "rejected"} else "cancelled"
+            )
+            self.service.apply_execution_event(ExecutionReportV2(
+                object_id=f"er-alpaca-terminal-{reservation_id}", as_of=now,
+                producer=_PRODUCER, trace_id=trace_id,
+                order_intent_id=intent_id,
+                attempt_id=f"attempt-{reservation_id}",
+                bracket_role="parent", state=state,
+                previous_state=previous, requested_units=requested,
+                broker_ids=broker_ids,
+            ))
+            previous = state
+            changed = True
+        if (
+            not positions_open
+            and self.store.exposure_state(f"exp-{intent_id}") == "open"
+        ):
+            self.service.apply_position_close(intent_id)
+            changed = True
+        if changed:
+            self.store.record_broker_fact(
+                str(effect["effect_id"]), "l0_reconciled", {
+                    "reservation_id": reservation_id,
+                    "order_intent_id": intent_id,
+                    "broker_status": status,
+                    "filled_qty": filled,
+                    "positions_open": positions_open,
+                }
+            )
+        return {"reconciled": True, "reservation_id": reservation_id,
+                "lifecycle_state": previous, "changed": changed}
+
+    def reconcile_terminal_effects(self) -> list[dict[str, Any]]:
+        """Repair terminal broker facts that predate L0 lifecycle ingestion."""
+        results = []
+        candidates: dict[str, dict[str, Any]] = {}
+        for pending in self.store.active_reservation_intents():
+            effect = self.store.effect_by_key(pending["idempotency_key"])
+            if effect is None or effect["kind"] != "alpaca_bracket_entry":
+                continue
+            candidates[effect["effect_id"]] = effect
+        for exposure in self.store.open_exposures():
+            reservation_id = self.store.exposure_reservation(
+                exposure["order_intent_id"]
+            )
+            idempotency_key = (
+                None if reservation_id is None
+                else self.store.reservation_idempotency(reservation_id)
+            )
+            effect = (
+                None if idempotency_key is None
+                else self.store.effect_by_key(idempotency_key)
+            )
+            if effect is not None and effect["kind"] == "alpaca_bracket_entry":
+                candidates[effect["effect_id"]] = effect
+        for effect in candidates.values():
+            contract = self.store.effect_contract(effect["effect_id"])
+            if contract is None or not effect["order_ids"]:
+                continue
+            order = self.client.order(str(effect["order_ids"][0]))
+            positions = [
+                item for item in self.client.positions()
+                if item.get("symbol") == contract["symbol"]
+            ]
+            if positions or str(order.get("status", "")) not in _TERMINAL_ORDER_STATES:
+                continue
+            snapshots = [
+                fact["fact"] for fact in self.store.broker_facts(effect["effect_id"])
+                if fact["fact_kind"] in {"ack_snapshot", "monitor_snapshot"}
+                and float(fact["fact"].get("filled_qty") or 0.0) > 0
+            ]
+            active_snapshots = [
+                snapshot for snapshot in snapshots
+                if all(
+                    leg.get("status") not in _TERMINAL_ORDER_STATES
+                    for leg in snapshot.get("legs") or []
+                )
+            ]
+            evidence = active_snapshots[-1] if active_snapshots else (
+                snapshots[-1] if snapshots else order
+            )
+            results.append(self._apply_l0_snapshot(
+                effect, contract, evidence, positions_open=False
             ))
         return results
 
@@ -352,6 +584,13 @@ class AlpacaL1Executor:
         if verdict["protected"]:
             if effect["state"] == "submitted_pending_ack":
                 self.store.advance_effect(effect_id, "acknowledged")
+            positions_open = any(
+                item.get("symbol") == contract["symbol"]
+                for item in self.client.positions()
+            )
+            self._apply_l0_snapshot(
+                effect, contract, order, positions_open=positions_open
+            )
             return {"effect_id": effect_id, "order_id": order_id, **verdict}
         self._recover(effect_id, order_id, contract, verdict["failures"])
         return {"effect_id": effect_id, "order_id": order_id, **verdict}
@@ -394,9 +633,20 @@ class AlpacaL1Executor:
         if not verdict["protected"] and (
             positions or status not in _TERMINAL_ORDER_STATES
         ):
-            self._recover(effect_id, str(effect["order_ids"][0]), contract, verdict["failures"])
-        elif not positions and status in _TERMINAL_ORDER_STATES and effect["state"] == "acknowledged":
+            if effect["state"] != "recovering":
+                self._recover(
+                    effect_id, str(effect["order_ids"][0]), contract,
+                    verdict["failures"]
+                )
+        elif (
+            not positions
+            and status in _TERMINAL_ORDER_STATES
+            and effect["state"] in {"acknowledged", "recovering"}
+        ):
+            self._apply_l0_snapshot(effect, contract, order, positions_open=False)
             self.store.advance_effect(effect_id, "terminal_flat")
+        elif positions:
+            self._apply_l0_snapshot(effect, contract, order, positions_open=True)
         return {
             "effect_id": effect_id,
             "status": status,

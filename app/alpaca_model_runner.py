@@ -175,7 +175,9 @@ class AlpacaModelRunner:
             DemoExecutionConfig.from_dict(config["service"]), self.store,
             ZeroNetworkSink(),
         )
-        self.executor = AlpacaL1Executor(self.store, self.client, self.profile)
+        self.executor = AlpacaL1Executor(
+            self.store, self.client, self.profile, self.service
+        )
         self.sessions = ModelSessionStore(self.store._con)
         self.selector = SelectedLinearPolicy(
             manifest_file=config["model"]["manifest_file"],
@@ -227,6 +229,7 @@ class AlpacaModelRunner:
         account, fingerprint = self._account_facts()
         open_orders = self.client.open_orders()
         positions = [p for p in self.client.positions() if p.get("symbol") == self.profile.symbol]
+        reconciliations = self.executor.reconcile_terminal_effects()
         current = self.sessions.active("alpaca_paper", fingerprint, self.profile.symbol)
         selected_changed = current is not None and (
             current["model_id"] != self.policy.model_id
@@ -261,7 +264,10 @@ class AlpacaModelRunner:
             )
 
         for effect in self.store.nonterminal_effects():
-            if effect["kind"] == "alpaca_bracket_entry" and effect["state"] == "acknowledged":
+            if (
+                effect["kind"] == "alpaca_bracket_entry"
+                and effect["state"] in {"acknowledged", "recovering"}
+            ):
                 self.executor.monitor(effect["effect_id"])
         if open_orders or positions:
             return {"state": "monitoring", "model_id": self.policy.model_id,
@@ -290,8 +296,19 @@ class AlpacaModelRunner:
         take = reference * (1.0 + side * take_fraction)
         bar_start = datetime.fromisoformat(inference["last_closed_bar"])
         decided_at = bar_start + timedelta(hours=16)
+        retry_suffix = ""
+        if reconciliations:
+            repaired = "|".join(sorted(
+                str(item.get("reservation_id", "")) for item in reconciliations
+            ))
+            retry_suffix = ":l0-reconciled-" + hashlib.sha256(
+                repaired.encode()
+            ).hexdigest()[:12]
         intent = AssetIntent(
-            object_id=f"{self.policy.model_id}:{inference['last_closed_bar']}",
+            object_id=(
+                f"{self.policy.model_id}:{inference['last_closed_bar']}"
+                f"{retry_suffix}"
+            ),
             as_of=decided_at, valid_until=decided_at + timedelta(days=7),
             producer={"name": "prediction_provider.live_linear_policy", "version": "0.1.0"},
             trace_id=f"alpaca-{inference['input_sha256'][:16]}",
@@ -305,7 +322,10 @@ class AlpacaModelRunner:
                            "take_profit_price": round(take, 2)},
             reason_codes=[f"model:{self.policy.model_id}",
                           f"input:{inference['input_sha256']}",
-                          "paper_infrastructure_canary"],
+                          "paper_infrastructure_canary"] + (
+                              ["retry_after_l0_terminal_reconciliation"]
+                              if retry_suffix else []
+                          ),
             artifact_hash="sha256:" + self.policy.artifact_sha256,
         )
         capability = self._capability(fingerprint, now)

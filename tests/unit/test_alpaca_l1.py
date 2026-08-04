@@ -1,12 +1,25 @@
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
+from trading_contracts import (
+    AssetIntent,
+    BrokerCapabilitySnapshot,
+    ExecutionReportV2,
+    InstrumentCapability,
+    OrderIntentV2,
+)
 
 from app.alpaca_l1 import (
     AlpacaL1Executor,
     AlpacaL1Profile,
     AlpacaPaperError,
     verify_native_bracket,
+)
+from app.demo_execution_service import (
+    DemoExecutionConfig,
+    DemoExecutionService,
+    ZeroNetworkSink,
 )
 from app.ibkr_l1_journal import L1ExecutionOlap
 
@@ -62,6 +75,7 @@ class FakeClient:
         self.cancel_calls = 0
         self.close_calls = 0
         self._client_order_id = None
+        self.order_payload = None
 
     def account(self):
         return {"id": "paper", "status": "ACTIVE", "trading_blocked": False}
@@ -75,6 +89,8 @@ class FakeClient:
         return {"id": "parent-id", "status": "accepted"}
 
     def order(self, _order_id):
+        if self.order_payload is not None:
+            return self.order_payload
         legs = _order()["legs"] if self.protected else []
         return _order(client_order_id=self._client_order_id, legs=legs)
 
@@ -205,3 +221,139 @@ def test_crypto_route_is_impossible_in_profile(tmp_path):
     )
     with pytest.raises(AlpacaPaperError, match="Only US equities"):
         AlpacaL1Profile.load(profile)
+
+
+def test_terminal_broker_effect_reconciles_l0_and_unblocks_next_signal(tmp_path):
+    database = tmp_path / "ledger.sqlite"
+    config = DemoExecutionConfig.from_dict({
+        "venue": "alpaca_paper",
+        "account_fingerprint": "0123456789abcdef",
+        "environment": "paper",
+        "database_path": str(database),
+        "risk_fraction_at_stop": 0.001,
+        "max_overshoot_ratio": 0.25,
+        "gross_notional_fraction_max": 0.10,
+        "margin_fraction_max": 0.10,
+        "daily_loss_budget_fraction": 0.01,
+        "max_concurrent_positions": 1,
+        "signal_max_age_seconds": 3600.0,
+        "owner_issuer_allowlist": ["owner"],
+        "command_phrases": {},
+        "asset_instrument_bindings": {"equity:SPY": "SPY"},
+    })
+    store = L1ExecutionOlap(database)
+    service = DemoExecutionService(config, store, ZeroNetworkSink())
+    client = FakeClient()
+    executor = AlpacaL1Executor(store, client, _profile(), service)
+    now = datetime.now(timezone.utc)
+    reservation_id = "rsv-legacy"
+    idempotency_key = "legacy-signal"
+    intent = OrderIntentV2(
+        object_id="oi2-legacy", as_of=now,
+        producer={"name": "test", "version": "1"}, trace_id="legacy-trace",
+        account_ref="0123456789abcdef", asset_id="equity:SPY",
+        venue="alpaca_paper", instrument="SPY",
+        intent_class="risk_increasing", order_type="market",
+        delta_units=-1.0, idempotency_key=idempotency_key,
+        capability_snapshot_hash="sha256:" + "f" * 64,
+        protection={"stop_loss_price": 510.0, "take_profit_price": 490.0},
+        risk={
+            "risk_fraction_at_stop": 0.0005,
+            "gross_notional_fraction": 0.005,
+            "margin_fraction": 0.005,
+            "daily_loss_budget_fraction": 0.01,
+            "reservation_id": reservation_id,
+        },
+        preflight={
+            "source_model_id": "model",
+            "source_artifact_sha256": "sha256:" + "a" * 64,
+            "source_config_sha256": "sha256:" + "b" * 64,
+            "source_input_sha256": "c" * 64,
+        },
+    )
+    effect_id = "alpaca-legacy"
+    active_fill = _order(
+        status="filled", side="sell", qty="1", filled_qty="1",
+        filled_avg_price="500", time_in_force="day",
+        client_order_id="lts-client",
+        legs=[
+            {"id": "tp", "side": "buy", "type": "limit", "qty": "1",
+             "limit_price": "490", "time_in_force": "day", "status": "new"},
+            {"id": "sl", "side": "buy", "type": "stop", "qty": "1",
+             "stop_price": "510", "time_in_force": "day", "status": "held"},
+        ],
+    )
+    terminal = dict(active_fill)
+    terminal["legs"] = [dict(leg, status="canceled") for leg in active_fill["legs"]]
+    client.order_payload = terminal
+    with store.atomic_unit():
+        store.reserve(reservation_id, idempotency_key, now.date().isoformat(),
+                      0.0005, 0.005, 0.005)
+        store.record_decision(
+            idempotency_key, "would_be_order", None,
+            intent.model_dump_json(), {"adapter": "alpaca_paper"},
+            capability_evidence="live_observed",
+        )
+        store.append_lifecycle(ExecutionReportV2(
+            object_id="er-legacy-request", as_of=now,
+            producer={"name": "test", "version": "1"},
+            trace_id="legacy-trace", order_intent_id=intent.object_id,
+            attempt_id=f"attempt-{reservation_id}", bracket_role="parent",
+            state="requested", requested_units=-1.0,
+        ))
+        store.create_effect(effect_id, idempotency_key,
+                            "alpaca_bracket_entry", ["parent-id"])
+        store.store_effect_contract(effect_id, {
+            "symbol": "SPY", "qty": "1", "side": "sell",
+            "stop_price": "510", "take_profit_price": "490",
+            "client_order_id": "lts-client",
+        })
+        store.record_broker_fact(effect_id, "monitor_snapshot", active_fill)
+        store.advance_effect(effect_id, "effect_unknown")
+        store.advance_effect(effect_id, "submitted_pending_ack")
+        store.advance_effect(effect_id, "acknowledged")
+        store.advance_effect(effect_id, "terminal_flat")
+
+    repaired = executor.reconcile_terminal_effects()
+    assert repaired == [{
+        "reconciled": True,
+        "reservation_id": reservation_id,
+        "lifecycle_state": "filled",
+        "changed": True,
+    }]
+    assert store.reservation_row(reservation_id)["state"] == "consumed"
+    assert store.exposure_state("exp-oi2-legacy") == "closed"
+    assert store.active_totals(now.date().isoformat())["positions"] == 0
+    assert executor.reconcile_terminal_effects() == []
+
+    next_intent = AssetIntent(
+        object_id="next-signal", as_of=now,
+        valid_until=now + timedelta(minutes=30),
+        producer={"name": "test", "version": "1"}, trace_id="next-trace",
+        cell_id="equity:SPY@1d:model", asset_id="equity:SPY",
+        action="target", target_exposure=-1.0,
+        risk_geometry={
+            "mode": "fixed_price", "stop_price": 101.0,
+            "take_profit_price": 98.0,
+        },
+        artifact_hash="sha256:" + "d" * 64,
+    )
+    capability = BrokerCapabilitySnapshot(
+        object_id="cap-next", as_of=now,
+        producer={"name": "test", "version": "1"}, trace_id="cap-trace",
+        venue="alpaca_paper", account_fingerprint="0123456789abcdef",
+        environment="paper", capability_evidence="live_observed",
+        source_artifact_hash="sha256:" + "e" * 64,
+        source_observed_at=now,
+        instruments=[InstrumentCapability(
+            instrument="SPY", tradeable=True, shortable=True,
+            min_units=1.0, unit_step=1.0, price_decimals=2,
+            margin_rate=1.0, native_stop_loss=True,
+            native_take_profit=True, native_bracket=True,
+        )],
+    )
+    decision = service.process_intent(
+        next_intent, capability, equity=100_000.0, reference_price=100.0,
+        quote_time=now, instrument="SPY", now=now,
+    )
+    assert decision["outcome"] == "would_be_order", decision
