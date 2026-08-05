@@ -143,6 +143,64 @@ def validate_resume_capability(
     )
 
 
+RESUME_SIGNATURE_NAMESPACE = "lts-ibkr-resume"
+ALLOWED_SIGNERS_PATH = Path("/etc/lts/resume_allowed_signers")
+OWNER_PRINCIPAL = "owner"
+
+
+def verify_owner_signature(
+    capability_path: Path,
+    signature_path: Path,
+    *,
+    allowed_signers: Path = ALLOWED_SIGNERS_PATH,
+    require_root_pin: bool = True,
+) -> dict[str, Any]:
+    """Finding 094: a PTY is not proof of a human owner. The capability
+    file must carry a detached OpenSSH Ed25519 signature
+    (``ssh-keygen -Y sign``) whose key is pinned in a ROOT-OWNED
+    allowed-signers file the agent user cannot write. The private key
+    lives behind the owner's passphrase — a separate human-authenticated
+    boundary. Missing pin, missing signature, wrong signer, wrong
+    namespace or any byte change in the payload refuses; while the pin
+    file does not exist, resume is structurally disabled."""
+    import os as _os
+    import subprocess as _subprocess
+
+    if not allowed_signers.is_file():
+        raise L1AuthorizationError(
+            f"owner-signer pin {allowed_signers} does not exist — resume"
+            " is disabled until the owner completes the signer setup"
+            " packet (docs/security/OWNER_RESUME_SIGNER_SETUP)")
+    pin_stat = _os.stat(allowed_signers)
+    if require_root_pin and pin_stat.st_uid != 0:
+        raise L1AuthorizationError(
+            f"owner-signer pin {allowed_signers} is not root-owned — an"
+            " agent-writable pin is no pin; refusing")
+    if pin_stat.st_mode & 0o022:
+        raise L1AuthorizationError(
+            "owner-signer pin must not be group/other-writable")
+    if not signature_path.is_file():
+        raise L1AuthorizationError(
+            f"detached owner signature {signature_path} is missing")
+    result = _subprocess.run(
+        ["ssh-keygen", "-Y", "verify",
+         "-f", str(allowed_signers),
+         "-I", OWNER_PRINCIPAL,
+         "-n", RESUME_SIGNATURE_NAMESPACE,
+         "-s", str(signature_path)],
+        stdin=capability_path.open("rb"),
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise L1AuthorizationError(
+            "owner signature verification FAILED: "
+            + (result.stderr.strip() or result.stdout.strip())[:200])
+    return {"verified": True, "principal": OWNER_PRINCIPAL,
+            "namespace": RESUME_SIGNATURE_NAMESPACE,
+            "capability_sha256": hashlib.sha256(
+                capability_path.read_bytes()).hexdigest()}
+
+
 class ResumeGate(CapabilityGate):
     """Loads the single valid resume capability from its own fixed store."""
 

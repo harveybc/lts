@@ -38,6 +38,7 @@ from app.ibkr_model_authority import ContinuousPaperProfile  # noqa: E402
 from app.ibkr_l1_resume import (  # noqa: E402
     ResumeGate,
     resume_after_reconciliation,
+    verify_owner_signature,
 )
 
 DEFAULT_INCIDENT_REPO = Path.home() / "Documents/GitHub/agent-multi"
@@ -157,7 +158,20 @@ def main() -> int:
     olap = L1ExecutionOlap(ledger_path)
 
     try:
-        payload, record = ResumeGate().load(profile)
+        gate = ResumeGate()
+        candidates = sorted(gate.store_dir.glob("*.json"))
+        if len(candidates) != 1:
+            raise L1AuthorizationError(
+                f"{len(candidates)} capability file(s) in the store;"
+                " exactly one signed capability is required")
+        capability_file = candidates[0]
+        signature_file = Path(str(capability_file) + ".sig")
+        # Finding 094: the owner's detached Ed25519 signature over the
+        # exact capability bytes, verified against the root-pinned
+        # allowed-signers file, is the human-authentication boundary.
+        attestation = verify_owner_signature(
+            capability_file, signature_file)
+        payload, record = gate.load(profile)
         evidence = gather_broker_evidence(profile)
         result = resume_after_reconciliation(
             olap=olap, profile=profile, payload=payload, record=record,

@@ -409,3 +409,115 @@ def test_incident_probe_runs_inside_the_unit(olap):
     assert calls == [True]
     assert olap.get_state("halt") == "hold"
     assert not olap.nonce_consumed(record.nonce_sha256)
+
+
+# ── finding 094: owner signature verification ──
+
+
+import subprocess as _subprocess
+
+
+@pytest.fixture()
+def signer(tmp_path):
+    """A throwaway ed25519 signer + pinned allowed_signers fixture.
+    All key material is synthetic and lives only in tmp."""
+    key = tmp_path / "owner_key"
+    _subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+                     "-f", str(key)], check=True)
+    pub = (tmp_path / "owner_key.pub").read_text().split()
+    signers = tmp_path / "allowed_signers"
+    signers.write_text(
+        f'owner namespaces="lts-ibkr-resume" {pub[0]} {pub[1]}\n')
+    signers.chmod(0o644)
+    capability = tmp_path / "resume_test.json"
+    capability.write_text(json.dumps({"synthetic": "capability"}))
+    return key, signers, capability
+
+
+def _sign(key, capability, namespace="lts-ibkr-resume"):
+    _subprocess.run(["ssh-keygen", "-Y", "sign", "-f", str(key),
+                     "-n", namespace, str(capability)], check=True,
+                    capture_output=True)
+    return capability.parent / (capability.name + ".sig")
+
+
+def test_valid_owner_signature_verifies(signer):
+    from app.ibkr_l1_resume import verify_owner_signature
+
+    key, signers, capability = signer
+    signature = _sign(key, capability)
+    attestation = verify_owner_signature(
+        capability, signature, allowed_signers=signers,
+        require_root_pin=False)
+    assert attestation["verified"] is True
+    assert attestation["namespace"] == "lts-ibkr-resume"
+
+
+def test_forged_payload_and_copied_signature_refuse(signer):
+    from app.ibkr_l1_resume import verify_owner_signature
+
+    key, signers, capability = signer
+    signature = _sign(key, capability)
+    capability.write_text(json.dumps({"synthetic": "TAMPERED"}))
+    with pytest.raises(L1AuthorizationError, match="FAILED"):
+        verify_owner_signature(capability, signature,
+                               allowed_signers=signers,
+                               require_root_pin=False)
+
+
+def test_wrong_signer_refuses(signer, tmp_path):
+    from app.ibkr_l1_resume import verify_owner_signature
+
+    _key, signers, capability = signer
+    impostor = tmp_path / "impostor_key"
+    _subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+                     "-f", str(impostor)], check=True)
+    signature = _sign(impostor, capability)
+    with pytest.raises(L1AuthorizationError, match="FAILED"):
+        verify_owner_signature(capability, signature,
+                               allowed_signers=signers,
+                               require_root_pin=False)
+
+
+def test_wrong_namespace_refuses(signer):
+    from app.ibkr_l1_resume import verify_owner_signature
+
+    key, signers, capability = signer
+    signature = _sign(key, capability, namespace="something-else")
+    with pytest.raises(L1AuthorizationError, match="FAILED"):
+        verify_owner_signature(capability, signature,
+                               allowed_signers=signers,
+                               require_root_pin=False)
+
+
+def test_missing_pin_disables_resume(signer, tmp_path):
+    from app.ibkr_l1_resume import verify_owner_signature
+
+    key, _signers, capability = signer
+    signature = _sign(key, capability)
+    with pytest.raises(L1AuthorizationError, match="disabled"):
+        verify_owner_signature(capability, signature,
+                               allowed_signers=tmp_path / "absent",
+                               require_root_pin=False)
+
+
+def test_writable_pin_refuses(signer):
+    from app.ibkr_l1_resume import verify_owner_signature
+
+    key, signers, capability = signer
+    signers.chmod(0o666)
+    signature = _sign(key, capability)
+    with pytest.raises(L1AuthorizationError, match="writable"):
+        verify_owner_signature(capability, signature,
+                               allowed_signers=signers,
+                               require_root_pin=False)
+
+
+def test_missing_signature_refuses(signer):
+    from app.ibkr_l1_resume import verify_owner_signature
+
+    _key, signers, capability = signer
+    with pytest.raises(L1AuthorizationError, match="missing"):
+        verify_owner_signature(
+            capability, capability.parent / "absent.sig",
+            allowed_signers=signers, require_root_pin=False)

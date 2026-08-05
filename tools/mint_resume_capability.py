@@ -109,7 +109,13 @@ def main() -> int:
     path = write_capability(payload, RESUME_STORE)
     print(f"Minted: {path}")
     print(f"Digest: {capability_digest(payload)}")
-    print("Now run: python tools/ibkr_resume_after_reconciliation.py "
+    print("")
+    print("Finding 094: this capability is INERT until you sign it with")
+    print("your passphrase-protected owner key (see")
+    print("docs/security/OWNER_RESUME_SIGNER_SETUP_2026_08_05.md):")
+    print(f"  ssh-keygen -Y sign -f ~/.ssh/lts_owner_resume "
+          f"-n lts-ibkr-resume {path}")
+    print("Then run: python tools/ibkr_resume_after_reconciliation.py "
           "--config <runner config>")
     return 0
 
