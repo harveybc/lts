@@ -315,8 +315,22 @@ class AlpacaL1Executor:
     def consume_pending(self) -> list[dict[str, Any]]:
         """Consume accepted L0 orders; direct callers never bypass L0 risk."""
         results = []
+        utc_day = datetime.now(timezone.utc).date().isoformat()
+        budget_exhausted = self.store.effect_count_since(
+            "alpaca_bracket_entry", f"{utc_day}T00:00:00+00:00"
+        ) >= self.profile.max_orders_per_day
         for pending in self.store.l1_pending_decisions("would_be_order"):
             key = str(pending["idempotency_key"])
+            if budget_exhausted:
+                # Finding 101: budget exhaustion is a durable decision
+                # outcome with full lineage and zero submission — the
+                # runner stays alive and the next UTC day proceeds
+                # normally with fresh bars.
+                self.store.reject_decision(
+                    key, f"order_budget_exhausted:{utc_day}")
+                results.append({"idempotency_key": key,
+                                "budget_hold": True})
+                continue
             if ":l0-" in key:
                 # Exactly-once, consumer side: a retry-class decision whose
                 # bar identity already produced ANY effect is satisfied and

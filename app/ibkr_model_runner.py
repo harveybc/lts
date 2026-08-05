@@ -22,6 +22,7 @@ from app.ibkr_l1_outbox import L1OutboxConsumer
 from app.ibkr_model_authority import ContinuousPaperGate, ContinuousPaperProfile
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
 from app.model_runner_heartbeat import write_runner_heartbeat
+from app.runner_retry_taxonomy import classify_runner_exception
 
 
 _OPEN_STATUSES = {"PendingSubmit", "PendingCancel", "PreSubmitted", "Submitted"}
@@ -388,36 +389,45 @@ def build_runner_with_backoff(
         if max_backoff_seconds is not None
         else config.get("connect_backoff_max_seconds", 300.0)
     )
+    fatal_cadence = float(config.get("fatal_retry_seconds", 3600.0))
     while not stopped.is_set():
         try:
             return factory(config)
         except Exception as exc:
+            # 103: only explicit transient connection/session failures use
+            # the connect backoff; everything else is fatal — an advancing
+            # heartbeat on a slow fixed cadence, never mislabeled as
+            # connectivity and never a tight retry loop.
+            kind = classify_runner_exception(exc)
+            phase = "connect" if kind == "transient" else "fatal"
+            wait = backoff if kind == "transient" else fatal_cadence
             write_runner_heartbeat(
                 config["heartbeat_path"],
                 schema="lts.ibkr.model_runner.heartbeat.v1",
                 payload={
                     "state": "degraded_error",
-                    "phase": "connect",
+                    "phase": phase,
                     "error": f"{type(exc).__name__}: {exc}",
                     "venue": "ibkr_paper",
                     "environment": "paper",
                     "read_only": False,
                     "account_binding_verified": False,
                     "orders_submitted": None,
-                    "next_retry_seconds": backoff,
+                    "next_retry_seconds": wait,
                 },
             )
             print(
                 json.dumps(
-                    {"state": "degraded_error", "phase": "connect",
+                    {"state": "degraded_error", "phase": phase,
                      "error": f"{type(exc).__name__}: {exc}",
-                     "next_retry_seconds": backoff},
+                     "next_retry_seconds": wait},
                     sort_keys=True,
                 ),
                 flush=True,
             )
-            stopped.wait(backoff)
-            backoff = min(backoff * 2.0, ceiling)
+            stopped.wait(wait)
+            if kind == "transient":
+                backoff = min(backoff * 2.0, ceiling)
     return None
 
 

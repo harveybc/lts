@@ -20,6 +20,7 @@ from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
 from app.model_runner_heartbeat import write_runner_heartbeat
+from app.runner_retry_taxonomy import classify_runner_exception
 
 
 def _utc_now() -> datetime:
@@ -406,17 +407,25 @@ def main() -> int:
                 runner.write_heartbeat(result)
                 print(json.dumps(result, sort_keys=True, default=str), flush=True)
             except Exception as exc:
+                # 103: transient connection/session failures keep the
+                # normal cadence; anything else is fatal — an advancing
+                # degraded heartbeat on the slow fatal cadence so the
+                # condition pages immediately and is never mislabeled as
+                # connectivity (091 keeps the service alive either way;
+                # ledger idempotency makes the next tick safe).
+                kind = classify_runner_exception(exc)
                 runner.write_heartbeat({
                     "state": "degraded_error",
+                    "phase": "connect" if kind == "transient" else "fatal",
                     "error": f"{type(exc).__name__}: {exc}",
                     "orders_submitted": None,
                 })
                 if args.once:
                     raise
-                # 091 doctrine (parity with the IBKR runner): a failed tick
-                # degrades the heartbeat and keeps the service alive with
-                # its normal cadence instead of crash-looping systemd; the
-                # ledger's idempotency makes the next tick safe.
+                if kind == "fatal":
+                    stopped.wait(float(
+                        config.get("fatal_retry_seconds", 3600.0)))
+                    continue
             if args.once:
                 break
             stopped.wait(float(config["loop_seconds"]))
