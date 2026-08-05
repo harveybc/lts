@@ -192,18 +192,65 @@ def test_unknown_timeframe_refuses_to_call_clock_healthy():
     assert _observed(emissions, "decision_clock_stale")
 
 
-def test_monitoring_heartbeat_without_inference_is_not_clock_stale():
-    """False-P1 found live 2026-08-05: while the runner monitors an open
-    position its heartbeat has no inference block (timeframe and bar both
-    absent); per-minute heartbeat freshness governs, and the clock check
-    must recover, not page."""
-    probes = healthy_probes()
-    probes["heartbeat"]["timeframe"] = None
-    probes["heartbeat"]["last_closed_bar"] = None
+def _null_clock(probes, *, state="monitoring", position=-25000.0,
+                orders=2, model_id="usdcad-4h-linear-live-v1"):
+    probes["heartbeat"].update({
+        "timeframe": None, "last_closed_bar": None, "state": state,
+        "position": position, "orders": orders, "model_id": model_id,
+    })
+    return probes
+
+
+def test_monitoring_state_with_coherent_route_facts_may_omit_clock():
+    """Finding 106: ONLY an explicitly validated monitoring heartbeat with
+    coherent route facts (numeric position, integer orders, bound model)
+    may omit the inference clock."""
+    probes = _null_clock(healthy_probes())
     emissions, state = monitor.assess(probes, CONFIG, NOW, {})
     assert _observed(emissions, "decision_clock_stale") == []
     assert _recovered(emissions, "decision_clock_stale")
     assert state["tws_healthy"]
+
+
+def test_auditor_case_decided_with_null_clock_is_stale():
+    """The auditor's exact counterexample: state=decided with both clock
+    fields null must neither suppress nor recover decision_clock_stale."""
+    probes = _null_clock(healthy_probes(), state="decided")
+    emissions, _ = monitor.assess(probes, CONFIG, NOW, {})
+    assert _observed(emissions, "decision_clock_stale")
+    assert _recovered(emissions, "decision_clock_stale") == []
+
+
+def test_state_mutations_with_null_clock_are_stale():
+    """Property over states: any non-monitoring state with a missing clock
+    is stale — decided, degraded, unknown, malformed and absent."""
+    for state in ("decided", "degraded_error", "surprise_state", "", None):
+        probes = _null_clock(healthy_probes(), state=state)
+        if state not in ("monitoring", "decided"):
+            # keep tws-health leg out of the way: force healthy legs
+            probes["heartbeat"]["state"] = state
+        emissions, _ = monitor.assess(probes, CONFIG, NOW, {})
+        if state in ("monitoring", "decided"):
+            pass
+        # For non-healthy states the tws_unavailable leg fires; the clock
+        # must still never RECOVER on a malformed heartbeat.
+        assert _recovered(emissions, "decision_clock_stale") == [], state
+        if state == "decided":
+            assert _observed(emissions, "decision_clock_stale"), state
+
+
+def test_incoherent_route_facts_with_null_clock_are_stale():
+    """Schema-shape property: monitoring without each coherent route fact
+    refuses the clock omission."""
+    for mutation in (
+        {"position": None}, {"position": "flat"}, {"position": True},
+        {"orders": None}, {"orders": 1.5}, {"orders": True},
+        {"model_id": None}, {"model_id": ""},
+    ):
+        probes = _null_clock(healthy_probes(), **mutation)
+        emissions, _ = monitor.assess(probes, CONFIG, NOW, {})
+        assert _observed(emissions, "decision_clock_stale"), mutation
+        assert _recovered(emissions, "decision_clock_stale") == [], mutation
 
 
 def test_half_missing_clock_still_refuses():

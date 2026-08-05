@@ -112,6 +112,11 @@ def probe_heartbeat(path: Path, now: datetime) -> dict:
         "last_closed_bar": inference.get("last_closed_bar"),
         "timeframe": inference.get("timeframe"),
         "error": heartbeat.get("error"),
+        # Route facts a monitoring-state heartbeat must carry coherently
+        # for the clock-omission exception (finding 106).
+        "position": heartbeat.get("position"),
+        "orders": heartbeat.get("orders"),
+        "model_id": heartbeat.get("model_id"),
     }
 
 
@@ -255,16 +260,24 @@ def assess(probes: dict, config: dict, now: datetime,
         })
 
         # Decision clock: only meaningful while TWS itself is healthy.
-        # A heartbeat WITHOUT an inference block (timeframe and bar both
-        # absent) is the runner monitoring an open position between due
-        # bars — its per-minute freshness already proves liveness, so the
-        # clock check does not apply (false-P1 found live 2026-08-05).
+        # Finding 106: omitting the inference clock is valid ONLY for the
+        # explicitly enumerated `monitoring` state carrying coherent
+        # current route facts (numeric position, integer order count and a
+        # bound model id). A `decided`, unknown, malformed or partial
+        # heartbeat with a missing clock is stale, never suppressed.
         timeframe = heartbeat.get("timeframe")
         last_closed_bar = heartbeat.get("last_closed_bar")
         bar_seconds = config["timeframe_seconds"].get(timeframe or "", None)
-        clock_stale = False
         if timeframe is None and last_closed_bar is None:
-            clock_stale = False
+            route_coherent = (
+                heartbeat.get("state") == "monitoring"
+                and isinstance(heartbeat.get("position"), (int, float))
+                and not isinstance(heartbeat.get("position"), bool)
+                and isinstance(heartbeat.get("orders"), int)
+                and not isinstance(heartbeat.get("orders"), bool)
+                and bool(heartbeat.get("model_id"))
+            )
+            clock_stale = not route_coherent
         elif bar_seconds is not None and last_closed_bar:
             try:
                 last_bar = datetime.fromisoformat(last_closed_bar)
