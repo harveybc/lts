@@ -280,10 +280,14 @@ class IbkrModelRunner:
         inference = self.policy.predict(observation)
         self.sessions.record_inference(current["session_id"], inference)
         if inference["action"] == "hold":
+            self._record_due_bar(inference, outcome="hold",
+                                 reason="model_hold")
             return {"state": "hold", "inference": inference, "l1": monitoring}
         try:
             quote = self.client.current_quote(self.profile.instrument)
         except L1ExecutionError as exc:
+            self._record_due_bar(inference, outcome="refused",
+                                 reason=f"no_quote: {exc}"[:200])
             return {
                 "state": "waiting_for_quote",
                 "reason": str(exc),
@@ -328,8 +332,53 @@ class IbkrModelRunner:
         entries = self.consumer.consume_entries(quote={
             "bid": quote["bid"], "ask": quote["ask"], "time": quote["observed_at"],
         }, now=decision_now)
+        self._record_due_bar(
+            inference, outcome=str(decision.get("outcome")),
+            reason=decision.get("reason"),
+            quote={"bid": quote["bid"], "ask": quote["ask"]},
+            risk={"stop_price": stop, "take_profit_price": take,
+                  "target_exposure": side},
+            effect_id=(entries[0].get("effect_id")
+                       if entries and isinstance(entries[0], dict)
+                       else None),
+            decided_at=decision_now,
+        )
         return {"state": "decided", "inference": inference,
                 "decision": decision, "entries": entries, "l1": monitoring}
+
+    def _record_due_bar(self, inference, *, outcome, reason=None,
+                        quote=None, risk=None, effect_id=None,
+                        decided_at=None):
+        """Order C1: one normalized decision fact per due closed bar —
+        HOLDs and refusals included. Never raises into the tick."""
+        if not inference or not inference.get("last_closed_bar"):
+            return
+        try:
+            self.olap.record_due_bar_decision({
+                "venue": "ibkr_paper",
+                "account_fingerprint": self.profile.account_fingerprint,
+                "asset_id": self.profile.asset_id,
+                "instrument": self.profile.instrument,
+                "timeframe": self.config["model"]["expected_timeframe"],
+                "bar_close": inference["last_closed_bar"],
+                "decided_at": (decided_at or _utc_now()).isoformat(),
+                "feature_cutoff": inference["last_closed_bar"],
+                "input_sha256": inference["input_sha256"],
+                "config_sha256": self.manifest["config_sha256"],
+                "model_id": self.policy.model_id,
+                "artifact_sha256": self.policy.artifact_sha256,
+                "manifest_sha256": self.manifest.get("manifest_sha256"),
+                "action": inference["action"],
+                "score": inference.get("probability_up"),
+                "outcome": outcome, "reason": reason,
+                "risk_envelope": risk, "quote": quote,
+                "decision_id":
+                    f"{self.policy.model_id}:{inference['last_closed_bar']}",
+                "effect_or_command_id": effect_id,
+            })
+        except Exception as exc:
+            print(json.dumps({"due_bar_fact_error": str(exc)[:160]}),
+                  flush=True)
 
     def close(self) -> None:
         try:

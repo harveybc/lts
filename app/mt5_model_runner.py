@@ -410,6 +410,8 @@ class Mt5ModelRunner:
         inference = self.policy.predict(observation)
         self.sessions.record_inference(current["session_id"], inference)
         if inference["action"] == "hold":
+            self._record_due_bar(inference, bars[-1]["time"],
+                                 outcome="hold", reason="model_hold")
             return {"state": "hold", "inference": inference}
         bid, ask = float(symbol_fact["bid"]), float(symbol_fact["ask"])
         reference = (bid + ask) / 2.0
@@ -448,6 +450,13 @@ class Mt5ModelRunner:
             instrument=symbol, now=now,
         )
         if decision["outcome"] != "would_be_order":
+            self._record_due_bar(
+                inference, bars[-1]["time"],
+                outcome=str(decision.get("outcome")),
+                reason=decision.get("reason"),
+                quote={"bid": bid, "ask": ask},
+                risk={"stop_price": stop, "take_profit_price": take,
+                      "target_exposure": side})
             return {"state": "l0_refused", "decision": decision,
                     "inference": inference}
         pending = self.l0.l1_pending_decisions("would_be_order")
@@ -469,8 +478,47 @@ class Mt5ModelRunner:
             config_sha256=self.manifest["config_sha256"],
             input_sha256=inference["input_sha256"],
         )
+        self._record_due_bar(
+            inference, bars[-1]["time"],
+            outcome="would_be_order", reason=None,
+            quote={"bid": bid, "ask": ask},
+            risk={"stop_price": stop, "take_profit_price": take,
+                  "target_exposure": side},
+            command_id=command["command_id"])
         return {"state": "command_queued", "command_id": command["command_id"],
                 "inference": inference, "decision": decision}
+
+    def _record_due_bar(self, inference, bar_close, *, outcome,
+                        reason=None, quote=None, risk=None,
+                        command_id=None):
+        """Order C1: one normalized decision fact per due closed bar —
+        HOLDs and refusals included. Never raises into the tick."""
+        try:
+            self.l0.record_due_bar_decision({
+                "venue": "mt5_demo",
+                "account_fingerprint":
+                    self.bridge_config.account_fingerprint,
+                "asset_id": self.policy.asset_id,
+                "instrument": self.config["route"]["symbol"],
+                "timeframe": self.config["model"]["expected_timeframe"],
+                "bar_close": bar_close,
+                "decided_at": _utc_now().isoformat(),
+                "feature_cutoff": bar_close,
+                "input_sha256": inference["input_sha256"],
+                "config_sha256": self.manifest["config_sha256"],
+                "model_id": self.policy.model_id,
+                "artifact_sha256": self.policy.artifact_sha256,
+                "manifest_sha256": self.manifest.get("manifest_sha256"),
+                "action": inference["action"],
+                "score": inference.get("probability_up"),
+                "outcome": outcome, "reason": reason,
+                "risk_envelope": risk, "quote": quote,
+                "decision_id": f"{self.policy.model_id}:{bar_close}",
+                "effect_or_command_id": command_id,
+            })
+        except Exception as exc:
+            print(json.dumps({"due_bar_fact_error": str(exc)[:160]}),
+                  flush=True)
 
     def close(self) -> None:
         self.l0.close()

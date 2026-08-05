@@ -173,6 +173,98 @@ class L1ExecutionOlap(DemoExecutionOlap):
             is not None
         )
 
+    def record_due_bar_decision(self, fact: dict[str, Any]) -> bool:
+        """Order C1: exactly ONE normalized decision fact per due closed
+        bar per venue/model/timeframe, HOLDs and refusals included.
+
+        Returns True when this call inserted the fact; a duplicate bar
+        (restart, replay, repeated tick) returns False and changes
+        nothing — the UNIQUE constraint makes one-decision-per-bar
+        structural."""
+        required = (
+            "venue", "account_fingerprint", "asset_id", "instrument",
+            "timeframe", "bar_close", "decided_at", "input_sha256",
+            "config_sha256", "model_id", "artifact_sha256", "action",
+            "outcome", "decision_id",
+        )
+        missing = [key for key in required if not fact.get(key)]
+        if missing:
+            raise DemoExecutionError(
+                f"due-bar decision fact missing {missing}")
+        self._con.execute(
+            "CREATE TABLE IF NOT EXISTS due_bar_decisions ("
+            " venue TEXT NOT NULL, account_fingerprint TEXT NOT NULL,"
+            " asset_id TEXT NOT NULL, instrument TEXT NOT NULL,"
+            " timeframe TEXT NOT NULL, bar_close TEXT NOT NULL,"
+            " decided_at TEXT NOT NULL, feature_cutoff TEXT,"
+            " input_sha256 TEXT NOT NULL, config_sha256 TEXT NOT NULL,"
+            " model_id TEXT NOT NULL, artifact_sha256 TEXT NOT NULL,"
+            " manifest_sha256 TEXT, action TEXT NOT NULL,"
+            " score REAL, outcome TEXT NOT NULL, reason TEXT,"
+            " risk_envelope_json TEXT, quote_json TEXT,"
+            " decision_id TEXT NOT NULL, effect_or_command_id TEXT,"
+            " UNIQUE(venue, model_id, timeframe, bar_close))"
+        )
+        cursor = self._con.execute(
+            "INSERT OR IGNORE INTO due_bar_decisions VALUES"
+            " (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                fact["venue"], fact["account_fingerprint"],
+                fact["asset_id"], fact["instrument"], fact["timeframe"],
+                fact["bar_close"], fact["decided_at"],
+                fact.get("feature_cutoff"), fact["input_sha256"],
+                fact["config_sha256"], fact["model_id"],
+                fact["artifact_sha256"], fact.get("manifest_sha256"),
+                fact["action"], fact.get("score"), fact["outcome"],
+                fact.get("reason"),
+                json.dumps(fact.get("risk_envelope"), sort_keys=True)
+                if fact.get("risk_envelope") is not None else None,
+                json.dumps(fact.get("quote"), sort_keys=True)
+                if fact.get("quote") is not None else None,
+                fact["decision_id"], fact.get("effect_or_command_id"),
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def due_bar_decisions(
+        self, *, venue: str | None = None, since: str | None = None
+    ) -> list[dict[str, Any]]:
+        self._con.execute(
+            "CREATE TABLE IF NOT EXISTS due_bar_decisions ("
+            " venue TEXT NOT NULL, account_fingerprint TEXT NOT NULL,"
+            " asset_id TEXT NOT NULL, instrument TEXT NOT NULL,"
+            " timeframe TEXT NOT NULL, bar_close TEXT NOT NULL,"
+            " decided_at TEXT NOT NULL, feature_cutoff TEXT,"
+            " input_sha256 TEXT NOT NULL, config_sha256 TEXT NOT NULL,"
+            " model_id TEXT NOT NULL, artifact_sha256 TEXT NOT NULL,"
+            " manifest_sha256 TEXT, action TEXT NOT NULL,"
+            " score REAL, outcome TEXT NOT NULL, reason TEXT,"
+            " risk_envelope_json TEXT, quote_json TEXT,"
+            " decision_id TEXT NOT NULL, effect_or_command_id TEXT,"
+            " UNIQUE(venue, model_id, timeframe, bar_close))"
+        )
+        query = "SELECT * FROM due_bar_decisions"
+        clauses, params = [], []
+        if venue:
+            clauses.append("venue=?")
+            params.append(venue)
+        if since:
+            clauses.append("bar_close >= ?")
+            params.append(since)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY bar_close"
+        columns = [
+            "venue", "account_fingerprint", "asset_id", "instrument",
+            "timeframe", "bar_close", "decided_at", "feature_cutoff",
+            "input_sha256", "config_sha256", "model_id",
+            "artifact_sha256", "manifest_sha256", "action", "score",
+            "outcome", "reason", "risk_envelope_json", "quote_json",
+            "decision_id", "effect_or_command_id",
+        ]
+        return [dict(zip(columns, row))
+                for row in self._con.execute(query, params)]
+
     def effects_with_key_prefix(self, prefix: str) -> list[dict[str, Any]]:
         """All effects whose idempotency key starts with ``prefix``."""
         escaped = (

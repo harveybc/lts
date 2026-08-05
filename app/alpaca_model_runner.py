@@ -304,9 +304,13 @@ class AlpacaModelRunner:
         inference = self.policy.predict(observation)
         self.sessions.record_inference(current["session_id"], inference)
         if not allow_execution:
+            self._record_due_bar(inference, outcome="inference_only",
+                                 reason="execution_disabled")
             return {"state": "inference_only", "inference": inference,
                     "orders_submitted": 0}
         if inference["action"] == "hold":
+            self._record_due_bar(inference, outcome="hold",
+                                 reason="model_hold")
             return {"state": "hold", "inference": inference}
         quote = self.client.latest_stock_quote(self.profile.symbol)
         bid, ask = float(quote["bp"]), float(quote["ap"])
@@ -357,8 +361,53 @@ class AlpacaModelRunner:
         state = "decided" if executions else (
             "replayed_signal" if decision.get("replayed") else "no_execution"
         )
+        self._record_due_bar(
+            inference, outcome=str(decision.get("outcome")),
+            reason=decision.get("reason"),
+            quote={"bid": bid, "ask": ask},
+            risk={"stop_price": round(stop, 2),
+                  "take_profit_price": round(take, 2),
+                  "target_exposure": side},
+            effect_id=next(
+                (item.get("effect_id") for item in executions
+                 if isinstance(item, dict) and item.get("effect_id")),
+                None),
+        )
         return {"state": state, "inference": inference,
                 "decision": decision, "executions": executions}
+
+    def _record_due_bar(self, inference, *, outcome, reason=None,
+                        quote=None, risk=None, effect_id=None):
+        """Order C1: one normalized decision fact per due closed bar —
+        HOLDs and refusals included. Never raises into the tick."""
+        if not inference or not inference.get("last_closed_bar"):
+            return
+        try:
+            self.store.record_due_bar_decision({
+                "venue": "alpaca_paper",
+                "account_fingerprint": self.profile.account_fingerprint,
+                "asset_id": self.policy.asset_id,
+                "instrument": self.profile.symbol,
+                "timeframe": self.config["model"]["expected_timeframe"],
+                "bar_close": inference["last_closed_bar"],
+                "decided_at": _utc_now().isoformat(),
+                "feature_cutoff": inference["last_closed_bar"],
+                "input_sha256": inference["input_sha256"],
+                "config_sha256": self.manifest["config_sha256"],
+                "model_id": self.policy.model_id,
+                "artifact_sha256": self.policy.artifact_sha256,
+                "manifest_sha256": self.manifest.get("manifest_sha256"),
+                "action": inference["action"],
+                "score": inference.get("probability_up"),
+                "outcome": outcome, "reason": reason,
+                "risk_envelope": risk, "quote": quote,
+                "decision_id":
+                    f"{self.policy.model_id}:{inference['last_closed_bar']}",
+                "effect_or_command_id": effect_id,
+            })
+        except Exception as exc:
+            print(json.dumps({"due_bar_fact_error": str(exc)[:160]}),
+                  flush=True)
 
     def close(self) -> None:
         self.store.close()
