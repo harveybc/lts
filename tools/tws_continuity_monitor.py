@@ -380,7 +380,7 @@ def emit(emissions: list[dict], config: dict, now: datetime,
                                          sort_keys=True)]
         else:
             command = base + ["recover", *identity,
-                              "--evidence-json",
+                              "--state-json",
                               json.dumps(emission["evidence"],
                                          sort_keys=True)]
         if dry_run:

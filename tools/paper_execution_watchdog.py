@@ -1399,7 +1399,7 @@ def emit_to_incident_ledger(
             command = base + [
                 "recover",
                 *identity,
-                "--evidence-json",
+                "--state-json",
                 json.dumps({"summary": item["detail"][:300]}, sort_keys=True),
             ]
         try:

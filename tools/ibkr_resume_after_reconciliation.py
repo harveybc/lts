@@ -125,7 +125,7 @@ def report_transition(repo: Path, result: dict, machine: str) -> None:
         capture_output=True, text=True, timeout=30)
     subprocess.run(
         [sys.executable, str(script), "recover", *identity,
-         "--evidence-json", json.dumps(
+         "--state-json", json.dumps(
              {"summary": "transition committed",
               "evidence_sha256": result["evidence_sha256"]},
              sort_keys=True)],
