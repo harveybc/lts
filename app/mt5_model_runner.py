@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from prediction_provider_mechanics import build_closed_bar_features
-from trading_contracts import AssetIntent, BrokerCapabilitySnapshot, InstrumentCapability
+from trading_contracts import (
+    AssetIntent,
+    BrokerCapabilitySnapshot,
+    ExecutionReportV2,
+    InstrumentCapability,
+)
 
 from app.alpaca_model_runner import ModelSessionStore
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
@@ -49,6 +54,157 @@ def close_idempotency_key(
     )
     digest = hashlib.sha256(identity.encode()).hexdigest()
     return f"close:{digest}", digest
+
+
+def reconcile_completed_lifecycles(
+    l0: "L1ExecutionOlap",
+    *,
+    account_fingerprint: str,
+    symbol: str,
+    producer: dict[str, Any],
+    snapshot_max_age_seconds: float = 600.0,
+    now: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
+    """AUD-F2-20260804-104: reconcile collected MT5 deal/history events
+    into accepted/filled/closed L0 lifecycle facts and release the
+    reservation — idempotently, through the accepted APIs only.
+
+    Preconditions per active reservation (anything unproven skips):
+
+    - a fresh account snapshot proves the account flat (zero positions,
+      zero orders) — broker-flat evidence gathered by the bridge;
+    - the reservation holds no open exposure;
+    - exactly one succeeded execution command exists for its idempotency
+      identity (retry variants included) carrying the entry order ticket;
+    - the entry DEAL_ADD event exists for that ticket, and later
+      DEAL_ADD events on the same symbol/account (foreign tickets and
+      symbols excluded, duplicates collapsed by deal ticket, order
+      restored by observation time) sum to at least the entry volume —
+      a partial close leaves the reservation held.
+
+    The repair appends only the MISSING lifecycle stages
+    (accepted/filled/closed) with broker tickets in ``broker_ids`` and
+    releases the reservation as consumed, all in one atomic unit, so
+    restart and replay can never duplicate a close or alter balances.
+    """
+    now = now or _utc_now()
+    connection = l0._con
+    snapshot = connection.execute(
+        "SELECT positions_total, orders_total, received_at FROM"
+        " account_snapshots WHERE account_fingerprint=?"
+        " ORDER BY id DESC LIMIT 1",
+        (account_fingerprint,),
+    ).fetchone()
+    if snapshot is None:
+        return []
+    positions_total, orders_total, received_at = snapshot
+    age = (now - datetime.fromisoformat(received_at)).total_seconds()
+    if age > snapshot_max_age_seconds:
+        return []
+    if int(positions_total) != 0 or int(orders_total) != 0:
+        return []
+
+    repaired: list[dict[str, Any]] = []
+    for reservation in l0.active_reservation_intents():
+        reservation_id = reservation["reservation_id"]
+        key = str(reservation["idempotency_key"])
+        if l0.reservation_has_open_exposure(reservation_id):
+            continue
+        command = connection.execute(
+            "SELECT command_id, action, volume, result_json FROM"
+            " execution_commands WHERE state='succeeded' AND"
+            " account_fingerprint=? AND (idempotency_key=? OR"
+            " idempotency_key LIKE ?)",
+            (account_fingerprint, key, key + ":retry:%"),
+        ).fetchall()
+        if len(command) != 1:
+            continue                       # unknown linkage: never guessed
+        command_id, action, volume, result_json = command[0]
+        result = json.loads(result_json or "{}")
+        entry_ticket = str(result.get("order_ticket") or "")
+        if not entry_ticket:
+            continue
+        entry = connection.execute(
+            "SELECT price, volume, terminal_observed_at FROM trade_events"
+            " WHERE event_type='TRADE_TRANSACTION_DEAL_ADD' AND"
+            " order_ticket=? AND symbol=? AND account_fingerprint=?"
+            " AND volume > 0",
+            (entry_ticket, symbol, account_fingerprint),
+        ).fetchone()
+        if entry is None:
+            continue
+        entry_price, entry_volume, entry_at = entry
+        closes = connection.execute(
+            "SELECT DISTINCT deal_ticket, price, volume,"
+            " terminal_observed_at FROM trade_events WHERE"
+            " event_type='TRADE_TRANSACTION_DEAL_ADD' AND symbol=? AND"
+            " account_fingerprint=? AND order_ticket != ? AND volume > 0"
+            " AND terminal_observed_at > ?"
+            " ORDER BY terminal_observed_at",
+            (symbol, account_fingerprint, entry_ticket, entry_at),
+        ).fetchall()
+        seen: set[str] = set()
+        closed_volume = 0.0
+        close_notional = 0.0
+        close_tickets: list[str] = []
+        for deal_ticket, price, close_volume, _at in closes:
+            if deal_ticket in seen:
+                continue                   # duplicate event collapsed
+            seen.add(deal_ticket)
+            closed_volume += float(close_volume)
+            close_notional += float(close_volume) * float(price)
+            close_tickets.append(str(deal_ticket))
+        if closed_volume + 1e-9 < float(entry_volume):
+            continue                       # partial close: stay held
+        close_vwap = close_notional / closed_volume if closed_volume else 0.0
+
+        order_intent_id = f"oi2-{reservation_id}"
+        existing = {
+            row[0] for row in connection.execute(
+                "SELECT state FROM lifecycle_events WHERE order_intent_id=?",
+                (order_intent_id,),
+            )
+        }
+        sign = -1.0 if action == "open_short" else 1.0
+        units = sign * float(entry_volume)
+        with l0.atomic_unit():
+            for state, price, tickets in (
+                ("accepted", None, {"order_ticket": entry_ticket}),
+                ("filled", float(entry_price),
+                 {"order_ticket": entry_ticket}),
+                ("closed", close_vwap,
+                 {"order_ticket": entry_ticket,
+                  "close_deals": ",".join(close_tickets)}),
+            ):
+                if state in existing:
+                    continue
+                extra: dict[str, Any] = {}
+                if state != "accepted":
+                    # filled_units is a magnitude by contract; direction
+                    # lives in requested_units.
+                    extra = {"filled_units": float(entry_volume),
+                             "filled_price": price}
+                l0.append_lifecycle(ExecutionReportV2(
+                    object_id=f"er-{reservation_id}-{state}", as_of=now,
+                    producer=producer,
+                    trace_id=f"mt5-reconcile-{reservation_id}",
+                    order_intent_id=order_intent_id,
+                    attempt_id=f"attempt-{reservation_id}",
+                    bracket_role="parent", state=state,
+                    requested_units=units,
+                    broker_ids=tickets,
+                    reconciliation_required=False,
+                    **extra,
+                ))
+            l0.release(reservation_id, "consumed")
+        repaired.append({
+            "reservation_id": reservation_id,
+            "command_id": command_id,
+            "entry_ticket": entry_ticket,
+            "close_deals": close_tickets,
+            "closed_volume": closed_volume,
+        })
+    return repaired
 
 
 class Mt5ModelRunner:
@@ -173,6 +329,18 @@ class Mt5ModelRunner:
         symbol_fact = self._symbol_fact(snapshot)
         if symbol_fact is None:
             return {"state": "symbol_unavailable", "symbol": symbol}
+        lifecycles_reconciled = reconcile_completed_lifecycles(
+            self.l0,
+            account_fingerprint=self.bridge_config.account_fingerprint,
+            symbol=symbol,
+            producer={"name": "lts.mt5_model_runner", "version": "0.1.0"},
+            now=now,
+        )
+        if lifecycles_reconciled:
+            self.write_heartbeat({
+                "state": "lifecycle_reconciled",
+                "lifecycles_reconciled": lifecycles_reconciled,
+            })
         bars = self._bars(snapshot)
         if len(bars) < 51:
             return {"state": "waiting_for_closed_bars", "bars": len(bars)}
