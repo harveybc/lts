@@ -1,0 +1,15 @@
+{
+  "schema": "lts.live_sim_replay_config.v1",
+  "version": "1.0.0",
+  "venues": [
+    {"venue": "ibkr_paper", "timeframe": "4h", "instrument": "USD.CAD",
+     "expected_asset_id": "fx:USD/CAD",
+     "execution_ledger": "~/.local/state/lts/ibkr-model-execution.sqlite"},
+    {"venue": "alpaca_paper", "timeframe": "1d", "instrument": "SPY",
+     "expected_asset_id": "equity:SPY",
+     "execution_ledger": "~/.local/state/lts/alpaca-model-execution.sqlite"},
+    {"venue": "mt5_demo", "timeframe": "4h", "instrument": "ETHUSD",
+     "bars_source": "mt5_bridge", "bars_count": 60,
+     "execution_ledger": "~/.local/state/lts/mt5-bridge.sqlite"}
+  ]
+}
