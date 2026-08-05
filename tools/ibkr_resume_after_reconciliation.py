@@ -158,11 +158,13 @@ def main() -> int:
 
     try:
         payload, record = ResumeGate().load(profile)
-        incidents = active_venue_incidents(args.incident_repo, "ibkr_paper")
         evidence = gather_broker_evidence(profile)
         result = resume_after_reconciliation(
             olap=olap, profile=profile, payload=payload, record=record,
-            broker_evidence=evidence, active_incidents=incidents,
+            broker_evidence=evidence,
+            # Finding 093: re-queried inside the serialized transaction.
+            incident_probe=lambda: active_venue_incidents(
+                args.incident_repo, "ibkr_paper"),
         )
     except L1AuthorizationError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)

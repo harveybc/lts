@@ -207,59 +207,29 @@ def resume_after_reconciliation(
     payload: dict[str, Any],
     record: CapabilityRecord,
     broker_evidence: Any,
-    active_incidents: Optional[list[dict[str, Any]]],
+    incident_probe: Any,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """Execute the bounded ``halt: hold -> none`` transition. Fail-closed."""
+    """Execute the bounded ``halt: hold -> none`` transition. Fail-closed.
+
+    Finding 093: every mutable precondition — halt state, resume history,
+    nonce consumption, effect states and the incident probe — is read (or
+    re-read) INSIDE one serialized ``BEGIN IMMEDIATE`` unit, so a ``hold``,
+    ``kill``, new nonterminal effect or qualifying incident that commits at
+    any point before this transaction acquires the write lock wins, and a
+    losing resume consumes nothing and clears nothing. ``incident_probe``
+    is a callable re-invoked inside the unit; the incident ledger lives in
+    a separate database, so its answer is fresh-at-lock rather than
+    transactional — the residual cross-database window is the probe's own
+    execution time and is recorded as a known limitation.
+    """
     now = now or datetime.now(timezone.utc)
     effect_id = str(payload["resume_of_effect_id"])
+    if not callable(incident_probe):
+        raise L1AuthorizationError("incident_probe must be callable")
 
-    halt = olap.get_state("halt", "none")
-    last_resume_raw = olap.get_state("last_resume", "")
-    last_resume = json.loads(last_resume_raw) if last_resume_raw else {}
-
-    if halt == "none":
-        if last_resume.get("nonce_sha256") == record.nonce_sha256:
-            # Property 8/9: retry after a committed success is a no-op.
-            return {"applied": False, "already_resumed": True,
-                    "effect_id": effect_id,
-                    "evidence_sha256": last_resume.get("evidence_sha256")}
-        raise L1AuthorizationError(
-            "no hold is active; nothing to resume (capability not consumed)")
-    if halt != "hold":
-        raise L1AuthorizationError(
-            f"halt state {halt!r} is not 'hold'; this operation clears only"
-            " a reconciliation hold")
-    if olap.nonce_consumed(record.nonce_sha256):
-        # Property 8: a spent capability can never clear a later hold.
-        raise L1AuthorizationError(
-            "this capability was already consumed; the current hold needs a"
-            " freshly minted capability")
-
-    if active_incidents is None:
-        raise L1AuthorizationError(
-            "incident state could not be established — unknown is a refusal")
-    if active_incidents:
-        codes = sorted({str(i.get("event_code")) for i in active_incidents})
-        raise L1AuthorizationError(
-            f"originating incident condition still active: {codes};"
-            " resume refused")
-
-    nonterminal = olap.nonterminal_effects()
-    if nonterminal:
-        states = sorted({e["state"] for e in nonterminal})
-        raise L1AuthorizationError(
-            f"{len(nonterminal)} effect(s) not terminal ({states});"
-            " resume requires every effect terminal")
-    bound = olap.effect_row(effect_id)
-    if bound is None:
-        raise L1AuthorizationError(
-            f"bound recovery effect {effect_id} does not exist")
-    if not str(bound["state"]).startswith("terminal_"):
-        raise L1AuthorizationError(
-            f"bound recovery effect {effect_id} is {bound['state']!r},"
-            " not terminal")
-
+    # Pure validation of the caller-supplied evidence document only; no
+    # ledger state is involved here.
     evidence_sha256, evidence_summary = _evidence_or_refuse(
         broker_evidence, profile, now)
 
@@ -271,6 +241,58 @@ def resume_after_reconciliation(
     }
     try:
         with olap.atomic_unit():
+            halt = olap.get_state("halt", "none")
+            last_resume_raw = olap.get_state("last_resume", "")
+            last_resume = (json.loads(last_resume_raw)
+                           if last_resume_raw else {})
+
+            if halt == "none":
+                if last_resume.get("nonce_sha256") == record.nonce_sha256:
+                    # Retry after a committed success is a no-op.
+                    return {"applied": False, "already_resumed": True,
+                            "effect_id": effect_id,
+                            "evidence_sha256":
+                            last_resume.get("evidence_sha256")}
+                raise L1AuthorizationError(
+                    "no hold is active; nothing to resume (capability not"
+                    " consumed)")
+            if halt != "hold":
+                raise L1AuthorizationError(
+                    f"halt state {halt!r} is not 'hold'; this operation"
+                    " clears only a reconciliation hold")
+            if olap.nonce_consumed(record.nonce_sha256):
+                # A spent capability can never clear a later hold.
+                raise L1AuthorizationError(
+                    "this capability was already consumed; the current hold"
+                    " needs a freshly minted capability")
+
+            nonterminal = olap.nonterminal_effects()
+            if nonterminal:
+                states = sorted({e["state"] for e in nonterminal})
+                raise L1AuthorizationError(
+                    f"{len(nonterminal)} effect(s) not terminal ({states});"
+                    " resume requires every effect terminal")
+            bound = olap.effect_row(effect_id)
+            if bound is None:
+                raise L1AuthorizationError(
+                    f"bound recovery effect {effect_id} does not exist")
+            if not str(bound["state"]).startswith("terminal_"):
+                raise L1AuthorizationError(
+                    f"bound recovery effect {effect_id} is"
+                    f" {bound['state']!r}, not terminal")
+
+            active_incidents = incident_probe()
+            if active_incidents is None:
+                raise L1AuthorizationError(
+                    "incident state could not be established — unknown is"
+                    " a refusal")
+            if active_incidents:
+                codes = sorted({str(i.get("event_code"))
+                                for i in active_incidents})
+                raise L1AuthorizationError(
+                    f"originating incident condition still active: {codes};"
+                    " resume refused")
+
             olap.consume_capability(
                 record.capability_sha256, record.nonce_sha256,
                 {**record.metadata, "consumed_for": "resume"}, effect_id)

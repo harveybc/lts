@@ -98,17 +98,18 @@ def olap(tmp_path):
 _DEFAULT = object()
 
 
-def run(olap, profile, payload=None, evidence=_DEFAULT, incidents=None,
+def run(olap, profile, payload=None, evidence=_DEFAULT, incidents=_DEFAULT,
         now=NOW, record=None):
     profile = profile or make_profile()
     payload = payload or make_payload(profile)
     record = record or validate_resume_capability(
         payload, profile=profile, now=now)
+    resolved_incidents = [] if incidents is _DEFAULT else incidents
     return resume_after_reconciliation(
         olap=olap, profile=profile, payload=payload, record=record,
         broker_evidence=(make_evidence(profile) if evidence is _DEFAULT
                          else evidence),
-        active_incidents=incidents if incidents is not None else [],
+        incident_probe=lambda: resolved_incidents,
         now=now)
 
 
@@ -223,13 +224,9 @@ def test_active_incident_refuses(olap):
 
 def test_unknown_incident_state_refuses(olap):
     profile = make_profile()
-    payload = make_payload(profile)
-    record = validate_resume_capability(payload, profile=profile, now=NOW)
     with pytest.raises(L1AuthorizationError, match="unknown is a refusal"):
-        resume_after_reconciliation(
-            olap=olap, profile=make_profile(), payload=payload,
-            record=record, broker_evidence=make_evidence(profile),
-            active_incidents=None, now=NOW)
+        run(olap, profile, incidents=None)
+    assert olap.get_state("halt") == "hold"
 
 
 def test_expired_capability_refuses():
@@ -311,3 +308,104 @@ def test_crash_before_commit_leaves_hold_and_capability(olap, monkeypatch):
     # consumed nothing).
     result = run(olap, profile, payload=payload, record=record)
     assert result["applied"] is True
+
+
+def test_auditor_fixture_racing_kill_wins(olap):
+    """Finding 093, the auditor's injected fixture: a kill lands after the
+    caller's pre-checks and immediately before the transaction. The resume
+    must lose: nothing consumed, nothing cleared, kill preserved."""
+    from contextlib import contextmanager
+
+    profile = make_profile()
+    payload = make_payload(profile)
+    record = validate_resume_capability(payload, profile=profile, now=NOW)
+    original_atomic = olap.atomic_unit
+
+    @contextmanager
+    def racing_atomic():
+        olap.set_state("halt", "kill")
+        with original_atomic():
+            yield
+
+    olap.atomic_unit = racing_atomic
+    with pytest.raises(L1AuthorizationError, match="not 'hold'"):
+        run(olap, profile, payload=payload, record=record)
+    olap.atomic_unit = original_atomic
+    assert olap.get_state("halt") == "kill"
+    assert not olap.nonce_consumed(record.nonce_sha256)
+    assert not olap.broker_facts("l1e-f4993c2dda8cdc2a", "halt_cleared")
+
+
+def test_two_connection_race_new_hold_event_wins(olap, tmp_path):
+    """Finding 093, real second connection: another process commits a new
+    safety event (hold->kill) through its own connection before the resume
+    acquires the write lock. The in-unit re-read must see it and refuse."""
+    from contextlib import contextmanager
+
+    from app.ibkr_l1_journal import L1ExecutionOlap
+
+    second = L1ExecutionOlap(tmp_path / "ledger.sqlite")   # same file
+    profile = make_profile()
+    payload = make_payload(profile)
+    record = validate_resume_capability(payload, profile=profile, now=NOW)
+    original_atomic = olap.atomic_unit
+
+    @contextmanager
+    def interleaved_atomic():
+        second.set_state("halt", "kill")                   # other process
+        with original_atomic():
+            yield
+
+    olap.atomic_unit = interleaved_atomic
+    with pytest.raises(L1AuthorizationError, match="not 'hold'"):
+        run(olap, profile, payload=payload, record=record)
+    olap.atomic_unit = original_atomic
+    assert olap.get_state("halt") == "kill"
+    assert not olap.nonce_consumed(record.nonce_sha256)
+    second.close()
+
+
+def test_racing_nonterminal_effect_wins(olap):
+    """A new unknown effect journaled before the lock must veto the resume."""
+    from contextlib import contextmanager
+
+    profile = make_profile()
+    payload = make_payload(profile)
+    record = validate_resume_capability(payload, profile=profile, now=NOW)
+    original_atomic = olap.atomic_unit
+
+    @contextmanager
+    def racing_atomic():
+        olap.create_effect("l1e-bbbbbbbbbbbbbbbb", "key-race",
+                           "bracket_entry", [])
+        with original_atomic():
+            yield
+
+    olap.atomic_unit = racing_atomic
+    with pytest.raises(L1AuthorizationError, match="not terminal"):
+        run(olap, profile, payload=payload, record=record)
+    olap.atomic_unit = original_atomic
+    assert olap.get_state("halt") == "hold"
+    assert not olap.nonce_consumed(record.nonce_sha256)
+
+
+def test_incident_probe_runs_inside_the_unit(olap):
+    """The probe result is consumed inside the serialized unit; a probe
+    that turns unhealthy at lock time vetoes the burn."""
+    profile = make_profile()
+    payload = make_payload(profile)
+    record = validate_resume_capability(payload, profile=profile, now=NOW)
+    calls = []
+
+    def late_incident_probe():
+        calls.append(olap._in_unit)          # proves in-unit invocation
+        return [{"event_code": "tws_unavailable", "severity": "P0"}]
+
+    with pytest.raises(L1AuthorizationError, match="still active"):
+        resume_after_reconciliation(
+            olap=olap, profile=profile, payload=payload, record=record,
+            broker_evidence=make_evidence(profile),
+            incident_probe=late_incident_probe, now=NOW)
+    assert calls == [True]
+    assert olap.get_state("halt") == "hold"
+    assert not olap.nonce_consumed(record.nonce_sha256)
