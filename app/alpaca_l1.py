@@ -548,6 +548,51 @@ class AlpacaL1Executor:
         return {"reconciled": True, "reservation_id": reservation_id,
                 "lifecycle_state": previous, "changed": changed}
 
+    def reconcile_orphan_reservations(
+        self, *, route_flat: bool
+    ) -> list[dict[str, Any]]:
+        """AUD-F2-20260804-105: release ACTIVE reservations orphaned by the
+        defect-era retry sequence — only under direct flat broker facts
+        plus immutable terminal lifecycle lineage.
+
+        A reservation is released iff: the broker route is flat by direct
+        evidence THIS tick; it holds no open exposure; and its bar
+        identity's lifecycle is terminal — at least one effect exists for
+        the identity and every one of them is terminal. A reservation with
+        no effects at all (unknown linkage, e.g. a concurrent brand-new
+        decision) or any nonterminal effect is skipped, never guessed.
+        Idempotent across restart and replay; no cap bypass, no SQL edits,
+        no forced order."""
+        if not route_flat:
+            return []
+        released: list[dict[str, Any]] = []
+        for reservation in self.store.active_reservation_intents():
+            reservation_id = reservation["reservation_id"]
+            key = str(reservation["idempotency_key"])
+            if self.store.reservation_has_open_exposure(reservation_id):
+                continue
+            base_prefix = key.split(":l0-")[0] if ":l0-" in key else key
+            effects = self.store.effects_with_key_prefix(base_prefix)
+            if not effects:
+                continue                       # unknown linkage: skip
+            if any(not str(e["state"]).startswith("terminal_")
+                   for e in effects):
+                continue                       # active lifecycle: skip
+            anchor = effects[-1]
+            with self.store.atomic_unit():
+                self.store.release(reservation_id, "consumed")
+                self.store.record_broker_fact(
+                    anchor["effect_id"], "l0_reservation_released", {
+                        "reservation_id": reservation_id,
+                        "idempotency_key": key,
+                        "terminal_effects": len(effects),
+                        "route_flat": True,
+                    })
+            released.append({"reservation_id": reservation_id,
+                             "idempotency_key": key,
+                             "anchor_effect": anchor["effect_id"]})
+        return released
+
     def reconcile_terminal_effects(self) -> list[dict[str, Any]]:
         """Repair terminal broker facts that predate L0 lifecycle ingestion."""
         results = []

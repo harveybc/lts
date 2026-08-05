@@ -173,6 +173,29 @@ class L1ExecutionOlap(DemoExecutionOlap):
             is not None
         )
 
+    def effects_with_key_prefix(self, prefix: str) -> list[dict[str, Any]]:
+        """All effects whose idempotency key starts with ``prefix``."""
+        escaped = (
+            prefix.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        )
+        rows = self._con.execute(
+            "SELECT effect_id, idempotency_key, state FROM l1_effects "
+            "WHERE idempotency_key LIKE ? ESCAPE '\\' ORDER BY created_at",
+            (escaped + "%",),
+        ).fetchall()
+        return [{"effect_id": r[0], "idempotency_key": r[1], "state": r[2]}
+                for r in rows]
+
+    def reservation_has_open_exposure(self, reservation_id: str) -> bool:
+        return (
+            self._con.execute(
+                "SELECT 1 FROM exposures WHERE source_reservation_id=? "
+                "AND state='open' LIMIT 1",
+                (reservation_id,),
+            ).fetchone()
+            is not None
+        )
+
     def reject_decision(self, idempotency_key: str, reason: str) -> bool:
         """Finding 101: terminalize a queued would_be_order decision as a
         durable, lineage-bound rejection (e.g. daily order-budget

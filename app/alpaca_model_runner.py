@@ -250,6 +250,8 @@ class AlpacaModelRunner:
         open_orders = self.client.open_orders()
         positions = [p for p in self.client.positions() if p.get("symbol") == self.profile.symbol]
         reconciliations = self.executor.reconcile_terminal_effects()
+        orphan_releases = self.executor.reconcile_orphan_reservations(
+            route_flat=not open_orders and not positions)
         current = self.sessions.active("alpaca_paper", fingerprint, self.profile.symbol)
         selected_changed = current is not None and (
             current["model_id"] != self.policy.model_id
