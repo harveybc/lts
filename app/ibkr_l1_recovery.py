@@ -33,6 +33,11 @@ from app.ibkr_l1_journal import L1ExecutionOlap, TERMINAL_EFFECT_STATES
 
 ACCEPTABLE_PARENT_STATUSES = frozenset({"PreSubmitted", "Submitted", "Filled"})
 ACCEPTABLE_CHILD_STATUSES = frozenset({"PreSubmitted", "Submitted"})
+# Finding 100: while caches are suspect after 1100/1101, the
+# execution-derived position and the cached position must agree for this
+# many consecutive recovery samples before reconciliation proceeds.
+CACHE_CONVERGENCE_SAMPLES = 3
+
 OPEN_STATUSES = frozenset(
     {"PendingSubmit", "PendingCancel", "PreSubmitted", "Submitted"}
 )
@@ -384,6 +389,88 @@ class BracketLifecycleController:
                         )
                     ):
                         remaining += float(position.get("units", 0.0))
+                # Finding 100: after a 1100/1101 connectivity event the
+                # TWS-local order/position caches are SUSPECT. Server-side
+                # execution reports outrank completed orders, which
+                # outrank the open-order cache, which outranks the
+                # position cache. While suspect, reconciliation requires
+                # the execution-derived position and the cached position
+                # to agree for CACHE_CONVERGENCE_SAMPLES consecutive
+                # samples; disagreement journals suspect_cache facts and
+                # stays `recovering` — never flip-flopping on poison.
+                connectivity = getattr(
+                    self.client, "connectivity_events", lambda: [])()
+                suspect = any(code in (1100, 1101)
+                              for code, _at in connectivity)
+                derived = None
+                if suspect:
+                    exec_units_fn = getattr(
+                        self.client, "execution_units_for_order", None)
+                    flatten_fill = (
+                        None if exec_units_fn is None
+                        else exec_units_fn(flatten_id))
+                    if flatten_fill is not None:
+                        derived = (
+                            float(previous_attempt["fact"]["units"])
+                            + float(flatten_fill))
+                    agree = (derived is not None
+                             and abs(derived - remaining) < 1e-9)
+                    samples = self.olap.broker_facts(
+                        effect_id, "cache_agreement_sample")
+                    streak = 0
+                    for fact in reversed(samples):
+                        if fact["fact"].get("agree"):
+                            streak += 1
+                        else:
+                            break
+                    streak = streak + 1 if agree else 0
+                    self.olap.record_broker_fact(
+                        effect_id, "cache_agreement_sample", {
+                            "agree": bool(agree),
+                            "derived_units": derived,
+                            "cached_units": remaining,
+                            "streak": streak,
+                            "required": CACHE_CONVERGENCE_SAMPLES,
+                            "sources": {
+                                "executions": flatten_fill
+                                if suspect else None,
+                                "positions_cache": remaining,
+                            },
+                        })
+                    if not agree or streak < CACHE_CONVERGENCE_SAMPLES:
+                        self.olap.record_broker_fact(
+                            effect_id, "suspect_cache", {
+                                "derived_units": derived,
+                                "cached_units": remaining,
+                                "streak": streak,
+                                "connectivity_events": connectivity[-4:],
+                            })
+                        return {
+                            "complete": False, "state": "recovering",
+                            "actions": actions,
+                            "remaining_units": remaining,
+                            "derived_units": derived,
+                            "flatten_order_id": flatten_id,
+                        }
+                    first_1100 = next(
+                        (at for code, at in connectivity
+                         if code in (1100, 1101)), None)
+                    convergence_seconds = None
+                    if first_1100 is not None:
+                        convergence_seconds = (
+                            now - datetime.fromisoformat(first_1100)
+                        ).total_seconds()
+                    self.olap.record_broker_fact(
+                        effect_id, "cache_convergence", {
+                            "seconds_since_connectivity_loss":
+                                convergence_seconds,
+                            "samples": streak,
+                            "derived_units": derived,
+                            "source_hierarchy": [
+                                "executions", "completed_orders",
+                                "open_orders_cache", "positions_cache"],
+                        })
+                    remaining = derived
                 if remaining != 0.0:
                     order_fact = next(
                         (

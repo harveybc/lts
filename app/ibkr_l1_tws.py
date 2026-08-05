@@ -74,6 +74,41 @@ class IbAsyncTwsClient(IbkrClientProtocol):
             raise L1ExecutionError(
                 "TWS Paper account fingerprint does not match the L1 profile"
             )
+        # Finding 100: record connectivity transitions (1100 lost, 1101
+        # lost+reset, 1102 restored) so reconciliation can mark the
+        # TWS-local order/position caches suspect after a blip.
+        self._connectivity_events: list[tuple[int, str]] = []
+
+        def _on_error(reqId, errorCode, errorString, *_rest):
+            if int(errorCode) in (1100, 1101, 1102):
+                self._connectivity_events.append((
+                    int(errorCode),
+                    datetime.now(timezone.utc).isoformat(),
+                ))
+
+        self.ib.errorEvent += _on_error
+
+    def connectivity_events(self) -> list[tuple[int, str]]:
+        """(code, iso_utc) for 1100/1101/1102 seen this session."""
+        return list(self._connectivity_events)
+
+    def execution_units_for_order(self, order_id: int) -> Optional[float]:
+        """Signed filled units for one order from SERVER-SIDE execution
+        reports — authoritative over open-order/position caches after a
+        connectivity blip (finding 100). None when no execution report
+        exists for the order."""
+        total = 0.0
+        seen = False
+        for fill in self.ib.fills():
+            execution = getattr(fill, "execution", None)
+            if execution is None or int(getattr(execution, "orderId", -1)) \
+                    != int(order_id):
+                continue
+            seen = True
+            side = str(getattr(execution, "side", "")).upper()
+            sign = 1.0 if side.startswith("B") else -1.0
+            total += sign * float(getattr(execution, "shares", 0.0))
+        return total if seen else None
 
     def close(self) -> None:
         if getattr(self, "ib", None) is not None and self.ib.isConnected():

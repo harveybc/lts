@@ -72,8 +72,8 @@ def _capability(suffix="1"):
     )
 
 
-def _submitted(olap, **client_kw):
-    client = FakeIbkrClient(account=ACCOUNT, **client_kw)
+def _submitted(olap, client_factory=None, **client_kw):
+    client = (client_factory or FakeIbkrClient)(account=ACCOUNT, **client_kw)
     executor = BracketExecutor(olap, client)
     plan = _plan()
     result = executor.submit_bracket(_intent(), plan, _capability())
@@ -299,3 +299,110 @@ def test_acknowledged_effect_replays_without_broker_reads(olap):
     replay = controller.acknowledge(effect_id, plan, instrument="EUR.USD")
     assert replay["replayed"] is True and replay["protected"] is True
     assert len(client.calls) == reads_after
+
+
+# ── finding 100: post-1100 source hierarchy and bounded convergence ──
+
+
+class PoisonedCacheClient(FakeIbkrClient):
+    """Reproduces the 2026-08-04 incident: after a 1100/1102 blip the
+    position cache reports a poisoned value while server-side execution
+    reports carry the truth."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._connectivity = []
+        self._execution_units = {}
+        self.poisoned_positions = None
+
+    def connectivity_events(self):
+        return list(self._connectivity)
+
+    def execution_units_for_order(self, order_id):
+        return self._execution_units.get(int(order_id))
+
+    def position_facts(self):
+        if self.poisoned_positions is not None:
+            return list(self.poisoned_positions)
+        return super().position_facts()
+
+
+def _poisoned_recovery(olap):
+    client, controller, plan, effect_id = _submitted(
+        olap, client_factory=PoisonedCacheClient)
+    client.fill_parent(1000, 20000.0)
+    client.drop_order(1002)
+    verdict = controller.acknowledge(effect_id, plan, instrument="EUR.USD")
+    assert verdict["recovery"]["complete"] is False
+    attempt = olap.broker_facts(effect_id, "recovery_flatten_attempt")[-1]
+    flatten_id = attempt["fact"]["orderId"]
+    client.alter_order(flatten_id, status="Filled", filled=20000.0,
+                       remaining=0.0)
+    # The blip: caches poisoned (+20000 ghost), executions truthful.
+    client._connectivity = [(1100, "2026-08-04T04:17:55+00:00"),
+                            (1102, "2026-08-04T04:17:55+00:00")]
+    client._execution_units[int(flatten_id)] = -20000.0   # SELL flatten
+    client.poisoned_positions = [{
+        "symbol": "EUR", "currency": "USD", "secType": "CASH",
+        "account": ACCOUNT, "conId": 554321987, "units": 20000.0,
+    }]
+    return client, controller, plan, effect_id, flatten_id
+
+
+def test_suspect_cache_never_trusts_poison_and_never_flip_flops(olap):
+    client, controller, plan, effect_id, _fid = _poisoned_recovery(olap)
+    for _pass in range(4):
+        result = controller.recover(effect_id, plan, instrument="EUR.USD")
+        assert result["state"] == "recovering"        # never effect_unknown
+        assert result["derived_units"] == pytest.approx(0.0)
+    suspects = olap.broker_facts(effect_id, "suspect_cache")
+    assert len(suspects) == 4
+    assert olap.effect_row(effect_id)["state"] == "recovering"
+    assert not olap.broker_facts(effect_id, "recovery_reconciled_flat")
+
+
+def test_bounded_agreement_converges_and_records_lineage(olap):
+    client, controller, plan, effect_id, _fid = _poisoned_recovery(olap)
+    controller.recover(effect_id, plan, instrument="EUR.USD")  # disagree
+    client.poisoned_positions = []                     # cache heals: flat
+    outcomes = []
+    for _pass in range(3):
+        outcomes.append(
+            controller.recover(effect_id, plan, instrument="EUR.USD"))
+    assert [o["state"] for o in outcomes[:2]] == ["recovering",
+                                                  "recovering"]
+    assert outcomes[2]["complete"] is True
+    assert outcomes[2]["state"] == "terminal_flat"
+    convergence = olap.broker_facts(effect_id, "cache_convergence")
+    assert len(convergence) == 1
+    fact = convergence[0]["fact"]
+    assert fact["samples"] == 3
+    assert fact["source_hierarchy"][0] == "executions"
+    assert fact["seconds_since_connectivity_loss"] is not None
+    samples = olap.broker_facts(effect_id, "cache_agreement_sample")
+    assert [s["fact"]["agree"] for s in samples] == [
+        False, True, True, True]
+    assert olap.get_state("halt") == "hold"            # never code-cleared
+
+
+def test_underivable_position_stays_held_under_suspicion(olap):
+    client, controller, plan, effect_id, fid = _poisoned_recovery(olap)
+    del client._execution_units[int(fid)]              # no execution report
+    result = controller.recover(effect_id, plan, instrument="EUR.USD")
+    assert result["state"] == "recovering"
+    assert result["derived_units"] is None
+    assert olap.broker_facts(effect_id, "suspect_cache")
+
+
+def test_no_connectivity_events_keeps_original_behavior(olap):
+    client, controller, plan, effect_id = _submitted(olap)
+    client.fill_parent(1000, 20000.0)
+    client.drop_order(1002)
+    controller.acknowledge(effect_id, plan, instrument="EUR.USD")
+    attempt = olap.broker_facts(effect_id, "recovery_flatten_attempt")[-1]
+    client.alter_order(int(attempt["fact"]["orderId"]), status="Filled",
+                       filled=20000.0, remaining=0.0)
+    client.set_position(symbol="EUR", currency="USD", units=0.0)
+    result = controller.recover(effect_id, plan, instrument="EUR.USD")
+    assert result["complete"] is True                  # no extra samples
+    assert not olap.broker_facts(effect_id, "cache_agreement_sample")
