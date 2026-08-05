@@ -190,3 +190,24 @@ def test_unknown_timeframe_refuses_to_call_clock_healthy():
     probes["heartbeat"]["timeframe"] = "13m"
     emissions, _ = monitor.assess(probes, CONFIG, NOW, {})
     assert _observed(emissions, "decision_clock_stale")
+
+
+def test_monitoring_heartbeat_without_inference_is_not_clock_stale():
+    """False-P1 found live 2026-08-05: while the runner monitors an open
+    position its heartbeat has no inference block (timeframe and bar both
+    absent); per-minute heartbeat freshness governs, and the clock check
+    must recover, not page."""
+    probes = healthy_probes()
+    probes["heartbeat"]["timeframe"] = None
+    probes["heartbeat"]["last_closed_bar"] = None
+    emissions, state = monitor.assess(probes, CONFIG, NOW, {})
+    assert _observed(emissions, "decision_clock_stale") == []
+    assert _recovered(emissions, "decision_clock_stale")
+    assert state["tws_healthy"]
+
+
+def test_half_missing_clock_still_refuses():
+    probes = healthy_probes()
+    probes["heartbeat"]["last_closed_bar"] = None      # timeframe present
+    emissions, _ = monitor.assess(probes, CONFIG, NOW, {})
+    assert _observed(emissions, "decision_clock_stale")

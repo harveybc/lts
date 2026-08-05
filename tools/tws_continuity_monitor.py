@@ -255,20 +255,26 @@ def assess(probes: dict, config: dict, now: datetime,
         })
 
         # Decision clock: only meaningful while TWS itself is healthy.
-        bar_seconds = config["timeframe_seconds"].get(
-            heartbeat.get("timeframe") or "", None)
+        # A heartbeat WITHOUT an inference block (timeframe and bar both
+        # absent) is the runner monitoring an open position between due
+        # bars — its per-minute freshness already proves liveness, so the
+        # clock check does not apply (false-P1 found live 2026-08-05).
+        timeframe = heartbeat.get("timeframe")
+        last_closed_bar = heartbeat.get("last_closed_bar")
+        bar_seconds = config["timeframe_seconds"].get(timeframe or "", None)
         clock_stale = False
-        if bar_seconds is not None and heartbeat.get("last_closed_bar"):
+        if timeframe is None and last_closed_bar is None:
+            clock_stale = False
+        elif bar_seconds is not None and last_closed_bar:
             try:
-                last_bar = datetime.fromisoformat(
-                    heartbeat["last_closed_bar"])
+                last_bar = datetime.fromisoformat(last_closed_bar)
                 lag = (now - last_bar).total_seconds()
                 clock_stale = lag > bar_seconds * float(
                     config["decision_clock_grace_factor"])
             except ValueError:
                 clock_stale = True
-        elif bar_seconds is None:
-            clock_stale = True                    # unknown timeframe: refuse
+        else:
+            clock_stale = True    # unknown timeframe or half-missing clock
         if clock_stale:
             emissions.append({
                 "action": "observe",
