@@ -1,0 +1,16 @@
+{
+  "schema": "lts.rolling_evidence_config.v1",
+  "version": "1.0.0",
+  "incident_ledger": "~/.local/state/agent-multi/incident-ledger/incidents.sqlite",
+  "venues": [
+    {"venue": "ibkr_paper", "timeframe": "4h",
+     "execution_ledger": "~/.local/state/lts/ibkr-model-execution.sqlite",
+     "incident_object": "ibkr_paper"},
+    {"venue": "alpaca_paper", "timeframe": "1d",
+     "execution_ledger": "~/.local/state/lts/alpaca-model-execution.sqlite",
+     "incident_object": "alpaca_paper"},
+    {"venue": "mt5_demo", "timeframe": "4h",
+     "execution_ledger": "~/.local/state/lts/mt5-bridge.sqlite",
+     "incident_object": "mt5_demo"}
+  ]
+}
