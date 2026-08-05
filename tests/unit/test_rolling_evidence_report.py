@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,7 +21,15 @@ from app.ibkr_l1_journal import L1ExecutionOlap  # noqa: E402
 AS_OF = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _seed(tmp_path):
+def _seed(tmp_path, monkeypatch):
+    # AUD-F2-20260805-116: the lifecycle rows must carry DETERMINISTIC
+    # event timestamps inside the queried window, not the wall clock —
+    # otherwise every run after 12:00 UTC on the fixture date places
+    # them in AS_OF's future and the report reads zero.
+    import app.ibkr_l1_journal as journal_mod
+    monkeypatch.setattr(
+        journal_mod, "_utc_now",
+        lambda: AS_OF - timedelta(hours=1))
     ledger = L1ExecutionOlap(tmp_path / "ibkr.sqlite")
     for hour, outcome in ((0, "would_be_order"), (4, "hold"),
                           (8, "rejected")):
@@ -49,8 +57,8 @@ def _seed(tmp_path):
     }
 
 
-def test_report_counts_and_labels(tmp_path):
-    config = _seed(tmp_path)
+def test_report_counts_and_labels(tmp_path, monkeypatch):
+    config = _seed(tmp_path, monkeypatch)
     report = report_mod.build_report(config, AS_OF)
     day = report["windows"]["24h"]["ibkr_paper"]
     assert day["available"] is True
