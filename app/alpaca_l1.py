@@ -548,6 +548,54 @@ class AlpacaL1Executor:
         return {"reconciled": True, "reservation_id": reservation_id,
                 "lifecycle_state": previous, "changed": changed}
 
+    def drain_for_succession(self, reason: str) -> list[dict[str, Any]]:
+        """Order C3: a model switch drains the seat exactly once THROUGH
+        the journaled lifecycle — never a raw client bypass. Only effects
+        this ledger owns are touched (foreign exposure stays blocked by
+        its own gate, never silently closed); each leg is idempotent by
+        journaled fact so crash/restart re-runs complete without
+        duplicating a cancel or a close; no global hold is taken — the
+        drain is an ordinary risk-reducing transition and the successor
+        proceeds when the seat proves flat."""
+        drained: list[dict[str, Any]] = []
+        for effect in self.store.nonterminal_effects():
+            if effect["kind"] != "alpaca_bracket_entry":
+                continue
+            effect_id = effect["effect_id"]
+            contract = self.store.effect_contract(effect_id)
+            if contract is None or not effect["order_ids"]:
+                continue                   # unknown linkage: never guessed
+            order_id = str(effect["order_ids"][0])
+            kinds = {fact["fact_kind"]
+                     for fact in self.store.broker_facts(effect_id)}
+            actions: list[str] = []
+            if "succession_cancel" not in kinds:
+                try:
+                    self.client.cancel_order(order_id)
+                    self.store.record_broker_fact(
+                        effect_id, "succession_cancel",
+                        {"order_id": order_id, "reason": reason})
+                except AlpacaPaperError as exc:
+                    self.store.record_broker_fact(
+                        effect_id, "succession_cancel_refused",
+                        {"order_id": order_id, "error": str(exc)})
+                actions.append("cancel")
+            open_position = [
+                p for p in self.client.positions()
+                if p.get("symbol") == contract["symbol"]]
+            if open_position and "succession_flatten" not in kinds:
+                closed = self.client.close_position(
+                    str(contract["symbol"]))
+                self.store.record_broker_fact(
+                    effect_id, "succession_flatten",
+                    {"reason": reason, "result": closed})
+                actions.append("flatten")
+            if effect["state"] in ("submitted_pending_ack",
+                                   "acknowledged", "effect_unknown"):
+                self.store.advance_effect(effect_id, "recovering")
+            drained.append({"effect_id": effect_id, "actions": actions})
+        return drained
+
     def reconcile_orphan_reservations(
         self, *, route_flat: bool
     ) -> list[dict[str, Any]]:

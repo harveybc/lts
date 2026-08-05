@@ -259,11 +259,10 @@ class AlpacaModelRunner:
             or current["config_sha256"] != self.manifest["config_sha256"]
         )
         if selected_changed:
-            for order in open_orders:
-                if order.get("symbol") == self.profile.symbol:
-                    self.client.cancel_order(str(order["id"]))
-            if positions:
-                self.client.close_position(self.profile.symbol)
+            # Order C3: succession drains through the journaled lifecycle
+            # (owned effects only) — the raw cancel/close bypass is gone.
+            self.executor.drain_for_succession(
+                reason=f"model_switch:{self.policy.model_id}")
             if open_orders or positions:
                 return {"state": "draining_for_model_switch", "model_id": current["model_id"]}
             self.sessions.end(

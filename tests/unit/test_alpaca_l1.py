@@ -357,3 +357,105 @@ def test_terminal_broker_effect_reconciles_l0_and_unblocks_next_signal(tmp_path)
         quote_time=now, instrument="SPY", now=now,
     )
     assert decision["outcome"] == "would_be_order", decision
+
+
+# ── order C3: lifecycle-only succession drain ──
+
+
+def _submitted_executor(tmp_path, client=None):
+    from app.ibkr_l1_journal import L1ExecutionOlap
+
+    store = L1ExecutionOlap(tmp_path / "ledger.sqlite")
+    client = client or FakeClient()
+    executor = AlpacaL1Executor(store, client, _profile())
+    result = executor.submit(
+        idempotency_key="succ-key-1", symbol="SPY",
+        asset_id="equity:SPY", qty=Decimal("1"), side="buy",
+        stop_price=Decimal("490"), take_profit_price=Decimal("510"),
+        risk_fraction_at_stop=Decimal("0.0005"),
+        model_evidence=_evidence(),
+    )
+    return store, client, executor, result["effect_id"]
+
+
+class HoldingClient(FakeClient):
+    """Reports one open SPY position until closed."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.flat = False
+
+    def positions(self):
+        if self.flat:
+            return []
+        return [{"symbol": "SPY", "qty": "-1"}]
+
+    def close_position(self, symbol):
+        self.flat = True
+        return super().close_position(symbol)
+
+
+def test_succession_drain_is_journaled_and_idempotent(tmp_path):
+    store, client, executor, effect_id = _submitted_executor(
+        tmp_path, HoldingClient())
+    drained = executor.drain_for_succession(reason="model_switch:new-m")
+    assert [d["actions"] for d in drained] == [["cancel", "flatten"]]
+    assert client.cancel_calls == 1 and client.close_calls == 1
+    kinds = {f["fact_kind"] for f in store.broker_facts(effect_id)}
+    assert {"succession_cancel", "succession_flatten"} <= kinds
+    assert store.effect_row(effect_id)["state"] == "recovering"
+    assert store.get_state("halt", "none") == "none"   # no global hold
+
+    # Crash/restart replay: legs already journaled are never duplicated.
+    again = executor.drain_for_succession(reason="model_switch:new-m")
+    assert client.cancel_calls == 1 and client.close_calls == 1
+    assert [d["actions"] for d in again] == [[]]
+
+
+def test_crash_between_cancel_and_flatten_completes_on_restart(tmp_path):
+    class CrashyClient(HoldingClient):
+        def close_position(self, symbol):
+            if self.close_calls == 0:
+                self.close_calls += 1
+                raise RuntimeError("crash before close persisted")
+            return super().close_position(symbol)
+
+    store, client, executor, effect_id = _submitted_executor(
+        tmp_path, CrashyClient())
+    with pytest.raises(RuntimeError):
+        executor.drain_for_succession(reason="switch")
+    # Restart: cancel fact exists (skipped); flatten completes once.
+    executor.drain_for_succession(reason="switch")
+    assert client.flat is True
+    kinds = [f["fact_kind"] for f in store.broker_facts(effect_id)]
+    assert kinds.count("succession_cancel") == 1
+    assert kinds.count("succession_flatten") == 1
+
+
+def test_foreign_exposure_is_never_silently_closed(tmp_path):
+    store, client, executor, effect_id = _submitted_executor(tmp_path)
+    # Submit auto-acknowledges; terminalize the owned lifecycle so only
+    # the foreign position remains.
+    store.advance_effect(effect_id, "terminal_flat")
+
+    class ForeignClient(FakeClient):
+        def positions(self):
+            return [{"symbol": "SPY", "qty": "3"}]   # not ours
+
+    foreign = ForeignClient()
+    executor.client = foreign
+    drained = executor.drain_for_succession(reason="switch")
+    assert drained == []                     # no owned nonterminal effects
+    assert foreign.close_calls == 0
+    assert foreign.cancel_calls == 0
+
+
+def test_runner_switch_path_has_no_direct_client_bypass():
+    import inspect
+
+    from app import alpaca_model_runner
+
+    source = inspect.getsource(alpaca_model_runner.AlpacaModelRunner.tick)
+    assert "client.cancel_order" not in source
+    assert "client.close_position" not in source
+    assert "drain_for_succession" in source
