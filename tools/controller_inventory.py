@@ -103,6 +103,14 @@ def _heartbeat(host: str | None, path: str,
         "config_sha256": (payload.get("config_sha256")
                           or inference.get("config_sha256")),
         "input_sha256": inference.get("input_sha256"),
+        "input_feature_sha256": (
+            payload.get("input_feature_sha256")
+            or inference.get("input_feature_sha256")),
+        "preprocessing_sha256": (
+            payload.get("preprocessing_sha256")
+            or inference.get("preprocessing_sha256")),
+        "manifest_sha256": (payload.get("manifest_sha256")
+                            or inference.get("manifest_sha256")),
         "instrument": payload.get("instrument")
         or inference.get("asset_id"),
         "positions": payload.get("positions"),
@@ -138,62 +146,126 @@ def _manifests_on(host: str | None) -> list | dict:
             "live_execution_eligible": payload.get(
                 "live_execution_eligible"),
             "research_validated": payload.get("research_validated"),
+            "observation_parity_verified": payload.get(
+                "observation_parity_verified"),
+            "config_sha256": payload.get("config_sha256"),
+            "input_feature_sha256": payload.get(
+                "input_feature_sha256"),
+            "preprocessing_sha256": payload.get(
+                "preprocessing_sha256"),
+            "manifest_sha256": payload.get("manifest_sha256"),
         })
     return manifests
 
 
-def _join_manifest(heartbeat: dict, manifests) -> dict:
-    """Exact hash join: controller class and SAC authority come from
-    the manifest whose artifact hash equals the heartbeat's."""
-    artifact = heartbeat.get("artifact_sha256")
-    if not artifact:
-        # Named evidence gap: this runner's heartbeat publishes no
-        # artifact hash, so no hash join is possible. A model_id join
-        # is reported as UNVERIFIED context only; it can never grant
-        # authority and the gap itself is the finding.
-        model_id = heartbeat.get("model_id")
-        weak = None
-        if model_id and isinstance(manifests, list):
-            weak = next((m for m in manifests
-                         if m.get("model_id") == model_id), None)
-        return {"controller_type": (
-                    "linear_shadow_control_unverified"
-                    if weak and weak.get("schema") == LINEAR_SCHEMA
-                    else "unavailable"),
-                "sac_champion_authoritative": "unavailable",
-                "join": {
-                    "gap": ("heartbeat publishes NO artifact hash;"
-                            " hash join impossible — runner heartbeat"
-                            " must be enriched"),
-                    "model_id_join_unverified": (
-                        weak.get("path") if weak else None),
-                }}
-    if isinstance(manifests, dict):                # unavailable
+def _authority(seat_facts: dict, heartbeat: dict, manifests,
+               unit: dict) -> dict:
+    """Exact authority join (AUD-F2-20260806-139).
+
+    Authority is TRUE only when every one of these holds:
+      * the unit is active AND the heartbeat is fresh;
+      * the manifest is a SAC manifest found on the seat's own host;
+      * model id, artifact, config, input-feature/preprocessing and
+        manifest hashes all match EXACTLY;
+      * live_inference_eligible AND live_execution_eligible are true;
+      * observation parity is verified.
+    Any missing fact is `unavailable`, never true.
+    """
+    reasons: list[str] = []
+    if isinstance(manifests, dict):                 # host unreachable
         return {"controller_type": "unclassified",
                 "sac_champion_authoritative": "unavailable",
-                "join": manifests.get("unavailable")}
+                "join": {"gap": manifests.get("unavailable")}}
+    if "unavailable" in heartbeat:
+        return {"controller_type": "unavailable",
+                "sac_champion_authoritative": "unavailable",
+                "join": {"gap": heartbeat["unavailable"]}}
+
+    active = str(unit.get("ActiveState", "")) == "active"
+    if not active:
+        reasons.append(f"unit not active ({unit.get('ActiveState')})")
+    if heartbeat.get("fresh") is not True:
+        reasons.append(
+            f"heartbeat not fresh (age={heartbeat.get('age_seconds')}s,"
+            f" budget={heartbeat.get('freshness_budget_seconds')}s)")
+
+    artifact = heartbeat.get("artifact_sha256")
+    if not artifact:
+        model_id = heartbeat.get("model_id")
+        weak = next((m for m in manifests
+                     if m.get("model_id") == model_id), None)
+        return {
+            "controller_type": (
+                "linear_shadow_control_unverified"
+                if weak and weak.get("schema") == LINEAR_SCHEMA
+                else "unavailable"),
+            "sac_champion_authoritative": "unavailable",
+            "join": {
+                "gap": ("heartbeat publishes NO artifact hash; the"
+                        " exact join is impossible — runner heartbeat"
+                        " must be enriched"),
+                "model_id_join_unverified": (
+                    weak.get("path") if weak else None),
+                "blocking_reasons": reasons,
+            }}
+
     match = next((m for m in manifests
                   if m.get("artifact_sha256") == artifact), None)
     if match is None:
         return {"controller_type": "unclassified",
                 "sac_champion_authoritative": False,
-                "join": (f"artifact {artifact[:12]} matches no"
-                         " manifest on the evidence host")}
+                "join": {"gap": (
+                    f"artifact {artifact[:12]} matches no manifest on"
+                    " the evidence host"),
+                    "blocking_reasons": reasons}}
+
     schema = match.get("schema")
-    if schema == SAC_SCHEMA:
-        authoritative = (
-            match.get("live_execution_eligible") is True)
-        return {"controller_type": "sac",
-                "sac_champion_authoritative": authoritative,
-                "join": {"manifest": match["path"],
-                         "eligible": authoritative}}
-    if schema == LINEAR_SCHEMA:
-        return {"controller_type": "linear_shadow_control",
+    if schema != SAC_SCHEMA:
+        kind = ("linear_shadow_control" if schema == LINEAR_SCHEMA
+                else f"other:{schema}")
+        return {"controller_type": kind,
                 "sac_champion_authoritative": False,
-                "join": {"manifest": match["path"]}}
-    return {"controller_type": f"other:{schema}",
-            "sac_champion_authoritative": False,
-            "join": {"manifest": match["path"]}}
+                "join": {"manifest": match["path"],
+                         "blocking_reasons": reasons}}
+
+    # --- SAC candidate: every predicate must hold ---
+    checks = {}
+    for field, hb_key in (("model_id", "model_id"),
+                          ("config_sha256", "config_sha256"),
+                          ("input_feature_sha256",
+                           "input_feature_sha256"),
+                          ("preprocessing_sha256",
+                           "preprocessing_sha256"),
+                          ("manifest_sha256", "manifest_sha256")):
+        expected = match.get(field)
+        seen = heartbeat.get(hb_key)
+        if expected is None or seen is None:
+            checks[field] = "unavailable"
+            reasons.append(f"{field} unavailable for exact comparison")
+        elif str(expected) != str(seen):
+            checks[field] = "mismatch"
+            reasons.append(f"{field} mismatch")
+        else:
+            checks[field] = "match"
+    for predicate in ("live_inference_eligible",
+                      "live_execution_eligible",
+                      "observation_parity_verified"):
+        value = match.get(predicate)
+        checks[predicate] = value
+        if value is not True:
+            reasons.append(f"{predicate} is {value!r}")
+
+    if reasons:
+        unavailable = any(v == "unavailable" for v in checks.values())
+        return {
+            "controller_type": "sac_not_authoritative",
+            "sac_champion_authoritative": (
+                "unavailable" if unavailable else False),
+            "join": {"manifest": match["path"], "checks": checks,
+                     "blocking_reasons": reasons}}
+    return {"controller_type": "sac",
+            "sac_champion_authoritative": True,
+            "join": {"manifest": match["path"], "checks": checks}}
 
 
 def collect(run_on=_run_on, max_age_seconds: float = 3600.0) -> dict:
@@ -207,7 +279,9 @@ def collect(run_on=_run_on, max_age_seconds: float = 3600.0) -> dict:
             heartbeat = _heartbeat(host, spec["heartbeat"],
                                    max_age_seconds)
             manifests = _manifests_on(host)
-            join = _join_manifest(heartbeat, manifests)
+            unit = _unit_state(host, spec["unit"])
+            join = _authority({}, heartbeat, manifests,
+                              unit)
             seats[seat] = {
                 "evidence_host": host or os.uname().nodename,
                 "evidence_paths": {
@@ -216,12 +290,12 @@ def collect(run_on=_run_on, max_age_seconds: float = 3600.0) -> dict:
                 },
                 "evidence_time": datetime.now(
                     timezone.utc).isoformat(),
-                "unit": _unit_state(host, spec["unit"]),
+                "unit": unit,
                 "heartbeat": heartbeat,
                 **join,
             }
         return {
-            "schema": "lts.controller_inventory.v2",
+            "schema": "lts.controller_inventory.v3",
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "collector_host": os.uname().nodename,
             "seats": seats,
