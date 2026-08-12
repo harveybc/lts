@@ -1,15 +1,36 @@
 import hashlib
 import json
+import socket
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from prediction_provider_mechanics import FEATURE_NAMES
 
 from app.mt5_bridge_lab import SnapshotPayload
-from app.mt5_execution_bridge import Mt5ExecutionConfig, Mt5ExecutionStore
-from app.mt5_model_runner import Mt5ModelRunner, close_idempotency_key
+from app.mt5_execution_bridge import (
+    ExecutionResultPayload,
+    Mt5ExecutionConfig,
+    Mt5ExecutionStore,
+)
+from app.mt5_model_runner import (
+    Mt5ModelRunner,
+    Mt5ModelRunnerError,
+    close_idempotency_key,
+    durable_command_heartbeat,
+)
 
 
 ACCOUNT = "0123456789abcdef01234567"
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("network operation attempted in MT5 runner test")
+
+    monkeypatch.setattr(socket, "socket", _explode)
+    monkeypatch.setattr(socket, "create_connection", _explode)
 
 
 def _json(path, value):
@@ -132,5 +153,93 @@ def test_closed_bars_drive_one_l0_checked_model_command(tmp_path):
         assert command["stop_loss"] < 1959.0 < command["take_profit"]
         assert command["artifact_sha256"] == artifact_sha
         assert len(command["input_sha256"]) == 64
+
+        # A subsequent tick reads the durable command instead of replaying
+        # the decision and pretending that it was queued again.
+        pending = runner.tick()
+        assert pending["state"] == "command_pending"
+        assert pending["state_source"] == "execution_commands"
+        assert "replayed" not in pending
+
+        runner.bridge_store.complete(ExecutionResultPayload.model_validate({
+            "schema": "lts.mt5.execution_result.v1",
+            "command_id": command["command_id"],
+            "account_fingerprint": ACCOUNT,
+            "success": True,
+            "result_code": 10009,
+            "order_ticket": "40217543",
+            "deal_ticket": "41053668",
+            "message": "fixture only",
+            "observed_at": datetime.now(timezone.utc),
+        }))
+        awaiting = runner.tick()
+        assert awaiting["state"] == (
+            "command_succeeded_awaiting_fresh_snapshot")
+        assert "replayed" not in awaiting
+
+        # Only a newer direct account snapshot can prove later-flat state.
+        runner.bridge_store.record_snapshot(SnapshotPayload.model_validate({
+            "schema": "lts.mt5.snapshot.v1",
+            "account_fingerprint": ACCOUNT,
+            "observed_at": datetime.now(timezone.utc),
+            "currency": "USD", "balance": 10000, "equity": 10000,
+            "margin": 0, "free_margin": 10000,
+            "positions": [], "orders": [], "bars": bars,
+            "symbols": [{
+                "symbol": "ETHUSD", "bid": 1958.0, "ask": 1960.0,
+                "point": 0.01, "volume_min": 0.01, "volume_max": 65,
+                "volume_step": 0.01, "trade_mode": 4,
+                "observed_at": datetime.now(timezone.utc),
+            }],
+        }))
+        reconciled = runner.tick()
+        assert reconciled["state"] == "command_succeeded_flat"
+        assert reconciled["positions"] == reconciled["orders"] == 0
+        assert reconciled["state_source"] == "execution_commands"
+        assert "replayed" not in reconciled
+        assert runner.bridge_store.connection.execute(
+            "SELECT COUNT(*) FROM execution_commands"
+        ).fetchone()[0] == 1
     finally:
         runner.close()
+
+
+class _CommandStoreStub:
+    def __init__(self, command):
+        self.command = command
+
+    def command_for_idempotency(self, account_fingerprint, idempotency_key):
+        return self.command
+
+
+def test_unknown_durable_command_state_fails_closed():
+    with pytest.raises(Mt5ModelRunnerError, match="unsupported durable"):
+        durable_command_heartbeat(
+            _CommandStoreStub({
+                "command_id": "mt5-corrupt-state", "state": "mystery",
+            }),
+            account_fingerprint=ACCOUNT,
+            idempotency_key="fixture-key",
+            snapshot_received_at="2026-08-12T12:00:00+00:00",
+            positions_total=0,
+            orders_total=0,
+        )
+
+
+def test_command_lookup_is_account_bound(tmp_path):
+    store = Mt5ExecutionStore(tmp_path / "mt5.sqlite")
+    try:
+        store.connection.execute(
+            "INSERT INTO execution_commands VALUES"
+            " (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("mt5-bound-command", "decision-key", ACCOUNT, "open_long",
+             "ETHUSD", 0.01, 1800.0, 2200.0, "eth-test-v1",
+             "a" * 64, "b" * 64, "c" * 64, "pending",
+             "2026-08-12T12:00:00+00:00", None, None, None),
+        )
+        assert store.command_for_idempotency(
+            ACCOUNT, "decision-key")["command_id"] == "mt5-bound-command"
+        assert store.command_for_idempotency(
+            "ffffffffffffffffffffffff", "decision-key") is None
+    finally:
+        store.close()

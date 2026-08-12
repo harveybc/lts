@@ -291,6 +291,23 @@ class Mt5ExecutionStore(Mt5BridgeStore):
             ).fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
 
+    def command_for_idempotency(
+        self, account_fingerprint: str, idempotency_key: str
+    ) -> Optional[dict[str, Any]]:
+        """Read the one durable command bound to an account and decision.
+
+        The account predicate is deliberate: an idempotency collision or a
+        caller using the wrong account must look absent instead of exposing
+        or adopting another account's command state.
+        """
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM execution_commands WHERE"
+                " account_fingerprint=? AND idempotency_key=?",
+                (account_fingerprint.lower(), idempotency_key),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def exposure_reconciliation(self) -> dict[str, Any]:
         """Match current MT5 exposure to completed, model-bound commands."""
         with self._lock:

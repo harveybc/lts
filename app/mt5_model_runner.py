@@ -39,6 +39,84 @@ class Mt5ModelRunnerError(RuntimeError):
     pass
 
 
+def _ledger_time(value: Any, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError) as error:
+        raise Mt5ModelRunnerError(
+            f"durable MT5 command has invalid {field}") from error
+    if parsed.tzinfo is None:
+        raise Mt5ModelRunnerError(
+            f"durable MT5 command has timezone-naive {field}")
+    return parsed.astimezone(timezone.utc)
+
+
+def durable_command_heartbeat(
+    store: Mt5ExecutionStore,
+    *,
+    account_fingerprint: str,
+    idempotency_key: str,
+    snapshot_received_at: str,
+    positions_total: int,
+    orders_total: int,
+) -> Optional[dict[str, Any]]:
+    """Derive runner state from the direct execution-command ledger.
+
+    A replayed model decision never gets to relabel an existing command as
+    newly queued.  Terminal success is called flat only when a direct account
+    snapshot received after command completion proves zero positions and zero
+    orders.  Missing/unknown durable states fail closed.
+    """
+    command = store.command_for_idempotency(
+        account_fingerprint, idempotency_key)
+    if command is None:
+        return None
+    state = str(command.get("state") or "")
+    command_id = str(command.get("command_id") or "")
+    if not command_id:
+        raise Mt5ModelRunnerError(
+            "durable MT5 command is missing command_id")
+    common = {
+        "command_id": command_id,
+        "command_state": state,
+        "state_source": "execution_commands",
+    }
+    if state == "pending":
+        return {"state": "command_pending", **common}
+    if state == "delivered":
+        return {"state": "command_delivered", **common}
+    if state == "failed":
+        return {"state": "command_failed", **common}
+    if state != "succeeded":
+        raise Mt5ModelRunnerError(
+            f"unsupported durable MT5 command state {state!r}")
+
+    completed = _ledger_time(command.get("completed_at"), "completed_at")
+    snapshot_at = _ledger_time(snapshot_received_at, "snapshot received_at")
+    if snapshot_at < completed:
+        return {
+            "state": "command_succeeded_awaiting_fresh_snapshot",
+            **common,
+            "completed_at": completed.isoformat(),
+            "snapshot_received_at": snapshot_at.isoformat(),
+        }
+    if positions_total or orders_total:
+        return {
+            "state": "command_succeeded_exposure_present",
+            **common,
+            "positions": positions_total,
+            "orders": orders_total,
+            "snapshot_received_at": snapshot_at.isoformat(),
+        }
+    return {
+        "state": "command_succeeded_flat",
+        **common,
+        "positions": 0,
+        "orders": 0,
+        "snapshot_received_at": snapshot_at.isoformat(),
+    }
+
+
 def close_idempotency_key(
     *, session_id: str, reason: str, snapshot_received_at: str, last_bar: str,
 ) -> tuple[str, str]:
@@ -459,9 +537,26 @@ class Mt5ModelRunner:
                       "target_exposure": side})
             return {"state": "l0_refused", "decision": decision,
                     "inference": inference}
+        decision_key = str(
+            (decision.get("payload") or {}).get("idempotency_key") or ""
+        )
+        if not decision_key:
+            raise Mt5ModelRunnerError(
+                "accepted MT5 decision is missing idempotency_key")
+        durable = durable_command_heartbeat(
+            self.bridge_store,
+            account_fingerprint=self.bridge_config.account_fingerprint,
+            idempotency_key=decision_key,
+            snapshot_received_at=snapshot["_received_at"],
+            positions_total=len(positions),
+            orders_total=len(orders),
+        )
+        if durable is not None:
+            durable["inference"] = inference
+            return durable
         pending = self.l0.l1_pending_decisions("would_be_order")
         accepted = next((row for row in pending
-                         if row["idempotency_key"] == decision["payload"]["idempotency_key"]), None)
+                         if row["idempotency_key"] == decision_key), None)
         if accepted is None:
             return {"state": "replayed_signal", "decision": decision}
         from trading_contracts import OrderIntentV2
