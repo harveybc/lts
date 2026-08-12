@@ -110,6 +110,69 @@ class IbAsyncTwsClient(IbkrClientProtocol):
             total += sign * float(getattr(execution, "shares", 0.0))
         return total if seen else None
 
+    def filled_parent_execution_fact(
+        self, order_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Direct, restart-retained parent-fill proof from TWS executions.
+
+        Unlike ``open_order_facts``, this does not require the completed-order
+        join to remain available.  It reports only fields carried by direct
+        execution/fill records; consistency defects remain visible so the
+        verifier can refuse them rather than selecting a convenient row.
+        """
+        matched = [
+            fill for fill in self.ib.fills()
+            if getattr(fill, "execution", None) is not None
+            and int(getattr(fill.execution, "orderId", -1)) == int(order_id)
+        ]
+        if not matched:
+            return None
+
+        accounts = {
+            str(getattr(fill.execution, "acctNumber", "") or "")
+            for fill in matched
+        }
+        sides = {
+            str(getattr(fill.execution, "side", "") or "").upper()
+            for fill in matched
+        }
+        contracts = [{
+            "secType": str(fill.contract.secType),
+            "symbol": str(fill.contract.symbol),
+            "currency": str(fill.contract.currency),
+            "exchange": str(fill.contract.exchange),
+            "conId": int(fill.contract.conId),
+        } for fill in matched]
+        contract_identities = {
+            tuple(sorted(contract.items())) for contract in contracts
+        }
+        action = None
+        if len(sides) == 1:
+            side = next(iter(sides))
+            if side.startswith("B"):
+                action = "BUY"
+            elif side.startswith("S"):
+                action = "SELL"
+        proof = {
+            "source": "broker_execution",
+            "orderId": int(order_id),
+            "account": next(iter(accounts)) if len(accounts) == 1 else None,
+            "action": action,
+            "filled": max(
+                float(getattr(fill.execution, "cumQty", 0.0) or 0.0)
+                for fill in matched
+            ),
+            "contract": contracts[0] if len(contract_identities) == 1 else {},
+            "execution_ids": sorted({
+                str(getattr(fill.execution, "execId", "") or "")
+                for fill in matched
+            }),
+        }
+        if len(accounts) != 1 or len(sides) != 1 \
+                or len(contract_identities) != 1 or action is None:
+            proof["integrity_error"] = "inconsistent_execution_identity"
+        return proof
+
     def close(self) -> None:
         if getattr(self, "ib", None) is not None and self.ib.isConnected():
             self.ib.disconnect()

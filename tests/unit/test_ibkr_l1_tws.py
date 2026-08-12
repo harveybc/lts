@@ -1,8 +1,20 @@
+import socket
 from types import SimpleNamespace
+
+import pytest
 
 from app.ibkr_l1_adapter import BracketPlan
 from app.ibkr_l1_recovery import verify_bracket_exact
 from app.ibkr_l1_tws import IbAsyncTwsClient
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("network operation attempted in TWS fact test")
+
+    monkeypatch.setattr(socket, "socket", _explode)
+    monkeypatch.setattr(socket, "create_connection", _explode)
 
 
 def _contract():
@@ -30,6 +42,8 @@ def _fill(*, perm_id=1193220731, order_id=7, cumulative=20000.0):
         contract=_contract(),
         execution=SimpleNamespace(
             permId=perm_id, orderId=order_id, cumQty=cumulative,
+            acctNumber="DUR378700", side="SLD", shares=cumulative,
+            execId="0001.01",
         ),
     )
 
@@ -96,3 +110,18 @@ def test_reconstructed_parent_and_open_children_prove_exact_protection():
     )
     assert verdict["protected"] is True
     assert verdict["failures"] == []
+
+
+def test_direct_execution_fact_does_not_need_completed_order_join():
+    client = object.__new__(IbAsyncTwsClient)
+    client.ib = SimpleNamespace(fills=lambda: [_fill()])
+    fact = client.filled_parent_execution_fact(7)
+    assert fact == {
+        "source": "broker_execution", "orderId": 7,
+        "account": "DUR378700", "action": "SELL", "filled": 20000.0,
+        "contract": {
+            "secType": "CASH", "symbol": "USD", "currency": "CAD",
+            "exchange": "IDEALPRO", "conId": 15016062,
+        },
+        "execution_ids": ["0001.01"],
+    }

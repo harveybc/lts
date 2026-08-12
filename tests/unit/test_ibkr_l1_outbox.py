@@ -250,6 +250,52 @@ def test_full_canary_long_flat_short_flat(env):
     assert flatten_actions == ["SELL", "BUY"]
 
 
+def test_parent_fill_proof_survives_open_order_and_execution_cache_eviction(env):
+    env.mint()
+    env.decide(_asset_intent())
+    result = env.consumer.consume_entries(
+        quote=QUOTE, now=NOW + timedelta(seconds=2))[0]
+    effect_id = result["effect_id"]
+    parent_id = result["order_ids"][0]
+    env.client.fill_parent(parent_id, 20000.0)
+    env.client.drop_order(parent_id)
+
+    first = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=3))
+    assert first["exposure"] == "opened"
+    assert env.olap.get_state("halt", "none") == "none"
+
+    # A process/cache transition can remove the live execution cache. The
+    # append-only broker fact remains usable, but current position and both
+    # child orders are still re-read and required.
+    env.client.drop_execution_fact(parent_id)
+    second = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=4))
+    assert second["position_reconciled"] is True
+    assert env.olap.get_state("halt", "none") == "none"
+    assert len(env.olap.broker_facts(
+        effect_id, "parent_fill_execution")) == 1
+
+
+def test_retained_parent_fill_never_masks_missing_child(env):
+    env.mint()
+    env.decide(_asset_intent())
+    result = env.consumer.consume_entries(
+        quote=QUOTE, now=NOW + timedelta(seconds=2))[0]
+    effect_id = result["effect_id"]
+    parent_id, _take_id, stop_id = result["order_ids"]
+    env.client.fill_parent(parent_id, 20000.0)
+    env.client.drop_order(parent_id)
+    env.client.drop_order(stop_id)
+
+    sync = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=3))
+
+    assert sync["protection_lost"] is True
+    assert any("stop_loss" in failure for failure in sync["failures"])
+    assert env.olap.get_state("halt") == "hold"
+
+
 # ── ceilings refuse, never resize ──
 
 def test_quantity_above_profile_ceiling_is_rejected_not_resized(tmp_path):

@@ -454,11 +454,12 @@ class L1OutboxConsumer:
         except L1ExecutionError as error:
             return self._refuse_fill_sync(effect_id, str(error))
 
-        snapshot = self.client.open_order_facts()
-        verdict = verify_bracket_exact(
-            plan=plan, open_orders=snapshot,
-            instrument=contract["instrument"],
-            expected_con_id=contract["expected_con_id"],
+        verdict, snapshot, parent_proof, position_snapshot = (
+            self.controller.current_protection(
+                effect_id, plan,
+                instrument=contract["instrument"],
+                expected_con_id=contract["expected_con_id"],
+            )
         )
         if not verdict["protected"]:
             return self._handle_protection_loss(
@@ -470,7 +471,10 @@ class L1OutboxConsumer:
              if int(f.get("orderId", -1)) == int(effect["order_ids"][0])),
             None,
         )
-        cumulative_raw = None if parent_fact is None else parent_fact.get("filled")
+        cumulative_raw = (
+            parent_fact.get("filled") if parent_fact is not None
+            else None if parent_proof is None else parent_proof.get("filled")
+        )
         if cumulative_raw is None:
             return self._refuse_fill_sync(
                 effect_id, "broker_filled_fact_missing_never_zero"
@@ -527,9 +531,14 @@ class L1OutboxConsumer:
         # 3. mandatory position reconciliation against direct facts
         expected_contract = expected_contract_facts(contract["instrument"])
         sign = 1.0 if contract["delta_units"] > 0 else -1.0
+        positions = (
+            position_snapshot
+            if position_snapshot is not None
+            else self.client.position_facts()
+        )
         observed = sum(
             float(p.get("units", 0.0))
-            for p in self.client.position_facts()
+            for p in positions
             if p.get("symbol") == expected_contract["symbol"]
             and p.get("currency") == expected_contract["currency"]
             and p.get("secType") == expected_contract["secType"]

@@ -106,6 +106,44 @@ def test_filled_parent_with_open_children_is_protected(olap):
     assert verdict["protected"] is True
 
 
+def test_filled_parent_absent_with_position_and_children_is_protected(olap):
+    """Observed defect: TWS removes a filled parent from open orders while
+    its position and both correctly linked protection children remain."""
+    client, controller, plan, effect_id = _submitted(olap)
+    client.fill_parent(1000, 20000.0)
+    client.drop_order(1000)
+
+    verdict = controller.acknowledge(
+        effect_id, plan, instrument="EUR.USD")
+
+    assert verdict["protected"] is True
+    assert verdict["parent_evidence"] == "direct_execution"
+    assert olap.effect_row(effect_id)["state"] == "acknowledged"
+    assert olap.get_state("halt", "none") == "none"
+    assert [fact["orderId"] for fact in client.open_order_facts()] == [
+        1001, 1002]
+    assert olap.broker_facts(effect_id, "parent_fill_execution")
+
+
+def test_absent_parent_proof_never_adopts_foreign_account_position(olap):
+    client, controller, plan, effect_id = _submitted(olap)
+    client.fill_parent(1000, 20000.0)
+    client.drop_order(1000)
+    client.set_position(symbol="EUR", currency="USD", units=0.0)
+    client.set_position(
+        symbol="EUR", currency="USD", units=20000.0,
+        account="DU7654321",
+    )
+
+    verdict = controller.acknowledge(
+        effect_id, plan, instrument="EUR.USD")
+
+    assert verdict["protected"] is False
+    assert any("current position 0" in failure
+               for failure in verdict["failures"])
+    assert olap.get_state("halt") == "hold"
+
+
 def test_audit_065_reproducer_scenario_now_fails_closed(olap):
     """TP altered to a cancelled market order, SL rejected at a wrong price:
     the predecessor called this protected; it must recover instead."""

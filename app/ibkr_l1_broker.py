@@ -43,6 +43,13 @@ class IbkrClientProtocol(Protocol):
         """Direct broker snapshot of positions."""
         ...
 
+    def filled_parent_execution_fact(
+        self, order_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Direct cumulative execution proof retained after an order leaves
+        the open-order set, or ``None`` when the broker has no such proof."""
+        ...
+
     def connected_account(self) -> Optional[str]:
         """The account the session is bound to, or None when unknown."""
         ...
@@ -223,6 +230,7 @@ class FakeIbkrClient:
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     _orders: dict[int, dict[str, Any]] = field(default_factory=dict)
     _positions: list[dict[str, Any]] = field(default_factory=list)
+    _execution_facts: dict[int, dict[str, Any]] = field(default_factory=dict)
     _next_id: int = 9000
 
     # -- protocol ----------------------------------------------------------
@@ -282,6 +290,17 @@ class FakeIbkrClient:
         self.calls.append(("position_facts", {}))
         return [dict(p) for p in self._positions]
 
+    def filled_parent_execution_fact(
+        self, order_id: int
+    ) -> Optional[dict[str, Any]]:
+        self.calls.append((
+            "filled_parent_execution_fact", {"orderId": int(order_id)}
+        ))
+        fact = self._execution_facts.get(int(order_id))
+        if fact is None:
+            return None
+        return {**fact, "contract": dict(fact["contract"])}
+
     def connected_account(self) -> Optional[str]:
         return self.account
 
@@ -305,6 +324,9 @@ class FakeIbkrClient:
 
     def drop_order(self, order_id: int) -> None:
         self._orders.pop(int(order_id), None)
+
+    def drop_execution_fact(self, order_id: int) -> None:
+        self._execution_facts.pop(int(order_id), None)
 
     def set_position(
         self,
@@ -355,6 +377,15 @@ class FakeIbkrClient:
             currency=fact["contract"]["currency"],
             units=existing + sign * increment,
         )
+        self._execution_facts[int(order_id)] = {
+            "source": "broker_execution",
+            "orderId": int(order_id),
+            "account": fact["account"],
+            "action": fact["action"],
+            "filled": fact["filled"],
+            "contract": dict(fact["contract"]),
+            "execution_ids": [f"fake-execution-{int(order_id)}"],
+        }
 
 
 def place_order_sequence(calls: Iterable[tuple[str, dict[str, Any]]]) -> list[int]:

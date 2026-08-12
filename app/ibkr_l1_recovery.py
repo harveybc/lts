@@ -158,6 +158,80 @@ def _leg_failures(
     return failures
 
 
+def _filled_parent_failures(
+    spec: Mapping[str, Any],
+    proof: Optional[Mapping[str, Any]],
+    *,
+    contract: Mapping[str, Any],
+    expected_con_id: Optional[int],
+    quantity_tolerance: float,
+) -> list[str]:
+    if proof is None:
+        return ["parent: no direct or retained broker execution evidence"]
+    failures: list[str] = []
+    if proof.get("integrity_error"):
+        failures.append("parent: broker execution identity is inconsistent")
+    if proof.get("source") != "broker_execution":
+        failures.append("parent: execution proof source is not broker_execution")
+    if int(proof.get("orderId", -1)) != int(spec["orderId"]):
+        failures.append("parent: execution orderId mismatch")
+    if proof.get("account") != spec["account"]:
+        failures.append("parent: execution account mismatch")
+    if proof.get("action") != spec["action"]:
+        failures.append("parent: execution side mismatch")
+    filled = proof.get("filled")
+    if filled is None or abs(
+        float(filled) - float(spec["totalQuantity"])
+    ) > quantity_tolerance:
+        failures.append(
+            f"parent: execution fill {filled!r} != {spec['totalQuantity']!r}"
+        )
+    observed_contract = proof.get("contract")
+    if not isinstance(observed_contract, Mapping):
+        failures.append("parent: execution contract missing")
+    else:
+        for key, expected in contract.items():
+            if observed_contract.get(key) != expected:
+                failures.append(
+                    f"parent: execution contract {key} mismatch")
+        if expected_con_id is not None \
+                and observed_contract.get("conId") != expected_con_id:
+            failures.append("parent: execution conId mismatch")
+    return failures
+
+
+def _filled_position_failures(
+    spec: Mapping[str, Any],
+    positions: Optional[list[Mapping[str, Any]]],
+    *,
+    contract: Mapping[str, Any],
+    expected_con_id: Optional[int],
+    quantity_tolerance: float,
+) -> list[str]:
+    if positions is None:
+        return ["parent: current direct position evidence missing"]
+    expected_units = (
+        1.0 if spec["action"] == "BUY" else -1.0
+    ) * float(spec["totalQuantity"])
+    observed_units = sum(
+        float(position.get("units", 0.0))
+        for position in positions
+        if position.get("account") == spec["account"]
+        and position.get("secType") == contract["secType"]
+        and position.get("symbol") == contract["symbol"]
+        and position.get("currency") == contract["currency"]
+        and (
+            expected_con_id is None
+            or position.get("conId") == expected_con_id
+        )
+    )
+    if abs(observed_units - expected_units) > quantity_tolerance:
+        return [
+            f"parent: current position {observed_units} != {expected_units}"
+        ]
+    return []
+
+
 def verify_bracket_exact(
     *,
     plan: BracketPlan,
@@ -166,6 +240,8 @@ def verify_bracket_exact(
     expected_con_id: Optional[int] = None,
     quantity_tolerance: float = 1e-9,
     price_tolerance: float = 1e-9,
+    filled_parent_proof: Optional[Mapping[str, Any]] = None,
+    position_facts: Optional[list[Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Protection from direct facts only; every deviation is enumerated."""
     contract = expected_contract_facts(instrument)
@@ -182,14 +258,28 @@ def verify_bracket_exact(
         ("stop_loss", plan.stop_loss),
     ):
         observed = by_id.get(int(spec["orderId"]))
-        leg_failures = _leg_failures(
-            name, spec, observed,
-            parent_order_id=int(plan.parent["orderId"]),
-            contract=contract,
-            expected_con_id=expected_con_id,
-            quantity_tolerance=quantity_tolerance,
-            price_tolerance=price_tolerance,
-        )
+        if name == "parent" and observed is None \
+                and filled_parent_proof is not None:
+            leg_failures = _filled_parent_failures(
+                spec, filled_parent_proof, contract=contract,
+                expected_con_id=expected_con_id,
+                quantity_tolerance=quantity_tolerance,
+            )
+            leg_failures.extend(_filled_position_failures(
+                spec, position_facts, contract=contract,
+                expected_con_id=expected_con_id,
+                quantity_tolerance=quantity_tolerance,
+            ))
+            observed = filled_parent_proof
+        else:
+            leg_failures = _leg_failures(
+                name, spec, observed,
+                parent_order_id=int(plan.parent["orderId"]),
+                contract=contract,
+                expected_con_id=expected_con_id,
+                quantity_tolerance=quantity_tolerance,
+                price_tolerance=price_tolerance,
+            )
         legs[name] = {
             "order_id": spec["orderId"],
             "observed": None if observed is None else dict(observed),
@@ -213,6 +303,65 @@ class BracketLifecycleController:
         self.olap = olap
         self.client = client
 
+    def current_protection(
+        self,
+        effect_id: str,
+        plan: BracketPlan,
+        *,
+        instrument: str,
+        expected_con_id: Optional[int] = None,
+    ) -> tuple[
+        dict[str, Any], list[dict[str, Any]],
+        Optional[dict[str, Any]], Optional[list[dict[str, Any]]]
+    ]:
+        """Verify current children plus a present or execution-proven parent.
+
+        A direct parent execution fact is retained append-only so a later TWS
+        cache eviction cannot erase a fill that was already observed.  The
+        retained proof never replaces current child and position checks.
+        """
+        snapshot = self.client.open_order_facts()
+        parent_id = int(plan.parent["orderId"])
+        parent_present = any(
+            int(fact.get("orderId", -1)) == parent_id for fact in snapshot
+        )
+        proof: Optional[dict[str, Any]] = None
+        proof_origin: Optional[str] = None
+        positions: Optional[list[dict[str, Any]]] = None
+        if not parent_present:
+            reader = getattr(self.client, "filled_parent_execution_fact", None)
+            direct = reader(parent_id) if callable(reader) else None
+            if direct is not None:
+                proof = dict(direct)
+                proof_origin = "direct_execution"
+                retained = self.olap.broker_facts(
+                    effect_id, "parent_fill_execution")
+                previous = retained[-1]["fact"].get("proof") if retained else None
+                if previous != proof:
+                    with self.olap.atomic_unit():
+                        self.olap.record_broker_fact(
+                            effect_id, "parent_fill_execution", {"proof": proof}
+                        )
+            else:
+                retained = self.olap.broker_facts(
+                    effect_id, "parent_fill_execution")
+                if retained:
+                    candidate = retained[-1]["fact"].get("proof")
+                    if isinstance(candidate, dict):
+                        proof = dict(candidate)
+                        proof_origin = "retained_execution"
+            positions = self.client.position_facts()
+        verdict = verify_bracket_exact(
+            plan=plan, open_orders=snapshot, instrument=instrument,
+            expected_con_id=expected_con_id,
+            filled_parent_proof=proof, position_facts=positions,
+        )
+        verdict["parent_evidence"] = (
+            "open_order" if parent_present else
+            proof_origin or "unavailable"
+        )
+        return verdict, snapshot, proof, positions
+
     # -- acknowledgement ---------------------------------------------------
     def acknowledge(
         self,
@@ -232,13 +381,12 @@ class BracketLifecycleController:
                 f"effect {effect_id} in state {effect['state']!r} cannot be "
                 "acknowledged"
             )
-        snapshot = self.client.open_order_facts()
+        verdict, snapshot, _proof, _positions = self.current_protection(
+            effect_id, plan, instrument=instrument,
+            expected_con_id=expected_con_id,
+        )
         self.olap.record_broker_fact(
             effect_id, "ack_snapshot", {"open_orders": snapshot}
-        )
-        verdict = verify_bracket_exact(
-            plan=plan, open_orders=snapshot, instrument=instrument,
-            expected_con_id=expected_con_id,
         )
         with self.olap.atomic_unit():
             self.olap.record_broker_fact(
