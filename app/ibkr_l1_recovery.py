@@ -322,13 +322,21 @@ class BracketLifecycleController:
         """
         snapshot = self.client.open_order_facts()
         parent_id = int(plan.parent["orderId"])
-        parent_present = any(
-            int(fact.get("orderId", -1)) == parent_id for fact in snapshot
-        )
+        parent_fact = next((
+            fact for fact in snapshot
+            if int(fact.get("orderId", -1)) == parent_id
+        ), None)
+        # A Filled parent may remain in the TWS completed-order cache, but it
+        # is no longer an open leg.  It therefore needs the same direct
+        # execution + current-position proof as a parent that disappeared
+        # from the cache.  Only a genuinely open parent can be verified from
+        # the order fact alone.
+        parent_open = parent_fact is not None and \
+            parent_fact.get("status") in OPEN_STATUSES
         proof: Optional[dict[str, Any]] = None
         proof_origin: Optional[str] = None
         positions: Optional[list[dict[str, Any]]] = None
-        if not parent_present:
+        if not parent_open:
             reader = getattr(self.client, "filled_parent_execution_fact", None)
             direct = reader(parent_id) if callable(reader) else None
             if direct is not None:
@@ -351,13 +359,17 @@ class BracketLifecycleController:
                         proof = dict(candidate)
                         proof_origin = "retained_execution"
             positions = self.client.position_facts()
+        verification_snapshot = snapshot if parent_open else [
+            fact for fact in snapshot
+            if int(fact.get("orderId", -1)) != parent_id
+        ]
         verdict = verify_bracket_exact(
-            plan=plan, open_orders=snapshot, instrument=instrument,
+            plan=plan, open_orders=verification_snapshot, instrument=instrument,
             expected_con_id=expected_con_id,
             filled_parent_proof=proof, position_facts=positions,
         )
         verdict["parent_evidence"] = (
-            "open_order" if parent_present else
+            "open_order" if parent_open else
             proof_origin or "unavailable"
         )
         return verdict, snapshot, proof, positions

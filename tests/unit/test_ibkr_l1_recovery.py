@@ -104,6 +104,22 @@ def test_filled_parent_with_open_children_is_protected(olap):
     client.fill_parent(1000, 20000.0)
     verdict = controller.acknowledge(effect_id, plan, instrument="EUR.USD")
     assert verdict["protected"] is True
+    assert verdict["parent_evidence"] == "direct_execution"
+
+
+def test_filled_parent_still_cached_requires_current_position(olap):
+    client, controller, plan, effect_id = _submitted(olap)
+    client.fill_parent(1000, 20000.0)
+    client.set_position(symbol="EUR", currency="USD", units=0.0)
+
+    verdict = controller.acknowledge(
+        effect_id, plan, instrument="EUR.USD")
+
+    assert verdict["protected"] is False
+    assert verdict["parent_evidence"] == "direct_execution"
+    assert any("current position 0" in failure
+               for failure in verdict["failures"])
+    assert olap.get_state("halt") == "hold"
 
 
 def test_filled_parent_absent_with_position_and_children_is_protected(olap):
