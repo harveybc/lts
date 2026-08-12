@@ -3,10 +3,13 @@
 
 Musashi addendum 2026-08-04 §9: the fail-closed hold is cleared only by a
 dedicated owner operation consuming a short-lived, nonce-bound capability.
-This tool is the ONLY writer of the resume-capability store. It refuses
-outside an interactive owner terminal, so no model, LLM, Hermes process or
-chat-driven pipeline can mint. The file (with its nonce) never enters Git
-or chat.
+This tool is the ONLY writer of the resume-capability store. The minted
+file is INERT until the owner signs it with the passphrase-protected
+Ed25519 key — that signature is the human-authentication boundary
+(findings 094/227). The interactive-terminal check and the typed
+confirmation phrase below are ergonomic guards against accidental
+invocation only; they authenticate nobody. The file (with its nonce)
+never enters Git or chat.
 """
 from __future__ import annotations
 
@@ -79,10 +82,14 @@ def main() -> int:
         help=f"expiry window, at most {MAX_RESUME_VALIDITY_SECONDS}")
     args = parser.parse_args()
 
+    # Ergonomic confirmation ONLY — never authentication (finding 227).
+    # The minted file stays inert until signed with the owner's
+    # passphrase-protected key.
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print(
             "REFUSED: minting requires an interactive owner terminal "
-            "(no pipes, no subprocess, no chat-driven invocation).",
+            "(ergonomic guard against accidental invocation; the owner "
+            "signature is the actual authentication).",
             file=sys.stderr,
         )
         return 2
@@ -115,8 +122,9 @@ def main() -> int:
     print("docs/security/OWNER_RESUME_SIGNER_SETUP_2026_08_05.md):")
     print(f"  ssh-keygen -Y sign -f ~/.ssh/lts_owner_resume "
           f"-n lts-ibkr-resume {path}")
-    print("Then run: python tools/ibkr_resume_after_reconciliation.py "
-          "--config <runner config>")
+    print("Then run (naming the file explicitly, finding 227):")
+    print(f"  python tools/ibkr_resume_after_reconciliation.py "
+          f"--config <runner config> --capability {path}")
     return 0
 
 

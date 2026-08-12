@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """Owner CLI: execute the bounded resume_after_reconciliation transition.
 
-Musashi addendum 2026-08-04 §9. Flow (all fail-closed):
+Musashi addendum 2026-08-04 §9, corrected per finding 227. Flow (all
+fail-closed):
 
-1. interactive owner terminal required — a model, LLM, Hermes process or
-   chat pipeline cannot invoke this;
+1. the passphrase-protected owner SIGNATURE over the capability bytes is
+   the human-authentication boundary (findings 094/227); the interactive
+   terminal check below is ergonomic confirmation only — a TTY never
+   authenticates anyone;
 2. loads the runner config, its L1 profile and the durable execution
    ledger; Paper-only bindings are enforced by the profile and the
    capability schema;
-3. loads the single valid resume capability from its protected store;
+3. selects the owner's capability: preferably the file the owner names
+   with ``--capability PATH`` (must be inside the protected store,
+   signed, current, profile-bound, unconsumed); otherwise the single
+   VALID entry after typed classification of every store file —
+   unsigned/malformed/expired/consumed side files are logged and
+   ignored, never counted, and can never deny a valid signed capability;
+   two valid signed current capabilities still refuse (ambiguity);
 4. gathers FRESH direct broker evidence over a read-only TWS session on a
    dedicated client id (positions, open orders, connected account
    fingerprint) immediately before the transition;
@@ -18,6 +27,10 @@ Musashi addendum 2026-08-04 §9. Flow (all fail-closed):
    IMMEDIATE unit);
 7. reports the transition into the incident ledger history and prints a
    sanitized result (hashes and fingerprints only).
+
+``--archive-invalid`` is a SEPARATE explicit operation: it moves typed
+expired/consumed files into ``<store>/archive/`` and exits without
+resuming. The default flow moves nothing and never deletes evidence.
 """
 from __future__ import annotations
 
@@ -37,8 +50,9 @@ from app.ibkr_l1_journal import L1ExecutionOlap  # noqa: E402
 from app.ibkr_model_authority import ContinuousPaperProfile  # noqa: E402
 from app.ibkr_l1_resume import (  # noqa: E402
     ResumeGate,
+    archive_invalid_capabilities,
     resume_after_reconciliation,
-    verify_owner_signature,
+    select_resume_capability,
 )
 
 DEFAULT_INCIDENT_REPO = Path.home() / "Documents/GitHub/agent-multi"
@@ -137,13 +151,29 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True,
                         help="IBKR model-runner config JSON")
+    parser.add_argument("--capability", type=Path, default=None,
+                        help="explicit capability file selected by the"
+                             " owner; must live inside the protected store"
+                             " and be signed, current, profile-bound and"
+                             " unconsumed (finding 227)")
+    parser.add_argument("--archive-invalid", action="store_true",
+                        help="separate archival operation: move typed"
+                             " expired/consumed capability files (with"
+                             " their .sig) into <store>/archive, then exit"
+                             " without resuming; never deletes, never"
+                             " touches valid/unsigned/malformed files")
     parser.add_argument("--incident-repo", type=Path,
                         default=DEFAULT_INCIDENT_REPO)
     parser.add_argument("--machine", default=os.uname().nodename)
     args = parser.parse_args()
 
+    # Ergonomic confirmation ONLY — never authentication (finding 227).
+    # The human-authority boundary is the owner's passphrase-protected
+    # Ed25519 signature, verified during store classification below.
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        print("REFUSED: resume requires an interactive owner terminal.",
+        print("REFUSED: resume requires an interactive owner terminal"
+              " (ergonomic confirmation; the owner signature is the actual"
+              " authentication).",
               file=sys.stderr)
         return 2
 
@@ -159,19 +189,28 @@ def main() -> int:
 
     try:
         gate = ResumeGate()
-        candidates = sorted(gate.store_dir.glob("*.json"))
-        if len(candidates) != 1:
-            raise L1AuthorizationError(
-                f"{len(candidates)} capability file(s) in the store;"
-                " exactly one signed capability is required")
-        capability_file = candidates[0]
-        signature_file = Path(str(capability_file) + ".sig")
-        # Finding 094: the owner's detached Ed25519 signature over the
+        if args.archive_invalid:
+            # Separate explicit archival operation (finding 227 §4): only
+            # typed expired/consumed files move; nothing is deleted; the
+            # valid capability and any unsigned/malformed evidence stay.
+            report = archive_invalid_capabilities(
+                gate.store_dir, profile=profile, olap=olap)
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        # Finding 094/227: the owner's detached Ed25519 signature over the
         # exact capability bytes, verified against the root-pinned
         # allowed-signers file, is the human-authentication boundary.
-        attestation = verify_owner_signature(
-            capability_file, signature_file)
-        payload, record = gate.load(profile)
+        # Classification types every store file BEFORE any ambiguity
+        # check, so unsigned/malformed/expired/consumed side files are
+        # logged and ignored — they can never deny the owner's valid
+        # signed capability. Two valid signed capabilities still refuse.
+        chosen, ignored = select_resume_capability(
+            gate.store_dir, profile=profile, olap=olap,
+            explicit_path=args.capability)
+        for entry in ignored:
+            print(f"IGNORED ({entry.kind}) {entry.path.name}:"
+                  f" {entry.detail}", file=sys.stderr)
+        payload, record = chosen.payload, chosen.record
         evidence = gather_broker_evidence(profile)
         result = resume_after_reconciliation(
             olap=olap, profile=profile, payload=payload, record=record,
