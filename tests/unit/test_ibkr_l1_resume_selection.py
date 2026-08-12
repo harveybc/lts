@@ -19,6 +19,7 @@ Proven here, on ISOLATED temporary stores only (the live owner store
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import subprocess
@@ -27,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+import app.ibkr_l1_resume as resume_module
 from app.ibkr_l1_adapter import L1AuthorizationError, L1Profile
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.ibkr_l1_resume import (
@@ -369,3 +371,54 @@ def test_classification_types_every_file_before_ambiguity(
                      "resume_expired.json": ENTRY_EXPIRED,
                      "resume_spent.json": ENTRY_CONSUMED,
                      "resume_unsigned.json": ENTRY_UNSIGNED}
+
+
+def test_classification_parses_the_exact_bytes_verified(
+        store, signer, olap, monkeypatch):
+    """A replacement between signature verification and parsing cannot
+    authorize bytes other than the immutable snapshot that was verified."""
+    _key, signers = signer
+    profile = make_profile()
+    original_payload = make_payload(profile, nonce="a" * 64)
+    capability = write_capability(
+        store, "resume_original.json", original_payload)
+
+    def replace_after_capture(path, signature_path, *, capability_bytes,
+                              **_kwargs):
+        assert capability_bytes == capability.read_bytes()
+        replacement = make_payload(profile, nonce="b" * 64)
+        path.write_text(json.dumps(replacement, sort_keys=True) + "\n")
+        path.chmod(0o600)
+        return {"verified": True}
+
+    monkeypatch.setattr(
+        resume_module, "verify_owner_signature", replace_after_capture)
+    entries = classify_resume_store(
+        store, profile=profile, olap=olap, now=NOW,
+        allowed_signers=signers, require_root_pin=False)
+
+    assert len(entries) == 1
+    assert entries[0].kind == ENTRY_VALID
+    assert entries[0].payload == original_payload
+    assert entries[0].record.nonce_sha256 == hashlib.sha256(
+        ("a" * 64).encode()).hexdigest()
+
+
+def test_symlinked_capability_is_never_eligible(
+        store, signer, olap, tmp_path):
+    key, signers = signer
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps(make_payload(make_profile())) + "\n")
+    outside.chmod(0o600)
+    sign(key, outside)
+    (store / "resume_link.json").symlink_to(outside)
+    (store / "resume_link.json.sig").symlink_to(
+        outside.with_name(outside.name + ".sig"))
+
+    entries = classify_resume_store(
+        store, profile=make_profile(), olap=olap, now=NOW,
+        allowed_signers=signers, require_root_pin=False)
+
+    assert [(entry.path.name, entry.kind) for entry in entries] == [
+        ("resume_link.json", ENTRY_MALFORMED)]
+    assert "regular file" in entries[0].detail

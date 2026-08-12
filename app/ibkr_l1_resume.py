@@ -187,6 +187,7 @@ def verify_owner_signature(
     *,
     allowed_signers: Path = ALLOWED_SIGNERS_PATH,
     require_root_pin: bool = True,
+    capability_bytes: Optional[bytes] = None,
 ) -> dict[str, Any]:
     """Findings 094/227: a PTY (or a typed public phrase) is ergonomic
     confirmation only — it never authenticates anyone. The capability
@@ -203,23 +204,29 @@ def verify_owner_signature(
     if not signature_path.is_file():
         raise L1AuthorizationError(
             f"detached owner signature {signature_path} is missing")
+    signed_bytes = (
+        capability_path.read_bytes()
+        if capability_bytes is None
+        else bytes(capability_bytes)
+    )
     result = _subprocess.run(
         ["ssh-keygen", "-Y", "verify",
          "-f", str(allowed_signers),
          "-I", OWNER_PRINCIPAL,
          "-n", RESUME_SIGNATURE_NAMESPACE,
          "-s", str(signature_path)],
-        stdin=capability_path.open("rb"),
-        capture_output=True, text=True, timeout=30,
+        input=signed_bytes, capture_output=True, timeout=30,
     )
     if result.returncode != 0:
+        error = result.stderr or result.stdout or b""
+        if isinstance(error, bytes):
+            error = error.decode("utf-8", errors="replace")
         raise L1AuthorizationError(
             "owner signature verification FAILED: "
-            + (result.stderr.strip() or result.stdout.strip())[:200])
+            + str(error).strip()[:200])
     return {"verified": True, "principal": OWNER_PRINCIPAL,
             "namespace": RESUME_SIGNATURE_NAMESPACE,
-            "capability_sha256": hashlib.sha256(
-                capability_path.read_bytes()).hexdigest()}
+            "capability_sha256": hashlib.sha256(signed_bytes).hexdigest()}
 
 
 class ResumeGate(CapabilityGate):
@@ -274,9 +281,9 @@ def classify_resume_store(
     require_root_pin: bool = True,
 ) -> list[StoreEntry]:
     """Type EVERY top-level JSON in the store BEFORE any ambiguity check
-    (finding 227). Classification order per file: signature first (the
-    passphrase-protected owner signature is the authority boundary), then
-    schema/binding validity, then expiry, then consumption. Unsigned,
+    (finding 227). Each regular file is captured once; JSON syntax and the
+    owner signature are checked against that exact immutable byte snapshot,
+    followed by schema/binding validity, expiry and consumption. Unsigned,
     malformed, expired and consumed side files come back typed so callers
     can log and ignore them — they can never deny one valid signed
     capability. Nothing here writes, moves or deletes anything."""
@@ -285,15 +292,27 @@ def classify_resume_store(
     now = now or datetime.now(timezone.utc)
     entries: list[StoreEntry] = []
     for path in sorted(store_dir.glob("*.json")):
-        mode = stat.S_IMODE(os.stat(path).st_mode)
+        path_stat = os.lstat(path)
+        if not stat.S_ISREG(path_stat.st_mode):
+            entries.append(StoreEntry(
+                path, ENTRY_MALFORMED,
+                "capability entry must be a regular file (no links)"))
+            continue
+        mode = stat.S_IMODE(path_stat.st_mode)
         if mode & 0o077:
             entries.append(StoreEntry(
                 path, ENTRY_MALFORMED,
                 f"permissive mode {oct(mode)}; required 0o600"))
             continue
         try:
-            payload = json.loads(path.read_text())
-        except (ValueError, OSError) as error:
+            signed_bytes = path.read_bytes()
+        except OSError as error:
+            entries.append(StoreEntry(
+                path, ENTRY_MALFORMED, f"unreadable capability: {error}"))
+            continue
+        try:
+            payload = json.loads(signed_bytes)
+        except (ValueError, TypeError) as error:
             entries.append(StoreEntry(
                 path, ENTRY_MALFORMED, f"unreadable JSON: {error}"))
             continue
@@ -302,10 +321,11 @@ def classify_resume_store(
             verify_owner_signature(
                 path, signature_path,
                 allowed_signers=allowed_signers,
-                require_root_pin=require_root_pin)
+                require_root_pin=require_root_pin,
+                capability_bytes=signed_bytes)
         except L1AuthorizationError as error:
             entries.append(StoreEntry(
-                path, ENTRY_UNSIGNED, str(error), payload=payload))
+                path, ENTRY_UNSIGNED, str(error)))
             continue
         try:
             record = validate_resume_capability(
