@@ -23,7 +23,10 @@ from app.alpaca_model_runner import ModelSessionStore
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
-from app.model_runner_heartbeat import write_runner_heartbeat
+from app.model_runner_heartbeat import (
+    linear_model_identity,
+    write_runner_heartbeat,
+)
 from app.mt5_execution_bridge import Mt5ExecutionConfig, Mt5ExecutionStore
 
 
@@ -620,12 +623,22 @@ class Mt5ModelRunner:
         self.bridge_store.close()
 
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
+        runtime = {
+            **payload,
+            **linear_model_identity(self.selector),
+            "venue": "mt5_demo",
+            "environment": "demo",
+            "read_only": False,
+            "account_binding_verified": True,
+            "account_fingerprint": self.bridge_config.account_fingerprint,
+            "instrument": self.config["route"]["symbol"],
+        }
         write_runner_heartbeat(
             self.config.get(
                 "heartbeat_path", "~/.local/state/lts/mt5-model-runner-heartbeat.json"
             ),
             schema="lts.mt5.model_runner.heartbeat.v1",
-            payload=payload,
+            payload=runtime,
         )
 
 

@@ -1,11 +1,48 @@
 """Atomic, filesystem-local heartbeat for continuous model runners."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
+
+
+def linear_model_identity(selector: Any) -> dict[str, Any]:
+    """Content identity for the exact linear policy currently in memory.
+
+    The feature and preprocessing hashes are derived from the immutable policy
+    fields used by inference, rather than from paths or labels.  This makes a
+    monitoring heartbeat independently joinable to the selected manifest and
+    prevents a model id from standing in for artifact custody.
+    """
+    policy = selector.policy
+    manifest = selector.manifest
+
+    def digest(payload: Mapping[str, Any]) -> str:
+        body = json.dumps(
+            dict(payload), sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+        return hashlib.sha256(body).hexdigest()
+
+    return {
+        "model_id": policy.model_id,
+        "artifact_sha256": policy.artifact_sha256,
+        "config_sha256": str(manifest["config_sha256"]),
+        "manifest_sha256": str(selector.manifest_sha256),
+        "input_feature_sha256": digest({
+            "feature_contract": "prediction_provider.closed_bars.linear.v1",
+            "feature_names": list(policy.feature_names),
+        }),
+        "preprocessing_sha256": digest({
+            "schema": "prediction_provider.live_linear.standardization.v1",
+            "feature_names": list(policy.feature_names),
+            "means": list(policy.means),
+            "scales": list(policy.scales),
+        }),
+    }
 
 
 def write_runner_heartbeat(

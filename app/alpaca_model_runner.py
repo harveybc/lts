@@ -19,7 +19,10 @@ from app.alpaca_l1 import AlpacaL1Executor, AlpacaL1Profile, AlpacaPaperTradingC
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
-from app.model_runner_heartbeat import write_runner_heartbeat
+from app.model_runner_heartbeat import (
+    linear_model_identity,
+    write_runner_heartbeat,
+)
 from app.runner_retry_taxonomy import classify_runner_exception
 
 
@@ -414,6 +417,7 @@ class AlpacaModelRunner:
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
         runtime = {
             **payload,
+            **linear_model_identity(self.selector),
             "venue": "alpaca_paper",
             "environment": "paper",
             "read_only": False,
