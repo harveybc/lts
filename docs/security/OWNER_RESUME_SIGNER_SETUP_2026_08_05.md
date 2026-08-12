@@ -1,11 +1,13 @@
-# Owner Resume-Signer Setup Packet (finding AUD-F2-20260804-094)
+# Owner Resume-Signer Setup Packet (findings AUD-F2-20260804-094, AUD-F2-20260811-227)
 
 The `resume_after_reconciliation` operation is DISABLED until this
 one-time setup is completed by the owner, by hand. A PTY is not proof of
-a human; from now on the proof is a detached OpenSSH Ed25519 signature
-whose public key is pinned in a **root-owned** file no agent account can
-write, and whose private key opens only with the owner's passphrase —
-a separate human-authenticated boundary.
+a human, and neither is typing a public confirmation phrase — those are
+ergonomic guards against accidental invocation only, never
+authentication. The proof of the owner is a detached OpenSSH Ed25519
+signature whose public key is pinned in a **root-owned** file no agent
+account can write, and whose private key opens only with the owner's
+passphrase — the human-authenticated boundary.
 
 Nothing in this packet is secret. The private key and its passphrase
 must never enter Git, Hermes, chat, logs, or any environment file an
@@ -49,9 +51,17 @@ ls -l /etc/lts/resume_allowed_signers     # must show root root, 0644
        ~/.config/lts/ibkr-resume-capabilities/resume_XXXXXXXX.json
    ```
 
-3. `python tools/ibkr_resume_after_reconciliation.py --config …` —
-   the CLI verifies the signature against the root pin BEFORE anything
-   else; then the serialized, fail-closed core (finding 093) runs.
+3. `python tools/ibkr_resume_after_reconciliation.py --config … \
+   --capability ~/.config/lts/ibkr-resume-capabilities/resume_XXXXXXXX.json`
+   — name the file you just signed (preferred, finding 227). The CLI
+   verifies the signature against the root pin BEFORE anything else;
+   then the serialized, fail-closed core (finding 093) runs.
+
+   `--capability` may be omitted: the CLI then classifies every store
+   file and uses the single VALID one. Unsigned, malformed, expired or
+   already-consumed side files are logged and ignored — they can never
+   deny your signed capability (finding 227). Two valid signed current
+   capabilities still refuse; keep exactly one, or name one.
 
 ## 3. What the verifier enforces (implemented, tested)
 
@@ -61,9 +71,27 @@ ls -l /etc/lts/resume_allowed_signers     # must show root root, 0644
   `owner`, namespace `lts-ibkr-resume`;
 - forged payloads, copied signatures on altered payloads, wrong signers
   and wrong namespaces refuse;
+- an explicit `--capability` must live inside the protected store and be
+  signed, current, profile-bound and unconsumed — anything else is a
+  typed refusal (finding 227);
 - everything the capability already enforced remains: single-use nonce
   burn, ≤15-minute validity, exact venue/account/instrument/effect
   binding, in-transaction precondition re-reads.
+
+## 3b. Store hygiene (optional, finding 227)
+
+Leftover files never block you and are never deleted automatically. To
+tidy the store, run the separate explicit archival operation:
+
+```bash
+python tools/ibkr_resume_after_reconciliation.py --config … --archive-invalid
+```
+
+It moves ONLY files typed expired or consumed (plus their `.sig`) into
+`~/.config/lts/ibkr-resume-capabilities/archive/`, then exits without
+resuming. Valid capabilities are never moved; unsigned/malformed files
+are also left in place as potential tamper evidence for you to inspect.
+The default resume flow moves nothing.
 
 ## 4. Rotation / revocation
 

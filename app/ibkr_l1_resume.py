@@ -5,8 +5,11 @@ broker is proven flat, and no code path may silently clear it. This module
 implements the one dedicated, bounded transition ``halt: hold -> none``:
 
 1. Paper/Demo only — the capability schema hard-binds venue ``ibkr_paper``,
-   loopback host and the TWS Paper port; the mint tool is TTY-only, so no
-   model, LLM, Hermes process or Telegram text can invoke it;
+   loopback host and the TWS Paper port; the passphrase-protected owner
+   SIGNATURE over the capability bytes is the human-authentication
+   boundary (findings 094/227) — the mint tool's TTY check is ergonomic
+   confirmation only and a minted file stays inert until the owner signs
+   it;
 2. consumes a short-lived, nonce-bound owner capability exactly once
    (UNIQUE nonce/digest burn inside the transaction);
 3. binds exact venue, environment, account fingerprint, instrument and the
@@ -30,7 +33,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import stat
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -57,6 +63,12 @@ _REQUIRED_KEYS = (
     "account_fingerprint", "asset_id", "instrument", "resume_of_effect_id",
     "issued_at", "expires_at", "nonce",
 )
+
+
+class ResumeCapabilityExpired(L1AuthorizationError):
+    """Typed expiry (finding 227): store classification distinguishes an
+    expired capability from a malformed one, so an expired side file is
+    ignorable and archivable instead of an anonymous refusal."""
 
 
 def validate_resume_capability(
@@ -121,7 +133,7 @@ def validate_resume_capability(
         raise L1AuthorizationError(
             f"resume capability validity exceeds {MAX_RESUME_VALIDITY_SECONDS}s")
     if now >= expires_at:
-        raise L1AuthorizationError("resume capability is expired")
+        raise ResumeCapabilityExpired("resume capability is expired")
     nonce = str(payload["nonce"])
     if len(nonce) < 32 or any(c not in "0123456789abcdef" for c in nonce):
         raise L1AuthorizationError(
@@ -148,30 +160,18 @@ ALLOWED_SIGNERS_PATH = Path("/etc/lts/resume_allowed_signers")
 OWNER_PRINCIPAL = "owner"
 
 
-def verify_owner_signature(
-    capability_path: Path,
-    signature_path: Path,
-    *,
-    allowed_signers: Path = ALLOWED_SIGNERS_PATH,
-    require_root_pin: bool = True,
-) -> dict[str, Any]:
-    """Finding 094: a PTY is not proof of a human owner. The capability
-    file must carry a detached OpenSSH Ed25519 signature
-    (``ssh-keygen -Y sign``) whose key is pinned in a ROOT-OWNED
-    allowed-signers file the agent user cannot write. The private key
-    lives behind the owner's passphrase — a separate human-authenticated
-    boundary. Missing pin, missing signature, wrong signer, wrong
-    namespace or any byte change in the payload refuses; while the pin
-    file does not exist, resume is structurally disabled."""
-    import os as _os
-    import subprocess as _subprocess
-
+def _require_signer_pin(
+    allowed_signers: Path, require_root_pin: bool
+) -> None:
+    """The root-pinned allowed-signers file is a store-wide precondition:
+    while it is absent or weak, resume is structurally disabled for every
+    capability, so this refusal is raised before per-file classification."""
     if not allowed_signers.is_file():
         raise L1AuthorizationError(
             f"owner-signer pin {allowed_signers} does not exist — resume"
             " is disabled until the owner completes the signer setup"
             " packet (docs/security/OWNER_RESUME_SIGNER_SETUP)")
-    pin_stat = _os.stat(allowed_signers)
+    pin_stat = os.stat(allowed_signers)
     if require_root_pin and pin_stat.st_uid != 0:
         raise L1AuthorizationError(
             f"owner-signer pin {allowed_signers} is not root-owned — an"
@@ -179,6 +179,27 @@ def verify_owner_signature(
     if pin_stat.st_mode & 0o022:
         raise L1AuthorizationError(
             "owner-signer pin must not be group/other-writable")
+
+
+def verify_owner_signature(
+    capability_path: Path,
+    signature_path: Path,
+    *,
+    allowed_signers: Path = ALLOWED_SIGNERS_PATH,
+    require_root_pin: bool = True,
+) -> dict[str, Any]:
+    """Findings 094/227: a PTY (or a typed public phrase) is ergonomic
+    confirmation only — it never authenticates anyone. The capability
+    file must carry a detached OpenSSH Ed25519 signature
+    (``ssh-keygen -Y sign``) whose key is pinned in a ROOT-OWNED
+    allowed-signers file the agent user cannot write. The private key
+    lives behind the owner's passphrase — THAT is the human-authenticated
+    boundary. Missing pin, missing signature, wrong signer, wrong
+    namespace or any byte change in the payload refuses; while the pin
+    file does not exist, resume is structurally disabled."""
+    import subprocess as _subprocess
+
+    _require_signer_pin(allowed_signers, require_root_pin)
     if not signature_path.is_file():
         raise L1AuthorizationError(
             f"detached owner signature {signature_path} is missing")
@@ -208,6 +229,209 @@ class ResumeGate(CapabilityGate):
 
     def __init__(self, store_dir: Optional[Path] = None) -> None:
         super().__init__(store_dir or RESUME_STORE)
+
+
+# ── finding 227: typed store classification, owner selection, archival ──
+
+ENTRY_VALID = "valid"
+ENTRY_UNSIGNED = "unsigned"
+ENTRY_MALFORMED = "malformed"
+ENTRY_EXPIRED = "expired"
+ENTRY_CONSUMED = "consumed"
+
+
+@dataclass(frozen=True)
+class StoreEntry:
+    """One top-level JSON file in the resume-capability store, typed."""
+
+    path: Path
+    kind: str  # ENTRY_VALID | ENTRY_UNSIGNED | ENTRY_MALFORMED |
+    #            ENTRY_EXPIRED | ENTRY_CONSUMED
+    detail: str
+    payload: Optional[dict[str, Any]] = field(default=None, repr=False)
+    record: Optional[CapabilityRecord] = field(default=None, repr=False)
+
+
+def _check_store_dir(store_dir: Path) -> None:
+    if not store_dir.is_dir():
+        raise L1AuthorizationError(
+            f"capability store {store_dir} does not exist; the owner must"
+            " mint a capability with tools/mint_resume_capability.py")
+    mode = stat.S_IMODE(os.stat(store_dir).st_mode)
+    if mode & 0o077:
+        raise L1AuthorizationError(
+            f"capability store {store_dir} has permissive mode {oct(mode)};"
+            " required 0o700")
+
+
+def classify_resume_store(
+    store_dir: Path,
+    *,
+    profile: L1Profile,
+    olap: Optional[L1ExecutionOlap] = None,
+    now: Optional[datetime] = None,
+    allowed_signers: Path = ALLOWED_SIGNERS_PATH,
+    require_root_pin: bool = True,
+) -> list[StoreEntry]:
+    """Type EVERY top-level JSON in the store BEFORE any ambiguity check
+    (finding 227). Classification order per file: signature first (the
+    passphrase-protected owner signature is the authority boundary), then
+    schema/binding validity, then expiry, then consumption. Unsigned,
+    malformed, expired and consumed side files come back typed so callers
+    can log and ignore them — they can never deny one valid signed
+    capability. Nothing here writes, moves or deletes anything."""
+    _check_store_dir(store_dir)
+    _require_signer_pin(allowed_signers, require_root_pin)
+    now = now or datetime.now(timezone.utc)
+    entries: list[StoreEntry] = []
+    for path in sorted(store_dir.glob("*.json")):
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        if mode & 0o077:
+            entries.append(StoreEntry(
+                path, ENTRY_MALFORMED,
+                f"permissive mode {oct(mode)}; required 0o600"))
+            continue
+        try:
+            payload = json.loads(path.read_text())
+        except (ValueError, OSError) as error:
+            entries.append(StoreEntry(
+                path, ENTRY_MALFORMED, f"unreadable JSON: {error}"))
+            continue
+        signature_path = Path(str(path) + ".sig")
+        try:
+            verify_owner_signature(
+                path, signature_path,
+                allowed_signers=allowed_signers,
+                require_root_pin=require_root_pin)
+        except L1AuthorizationError as error:
+            entries.append(StoreEntry(
+                path, ENTRY_UNSIGNED, str(error), payload=payload))
+            continue
+        try:
+            record = validate_resume_capability(
+                payload, profile=profile, now=now)
+        except ResumeCapabilityExpired as error:
+            entries.append(StoreEntry(
+                path, ENTRY_EXPIRED, str(error), payload=payload))
+            continue
+        except (L1AuthorizationError, ValueError, TypeError) as error:
+            entries.append(StoreEntry(
+                path, ENTRY_MALFORMED, str(error), payload=payload))
+            continue
+        if olap is not None and (
+            olap.capability_row(record.capability_sha256) is not None
+            or olap.nonce_consumed(record.nonce_sha256)
+        ):
+            entries.append(StoreEntry(
+                path, ENTRY_CONSUMED,
+                "capability already consumed; a spent capability can never"
+                " clear a later hold", payload=payload, record=record))
+            continue
+        entries.append(StoreEntry(
+            path, ENTRY_VALID, "signed, current, profile-bound, unconsumed",
+            payload=payload, record=record))
+    return entries
+
+
+def select_resume_capability(
+    store_dir: Path,
+    *,
+    profile: L1Profile,
+    olap: Optional[L1ExecutionOlap] = None,
+    explicit_path: Optional[Path] = None,
+    now: Optional[datetime] = None,
+    allowed_signers: Path = ALLOWED_SIGNERS_PATH,
+    require_root_pin: bool = True,
+) -> tuple[StoreEntry, list[StoreEntry]]:
+    """Return ``(chosen, ignored)`` — the owner's capability plus the typed
+    side files that were logged and ignored. Fail-closed rules
+    (finding 227):
+
+    - ``explicit_path`` (the owner's ``--capability PATH``) is preferred:
+      it must live INSIDE the protected store and classify as valid
+      (signed, current, profile-bound, unconsumed); any other typing is a
+      typed refusal. Explicit selection resolves ambiguity by naming.
+    - without an explicit path, exactly one VALID entry is required;
+      unsigned/malformed/expired/consumed side files are ignored and can
+      never deny it, but TWO OR MORE valid signed current capabilities
+      still refuse (ambiguity).
+    """
+    entries = classify_resume_store(
+        store_dir, profile=profile, olap=olap, now=now,
+        allowed_signers=allowed_signers, require_root_pin=require_root_pin)
+
+    if explicit_path is not None:
+        explicit = Path(os.path.expanduser(str(explicit_path))).resolve()
+        if explicit.parent != store_dir.resolve():
+            raise L1AuthorizationError(
+                f"--capability {explicit} is outside the protected store"
+                f" {store_dir}; the owner selects a file inside the store")
+        chosen = next(
+            (e for e in entries if e.path.resolve() == explicit), None)
+        if chosen is None:
+            raise L1AuthorizationError(
+                f"--capability {explicit.name} does not exist in the store"
+                " (only top-level *.json files are eligible)")
+        if chosen.kind != ENTRY_VALID:
+            raise L1AuthorizationError(
+                f"--capability {explicit.name} is {chosen.kind}:"
+                f" {chosen.detail}")
+        return chosen, [e for e in entries if e.path != chosen.path]
+
+    valid = [e for e in entries if e.kind == ENTRY_VALID]
+    ignored = [e for e in entries if e.kind != ENTRY_VALID]
+    if not valid:
+        reasons = "; ".join(
+            f"{e.path.name}: {e.kind} ({e.detail})" for e in ignored)
+        raise L1AuthorizationError(
+            "no valid signed capability in the store; typed side files: "
+            + (reasons or "store is empty"))
+    if len(valid) > 1:
+        names = ", ".join(e.path.name for e in valid)
+        raise L1AuthorizationError(
+            f"{len(valid)} valid signed current capabilities present"
+            f" ({names}); ambiguity is a refusal — the owner keeps exactly"
+            " one, or names one with --capability")
+    return valid[0], ignored
+
+
+def archive_invalid_capabilities(
+    store_dir: Path,
+    *,
+    profile: L1Profile,
+    olap: Optional[L1ExecutionOlap] = None,
+    now: Optional[datetime] = None,
+    allowed_signers: Path = ALLOWED_SIGNERS_PATH,
+    require_root_pin: bool = True,
+    archive_dir: Optional[Path] = None,
+) -> dict[str, list[str]]:
+    """Separate, explicit archival operation (finding 227 §4). Moves ONLY
+    files typed EXPIRED or CONSUMED (with their ``.sig``) into
+    ``<store>/archive/``; never deletes anything, never touches a VALID
+    capability, and deliberately leaves UNSIGNED/MALFORMED files in place
+    as potential tamper evidence for the owner. The default resume flow
+    never calls this — it moves nothing."""
+    entries = classify_resume_store(
+        store_dir, profile=profile, olap=olap, now=now,
+        allowed_signers=allowed_signers, require_root_pin=require_root_pin)
+    destination = archive_dir or (store_dir / "archive")
+    archived: list[str] = []
+    kept: list[str] = []
+    for entry in entries:
+        if entry.kind not in (ENTRY_EXPIRED, ENTRY_CONSUMED):
+            kept.append(f"{entry.path.name}: {entry.kind}")
+            continue
+        destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        for source in (entry.path, Path(str(entry.path) + ".sig")):
+            if not source.is_file():
+                continue
+            target = destination / source.name
+            if target.exists():
+                target = destination / f"{stamp}_{source.name}"
+            source.rename(target)
+        archived.append(f"{entry.path.name}: {entry.kind}")
+    return {"archived": archived, "kept": kept}
 
 
 def _evidence_or_refuse(
