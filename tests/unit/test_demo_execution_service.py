@@ -329,7 +329,7 @@ def test_lost_ack_blocks_new_risk_until_reconciled(tmp_path):
                       "requested", reconciliation_required=True)
     service.apply_execution_event(unknown)
     blocked = _process(service, _intent(object_id="ai-next"))
-    assert blocked["outcome"] == "rejected"
+    assert blocked["outcome"] == "deferred"
     assert blocked["reason"] == "reconciliation_required_before_new_risk"
 
 
@@ -452,7 +452,57 @@ def test_hold_state_survives_restart(tmp_path):
         ZeroNetworkSink(),
     )
     blocked = _process(reborn, _intent(object_id="ai-reborn"))
+    assert blocked["outcome"] == "deferred"
     assert blocked["reason"] == "halted:hold"
+
+
+def test_temporary_hold_defers_then_same_bar_materializes_once(tmp_path):
+    service = _service(tmp_path)
+    intent = _intent(object_id="ai-deferred")
+    service.olap.set_state("halt", "hold")
+    blocked = _process(service, intent)
+    assert blocked == {
+        "outcome": "deferred", "reason": "halted:hold", "replayed": False,
+    }
+    idem = f"{intent.object_id}:{intent.as_of.isoformat()}"
+    assert service.olap.recorded_decision(idem) is None
+    assert service.olap._con.execute(
+        "SELECT COUNT(*) FROM decision_deferrals WHERE idempotency_key=?",
+        (idem,),
+    ).fetchone()[0] == 1
+
+    service.olap.set_state("halt", "none")
+    accepted = _process(service, intent)
+    assert accepted["outcome"] == "would_be_order"
+    replay = _process(service, intent)
+    assert replay["outcome"] == "would_be_order"
+    assert replay["replayed"] is True
+    assert service.sink.would_be_orders == 1
+
+
+def test_legacy_hold_rejection_is_superseded_without_deleting_evidence(tmp_path):
+    service = _service(tmp_path)
+    intent = _intent(object_id="ai-legacy-hold")
+    idem = f"{intent.object_id}:{intent.as_of.isoformat()}"
+    service.olap.record_decision(
+        idem, "rejected", "halted:hold", intent.model_dump_json(), None,
+        reference_price=1.0, quote_time=NOW.isoformat(),
+        capability_evidence="live_observed",
+    )
+
+    accepted = _process(service, intent)
+    assert accepted["outcome"] == "would_be_order"
+    assert service.olap._con.execute(
+        "SELECT outcome, reason FROM decisions WHERE idempotency_key=?", (idem,)
+    ).fetchone() == ("rejected", "halted:hold")
+    assert service.olap._con.execute(
+        "SELECT COUNT(*) FROM decision_supersessions WHERE idempotency_key=?",
+        (idem,),
+    ).fetchone()[0] == 1
+    assert service.olap._con.execute(
+        "SELECT outcome FROM decision_revisions WHERE idempotency_key=?", (idem,)
+    ).fetchone()[0] == "would_be_order"
+    assert service.olap.decision_intent(idem)["object_id"].startswith("oi2-")
 
 
 def test_config_rejects_risk_enabling_command_verbs(tmp_path):

@@ -79,3 +79,77 @@ def test_missing_lineage_refuses(tmp_path):
             store.record_due_bar_decision(broken)
     assert store.due_bar_decisions() == []
     store.close()
+
+
+def test_deferred_bar_can_be_revised_once_after_hold_clears(tmp_path):
+    store = L1ExecutionOlap(tmp_path / "ledger.sqlite")
+    assert store.record_due_bar_decision(_fact(
+        outcome="deferred", reason="halted:hold",
+        effect_or_command_id=None,
+    ))
+    assert store.record_due_bar_decision(_fact())
+
+    rows = store.due_bar_decisions()
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "would_be_order"
+    assert rows[0]["reason"] is None
+    assert rows[0]["effect_or_command_id"] == "l1e-abc"
+    revision = store._con.execute(
+        "SELECT prior_fact_json, replacement_fact_json "
+        "FROM due_bar_decision_revisions"
+    ).fetchone()
+    assert '"outcome":"deferred"' in revision[0]
+    assert '"outcome":"would_be_order"' in revision[1]
+    store.close()
+
+
+def test_legacy_hold_rejection_can_be_revised_but_final_fact_cannot(tmp_path):
+    store = L1ExecutionOlap(tmp_path / "ledger.sqlite")
+    assert store.record_due_bar_decision(_fact(
+        outcome="rejected", reason="halted:hold",
+        effect_or_command_id=None,
+    ))
+    assert store.record_due_bar_decision(_fact())
+    with pytest.raises(DemoExecutionError, match="cannot be revised"):
+        store.record_due_bar_decision(_fact(
+            outcome="rejected", reason="some_new_terminal_reason",
+            effect_or_command_id=None,
+        ))
+    assert store.due_bar_decisions()[0]["outcome"] == "would_be_order"
+    store.close()
+
+
+def test_due_bar_revision_refuses_lineage_drift(tmp_path):
+    store = L1ExecutionOlap(tmp_path / "ledger.sqlite")
+    assert store.record_due_bar_decision(_fact(
+        outcome="deferred", reason="halted:hold",
+        effect_or_command_id=None,
+    ))
+    with pytest.raises(DemoExecutionError, match="lineage drift"):
+        store.record_due_bar_decision(_fact(artifact_sha256="d" * 64))
+    assert store.due_bar_decisions()[0]["outcome"] == "deferred"
+    store.close()
+
+
+def test_l1_outbox_reads_effective_revision_not_legacy_rejection(tmp_path):
+    store = L1ExecutionOlap(tmp_path / "ledger.sqlite")
+    store.record_decision(
+        "idem-legacy", "rejected", "halted:hold", "{}", None,
+        reference_price=1.0, quote_time="2026-08-05T08:00:00+00:00",
+        capability_evidence="live_observed",
+    )
+    assert store.supersede_transient_rejection(
+        "idem-legacy", cause="owner_resume_reconciled"
+    )
+    store.record_decision(
+        "idem-legacy", "would_be_order", None,
+        '{"object_id":"oi2-revised"}', {"adapter": "ibkr"},
+        reference_price=1.0, quote_time="2026-08-05T08:00:01+00:00",
+        capability_evidence="live_observed",
+    )
+    pending = store.l1_pending_decisions("would_be_order")
+    assert [row["idempotency_key"] for row in pending] == ["idem-legacy"]
+    assert store.decision_intent_json("idem-legacy") == (
+        '{"object_id":"oi2-revised"}'
+    )
+    store.close()

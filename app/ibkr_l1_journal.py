@@ -22,6 +22,7 @@ A missing fact never becomes zero or success (auditor order 2026-08-02).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Optional
 
@@ -174,13 +175,13 @@ class L1ExecutionOlap(DemoExecutionOlap):
         )
 
     def record_due_bar_decision(self, fact: dict[str, Any]) -> bool:
-        """Order C1: exactly ONE normalized decision fact per due closed
-        bar per venue/model/timeframe, HOLDs and refusals included.
+        """Record one effective fact per due bar, preserving revisions.
 
-        Returns True when this call inserted the fact; a duplicate bar
-        (restart, replay, repeated tick) returns False and changes
-        nothing — the UNIQUE constraint makes one-decision-per-bar
-        structural."""
+        Normal replay changes nothing. A temporary hold/reconciliation fact
+        may be revised after the condition clears; its prior value is appended
+        to ``due_bar_decision_revisions`` before the effective row changes.
+        Terminal decisions remain immutable.
+        """
         required = (
             "venue", "account_fingerprint", "asset_id", "instrument",
             "timeframe", "bar_close", "decided_at", "input_sha256",
@@ -205,26 +206,104 @@ class L1ExecutionOlap(DemoExecutionOlap):
             " decision_id TEXT NOT NULL, effect_or_command_id TEXT,"
             " UNIQUE(venue, model_id, timeframe, bar_close))"
         )
-        cursor = self._con.execute(
-            "INSERT OR IGNORE INTO due_bar_decisions VALUES"
-            " (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                fact["venue"], fact["account_fingerprint"],
-                fact["asset_id"], fact["instrument"], fact["timeframe"],
-                fact["bar_close"], fact["decided_at"],
-                fact.get("feature_cutoff"), fact["input_sha256"],
-                fact["config_sha256"], fact["model_id"],
-                fact["artifact_sha256"], fact.get("manifest_sha256"),
-                fact["action"], fact.get("score"), fact["outcome"],
-                fact.get("reason"),
-                json.dumps(fact.get("risk_envelope"), sort_keys=True)
-                if fact.get("risk_envelope") is not None else None,
-                json.dumps(fact.get("quote"), sort_keys=True)
-                if fact.get("quote") is not None else None,
-                fact["decision_id"], fact.get("effect_or_command_id"),
-            ),
+        self._con.execute(
+            "CREATE TABLE IF NOT EXISTS due_bar_decision_revisions ("
+            " seq INTEGER PRIMARY KEY AUTOINCREMENT, revised_at TEXT NOT NULL,"
+            " venue TEXT NOT NULL, model_id TEXT NOT NULL,"
+            " timeframe TEXT NOT NULL, bar_close TEXT NOT NULL,"
+            " prior_fact_json TEXT NOT NULL, replacement_fact_json TEXT NOT NULL,"
+            " prior_sha256 TEXT NOT NULL, replacement_sha256 TEXT NOT NULL)"
         )
-        return cursor.rowcount == 1
+        columns = (
+            "venue", "account_fingerprint", "asset_id", "instrument",
+            "timeframe", "bar_close", "decided_at", "feature_cutoff",
+            "input_sha256", "config_sha256", "model_id", "artifact_sha256",
+            "manifest_sha256", "action", "score", "outcome", "reason",
+            "risk_envelope_json", "quote_json", "decision_id",
+            "effect_or_command_id",
+        )
+        values = (
+            fact["venue"], fact["account_fingerprint"], fact["asset_id"],
+            fact["instrument"], fact["timeframe"], fact["bar_close"],
+            fact["decided_at"], fact.get("feature_cutoff"),
+            fact["input_sha256"], fact["config_sha256"], fact["model_id"],
+            fact["artifact_sha256"], fact.get("manifest_sha256"),
+            fact["action"], fact.get("score"), fact["outcome"],
+            fact.get("reason"),
+            json.dumps(fact.get("risk_envelope"), sort_keys=True)
+            if fact.get("risk_envelope") is not None else None,
+            json.dumps(fact.get("quote"), sort_keys=True)
+            if fact.get("quote") is not None else None,
+            fact["decision_id"], fact.get("effect_or_command_id"),
+        )
+        key = (fact["venue"], fact["model_id"], fact["timeframe"],
+               fact["bar_close"])
+        with self.atomic_unit():
+            row = self._con.execute(
+                "SELECT * FROM due_bar_decisions WHERE venue=? AND model_id=? "
+                "AND timeframe=? AND bar_close=?", key,
+            ).fetchone()
+            if row is None:
+                self._con.execute(
+                    "INSERT INTO due_bar_decisions VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values,
+                )
+                return True
+
+            prior = dict(zip(columns, row))
+            same_effective_result = (
+                prior["outcome"] == fact["outcome"]
+                and prior["reason"] == fact.get("reason")
+                and prior["action"] == fact["action"]
+                and prior["decision_id"] == fact["decision_id"]
+            )
+            if same_effective_result:
+                return False
+
+            transient = (
+                prior["outcome"] == "deferred"
+                or prior["reason"] in (
+                    "halted:hold",
+                    "reconciliation_required_before_new_risk",
+                )
+            )
+            if not transient:
+                raise DemoExecutionError(
+                    "terminal due-bar decision cannot be revised"
+                )
+            replacement = dict(zip(columns, values))
+            lineage = (
+                "venue", "account_fingerprint", "asset_id", "instrument",
+                "timeframe", "bar_close", "feature_cutoff", "input_sha256",
+                "config_sha256", "model_id", "artifact_sha256",
+                "manifest_sha256", "action", "decision_id",
+            )
+            drift = [name for name in lineage
+                     if prior[name] != replacement[name]]
+            if drift:
+                raise DemoExecutionError(
+                    f"due-bar revision lineage drift: {drift}"
+                )
+            prior_json = json.dumps(prior, sort_keys=True, separators=(",", ":"))
+            replacement_json = json.dumps(
+                replacement, sort_keys=True, separators=(",", ":")
+            )
+            self._con.execute(
+                "INSERT INTO due_bar_decision_revisions "
+                "(revised_at,venue,model_id,timeframe,bar_close,prior_fact_json,"
+                "replacement_fact_json,prior_sha256,replacement_sha256) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (_utc_now().isoformat(), *key, prior_json, replacement_json,
+                 hashlib.sha256(prior_json.encode()).hexdigest(),
+                 hashlib.sha256(replacement_json.encode()).hexdigest()),
+            )
+            assignments = ",".join(f"{name}=?" for name in columns[1:])
+            self._con.execute(
+                f"UPDATE due_bar_decisions SET {assignments} "
+                "WHERE venue=? AND model_id=? AND timeframe=? AND bar_close=?",
+                (*values[1:], *key),
+            )
+            return True
 
     def due_bar_decisions(
         self, *, venue: str | None = None, since: str | None = None
@@ -430,13 +509,23 @@ class L1ExecutionOlap(DemoExecutionOlap):
     def l1_pending_decisions(self, outcome: str) -> list[dict[str, Any]]:
         """Committed L0 decisions of one outcome that have no L1 effect yet.
 
-        The outbox is the decisions table itself (finding 066: no parallel
-        source of truth): a decision becomes consumed exactly when an
-        ``l1_effects`` row exists for its idempotency key.
+        The outbox is the effective L0 decision stream (finding 066: no
+        parallel source of truth). A narrowly authorized revision supersedes
+        a legacy temporary rejection without deleting it; an ``l1_effects``
+        row still consumes the idempotency key exactly once.
         """
         rows = self._con.execute(
-            "SELECT idempotency_key, intent_json, capability_evidence,"
-            " reference_price, quote_time, decided_at FROM decisions "
+            "WITH effective AS ("
+            " SELECT idempotency_key, intent_json, capability_evidence,"
+            " reference_price, quote_time, decided_at, outcome "
+            " FROM decision_revisions "
+            " UNION ALL "
+            " SELECT d.idempotency_key, d.intent_json, d.capability_evidence,"
+            " d.reference_price, d.quote_time, d.decided_at, d.outcome "
+            " FROM decisions d WHERE d.idempotency_key NOT IN "
+            " (SELECT idempotency_key FROM decision_supersessions)"
+            ") SELECT idempotency_key, intent_json, capability_evidence,"
+            " reference_price, quote_time, decided_at FROM effective "
             "WHERE outcome=? AND intent_json IS NOT NULL "
             "AND idempotency_key NOT IN (SELECT idempotency_key FROM l1_effects) "
             "ORDER BY decided_at",
@@ -456,8 +545,12 @@ class L1ExecutionOlap(DemoExecutionOlap):
 
     def decision_intent_json(self, idempotency_key: str) -> Optional[str]:
         row = self._con.execute(
-            "SELECT intent_json FROM decisions WHERE idempotency_key=?",
-            (idempotency_key,),
+            "SELECT intent_json FROM decision_revisions "
+            "WHERE idempotency_key=? UNION ALL "
+            "SELECT d.intent_json FROM decisions d "
+            "WHERE d.idempotency_key=? AND d.idempotency_key NOT IN "
+            "(SELECT idempotency_key FROM decision_supersessions) LIMIT 1",
+            (idempotency_key, idempotency_key),
         ).fetchone()
         return None if row is None else row[0]
 

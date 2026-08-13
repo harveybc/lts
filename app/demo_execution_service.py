@@ -55,6 +55,10 @@ class DemoExecutionError(RuntimeError):
     """Fail-closed rejection; the reason is persisted as a decision fact."""
 
 
+class DemoExecutionDeferred(DemoExecutionError):
+    """A temporary safety condition blocked this decision attempt."""
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -189,6 +193,33 @@ CREATE TABLE IF NOT EXISTS decisions (
     payload_json TEXT,
     payload_sha256 TEXT
 );
+CREATE TABLE IF NOT EXISTS decision_deferrals (
+    idempotency_key TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    intent_json TEXT,
+    PRIMARY KEY (idempotency_key, reason)
+);
+CREATE TABLE IF NOT EXISTS decision_supersessions (
+    idempotency_key TEXT PRIMARY KEY,
+    superseded_at TEXT NOT NULL,
+    prior_outcome TEXT NOT NULL,
+    prior_reason TEXT,
+    cause TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS decision_revisions (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    decided_at TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    reason TEXT,
+    reference_price REAL,
+    quote_time TEXT,
+    capability_evidence TEXT,
+    intent_json TEXT,
+    payload_json TEXT,
+    payload_sha256 TEXT
+);
 CREATE TABLE IF NOT EXISTS reservations (
     reservation_id TEXT PRIMARY KEY,
     idempotency_key TEXT NOT NULL,
@@ -299,12 +330,33 @@ class DemoExecutionOlap:
 
     # -- decisions / idempotency ------------------------------------------
     def recorded_decision(self, idempotency_key: str) -> Optional[dict[str, Any]]:
+        revision = self._con.execute(
+            "SELECT outcome, reason, payload_json, payload_sha256 "
+            "FROM decision_revisions WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if revision is not None:
+            return {
+                "outcome": revision[0],
+                "reason": revision[1],
+                "payload": (
+                    None if revision[2] is None else json.loads(revision[2])
+                ),
+                "payload_sha256": revision[3],
+                "replayed": True,
+            }
         row = self._con.execute(
             "SELECT outcome, reason, payload_json, payload_sha256 FROM decisions "
             "WHERE idempotency_key=?",
             (idempotency_key,),
         ).fetchone()
         if row is None:
+            return None
+        superseded = self._con.execute(
+            "SELECT 1 FROM decision_supersessions WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if superseded is not None:
             return None
         return {
             "outcome": row[0],
@@ -313,6 +365,37 @@ class DemoExecutionOlap:
             "payload_sha256": row[3],
             "replayed": True,
         }
+
+    def defer_decision(
+        self, idempotency_key: str, reason: str, intent_json: Optional[str]
+    ) -> None:
+        """Persist one idempotent, nonterminal refusal observation."""
+        self._con.execute(
+            "INSERT OR IGNORE INTO decision_deferrals VALUES (?,?,?,?)",
+            (idempotency_key, _utc_now().isoformat(), reason, intent_json),
+        )
+
+    def supersede_transient_rejection(
+        self, idempotency_key: str, *, cause: str
+    ) -> bool:
+        """Append a marker that lets a legacy transient rejection retry.
+
+        The original decision remains untouched. Only the two conditions that
+        represent temporary safety state may be superseded.
+        """
+        row = self._con.execute(
+            "SELECT outcome, reason FROM decisions WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if row is None or row[0] != "rejected" or row[1] not in (
+            "halted:hold", "reconciliation_required_before_new_risk"
+        ):
+            return False
+        cursor = self._con.execute(
+            "INSERT OR IGNORE INTO decision_supersessions VALUES (?,?,?,?,?)",
+            (idempotency_key, _utc_now().isoformat(), row[0], row[1], cause),
+        )
+        return cursor.rowcount == 1
 
     def record_decision(
         self,
@@ -331,21 +414,27 @@ class DemoExecutionOlap:
             if payload_json is None
             else hashlib.sha256(payload_json.encode()).hexdigest()
         )
-        self._con.execute(
-            "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                idempotency_key,
-                _utc_now().isoformat(),
-                outcome,
-                reason,
-                reference_price,
-                quote_time,
-                capability_evidence,
-                intent_json,
-                payload_json,
-                digest,
-            ),
+        values = (
+            idempotency_key, _utc_now().isoformat(), outcome, reason,
+            reference_price, quote_time, capability_evidence, intent_json,
+            payload_json, digest,
         )
+        superseded = self._con.execute(
+            "SELECT 1 FROM decision_supersessions WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if superseded is None:
+            self._con.execute(
+                "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?)", values
+            )
+        else:
+            self._con.execute(
+                "INSERT INTO decision_revisions "
+                "(idempotency_key,decided_at,outcome,reason,reference_price,"
+                "quote_time,capability_evidence,intent_json,payload_json,"
+                "payload_sha256) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
         return digest
 
     # -- reservations + exposures (findings 040, 044, 049) -------------------
@@ -433,10 +522,17 @@ class DemoExecutionOlap:
 
     def decision_intent(self, idempotency_key: str) -> Optional[dict[str, Any]]:
         row = self._con.execute(
-            "SELECT intent_json, capability_evidence FROM decisions "
+            "SELECT intent_json, capability_evidence FROM decision_revisions "
             "WHERE idempotency_key=?",
             (idempotency_key,),
         ).fetchone()
+        if row is None:
+            row = self._con.execute(
+                "SELECT intent_json, capability_evidence FROM decisions "
+                "WHERE idempotency_key=? AND idempotency_key NOT IN "
+                "(SELECT idempotency_key FROM decision_supersessions)",
+                (idempotency_key,),
+            ).fetchone()
         if row is None or row[0] is None:
             return None
         intent = json.loads(row[0])
@@ -449,10 +545,16 @@ class DemoExecutionOlap:
         """The immutable decision intent for one order-intent id (finding
         074): the ledger, not the report, says what class an order was."""
         row = self._con.execute(
-            "SELECT intent_json FROM decisions "
+            "SELECT intent_json FROM decision_revisions "
             "WHERE intent_json IS NOT NULL "
-            "AND json_extract(intent_json, '$.object_id')=?",
-            (order_intent_id,),
+            "AND json_extract(intent_json, '$.object_id')=? "
+            "UNION ALL "
+            "SELECT d.intent_json FROM decisions d "
+            "WHERE d.intent_json IS NOT NULL "
+            "AND d.idempotency_key NOT IN "
+            "(SELECT idempotency_key FROM decision_supersessions) "
+            "AND json_extract(d.intent_json, '$.object_id')=? LIMIT 1",
+            (order_intent_id, order_intent_id),
         ).fetchone()
         return None if row is None else json.loads(row[0])
 
@@ -969,9 +1071,35 @@ class DemoExecutionService:
         quote_time = quote_time or now
         idem = f"{intent.object_id}:{intent.as_of.isoformat()}"
 
+        halt = self.olap.get_state("halt", "none")
+        reconciliation_required = bool(self.olap.unreconciled())
         replay = self.olap.recorded_decision(idem)
         if replay is not None:
-            return replay
+            reason = replay.get("reason")
+            retryable_now = (
+                reason == "halted:hold" and halt == "none"
+            ) or (
+                reason == "reconciliation_required_before_new_risk"
+                and not reconciliation_required
+            )
+            if not retryable_now:
+                return replay
+            with self.olap.atomic_unit():
+                self.olap.supersede_transient_rejection(
+                    idem, cause=f"temporary_condition_cleared:{reason}"
+                )
+            # A concurrent retry may already have materialized the revision.
+            replay = self.olap.recorded_decision(idem)
+            if replay is not None:
+                return replay
+
+        def defer(reason: str) -> dict[str, Any]:
+            with self.olap.atomic_unit():
+                self.olap.defer_decision(
+                    idem, reason, intent.model_dump_json()
+                )
+            return {"outcome": "deferred", "reason": reason,
+                    "replayed": False}
 
         def reject(reason: str) -> dict[str, Any]:
             try:
@@ -1006,11 +1134,12 @@ class DemoExecutionService:
                 f"{self.config.environment})"
             )
 
-        halt = self.olap.get_state("halt", "none")
+        if halt == "hold":
+            return defer("halted:hold")
         if halt != "none":
             return reject(f"halted:{halt}")
-        if self.olap.unreconciled():
-            return reject("reconciliation_required_before_new_risk")
+        if reconciliation_required:
+            return defer("reconciliation_required_before_new_risk")
 
         age = (now - intent.as_of).total_seconds()
         if age > self.config.signal_max_age_seconds:
@@ -1127,6 +1256,15 @@ class DemoExecutionService:
         day = now.date().isoformat()
         try:
             with self.olap.atomic_unit():
+                current_halt = self.olap.get_state("halt", "none")
+                if current_halt == "hold":
+                    raise DemoExecutionDeferred("halted:hold")
+                if current_halt != "none":
+                    raise DemoExecutionError(f"halted:{current_halt}")
+                if self.olap.unreconciled():
+                    raise DemoExecutionDeferred(
+                        "reconciliation_required_before_new_risk"
+                    )
                 totals = self.olap.active_totals(day)
                 if totals["positions"] + 1 > self.config.max_concurrent_positions:
                     raise DemoExecutionError("max_concurrent_positions")
@@ -1199,6 +1337,8 @@ class DemoExecutionService:
             if recorded is not None:
                 return recorded
             raise
+        except DemoExecutionDeferred as error:
+            return defer(str(error))
         except DemoExecutionError as error:
             return reject(str(error))
         except Exception as error:  # noqa: BLE001 — finding 046: the atomic
