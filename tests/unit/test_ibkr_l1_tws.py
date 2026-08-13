@@ -115,7 +115,7 @@ def test_reconstructed_parent_and_open_children_prove_exact_protection():
 def test_direct_execution_fact_does_not_need_completed_order_join():
     client = object.__new__(IbAsyncTwsClient)
     client.ib = SimpleNamespace(fills=lambda: [_fill()])
-    fact = client.filled_parent_execution_fact(7)
+    fact = client.filled_order_execution_fact(7)
     assert fact == {
         "source": "broker_execution", "orderId": 7,
         "account": "DUR378700", "action": "SELL", "filled": 20000.0,
@@ -125,3 +125,23 @@ def test_direct_execution_fact_does_not_need_completed_order_join():
         },
         "execution_ids": ["0001.01"],
     }
+    assert client.filled_parent_execution_fact(7) == fact
+
+
+def test_portfolio_position_facts_are_a_separate_account_update_view():
+    client = object.__new__(IbAsyncTwsClient)
+    client._account = "DUR378700"
+    item = SimpleNamespace(
+        account="DUR378700", contract=_contract(), position=-25000.0,
+        averageCost=1.3921,
+    )
+    client.ib = SimpleNamespace(
+        sleep=lambda _seconds: None,
+        portfolio=lambda account: [item] if account == "DUR378700" else [],
+    )
+
+    assert client.portfolio_position_facts() == [{
+        "account": "DUR378700", "symbol": "USD", "currency": "CAD",
+        "secType": "CASH", "conId": 15016062, "units": -25000.0,
+        "averageCost": 1.3921,
+    }]

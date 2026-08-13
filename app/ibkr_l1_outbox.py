@@ -48,7 +48,8 @@ from app.ibkr_l1_recovery import (
     BracketLifecycleController,
     build_flatten_order,
     expected_contract_facts,
-    verify_bracket_exact,
+    matching_position_units,
+    verify_protective_exit_exact,
 )
 
 _PRODUCER = {"name": "lts.ibkr_l1_outbox", "version": "0.1.0"}
@@ -59,6 +60,7 @@ _DEFAULT_QUOTE_MAX_AGE_SECONDS = 60.0
 # stays pending and the next tick re-evaluates it.
 _DEFAULT_DECISION_MAX_AGE_SECONDS = 300.0
 _DEFAULT_ACK_MAX_AGE_SECONDS = 120.0
+_FLAT_RECONCILIATION_SAMPLES = 3
 
 
 class L1OutboxConsumer:
@@ -427,48 +429,20 @@ class L1OutboxConsumer:
             "recovery": recovery,
         }
 
-    def sync_parent_fill(
-        self, effect_id: str, *, now: Optional[datetime] = None
-    ) -> Optional[dict[str, Any]]:
-        """One monitoring pass over an acknowledged effect:
-
-        1. re-verify SL/TP protection from CURRENT direct broker facts
-           against the immutable contract (finding 069) — any deviation
-           executes recovery and reconciles L0;
-        2. read the parent's direct cumulative ``filled`` fact (finding
-           071) and apply the idempotent cumulative delta through the
-           accepted L0 service API; and
-        3. reconcile the direct broker position against the applied
-           cumulative after every update.
-        """
-        now = now or datetime.now(timezone.utc)
+    def _apply_parent_cumulative(
+        self,
+        effect_id: str,
+        contract: dict[str, Any],
+        plan,
+        snapshot: list[dict[str, Any]],
+        parent_proof: Optional[dict[str, Any]],
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Apply the parent's direct cumulative fill exactly once."""
         effect = self.olap.effect_row(effect_id)
-        if effect is None or effect["state"] != "acknowledged":
-            return None
-        contract = self.olap.effect_contract(effect_id)
-        if contract is None:
-            return self._refuse_fill_sync(effect_id, "missing_effect_contract")
-        account = self.client.connected_account()
-        try:
-            plan = plan_from_contract(contract, account=str(account))
-        except L1ExecutionError as error:
-            return self._refuse_fill_sync(effect_id, str(error))
-
-        verdict, snapshot, parent_proof, position_snapshot = (
-            self.controller.current_protection(
-                effect_id, plan,
-                instrument=contract["instrument"],
-                expected_con_id=contract["expected_con_id"],
-            )
-        )
-        if not verdict["protected"]:
-            return self._handle_protection_loss(
-                effect_id, contract, plan, verdict, now
-            )
-
         parent_fact = next(
-            (f for f in snapshot
-             if int(f.get("orderId", -1)) == int(effect["order_ids"][0])),
+            (fact for fact in snapshot
+             if int(fact.get("orderId", -1)) == int(effect["order_ids"][0])),
             None,
         )
         cumulative_raw = (
@@ -527,29 +501,367 @@ class L1OutboxConsumer:
                     {"cumulative": cumulative, "state": state},
                 )
             result["cumulative"] = cumulative
+        return result
+
+    def _position_views(
+        self,
+        contract: dict[str, Any],
+        plan,
+        positions: list[dict[str, Any]],
+    ) -> tuple[float, Optional[float], Optional[list[dict[str, Any]]]]:
+        primary = matching_position_units(
+            positions, account=plan.parent["account"],
+            instrument=contract["instrument"],
+            expected_con_id=contract["expected_con_id"],
+        )
+        reader = getattr(self.client, "portfolio_position_facts", None)
+        portfolio = reader() if callable(reader) else None
+        secondary = None if portfolio is None else matching_position_units(
+            portfolio, account=plan.parent["account"],
+            instrument=contract["instrument"],
+            expected_con_id=contract["expected_con_id"],
+        )
+        return primary, secondary, portfolio
+
+    def _defer_position_reconciliation(
+        self,
+        effect_id: str,
+        *,
+        reason: str,
+        position_units: float,
+        portfolio_units: Optional[float],
+    ) -> dict[str, Any]:
+        fact = {
+            "reason": reason,
+            "position_units": position_units,
+            "portfolio_units": portfolio_units,
+        }
+        self.olap.record_broker_fact(
+            effect_id, "position_reconciliation_pending", fact
+        )
+        return {"reconciliation_pending": True, **fact}
+
+    def _cancel_open_bracket_legs(
+        self, effect_id: str, plan
+    ) -> list[int]:
+        open_by_id = {
+            int(fact["orderId"]): fact
+            for fact in self.client.open_order_facts()
+            if fact.get("orderId") is not None
+        }
+        cancelled = []
+        for spec in plan.transmission_order():
+            fact = open_by_id.get(int(spec["orderId"]))
+            if fact is None or fact.get("status") not in (
+                "PendingSubmit", "PendingCancel", "PreSubmitted", "Submitted"
+            ):
+                continue
+            self.olap.record_broker_fact(
+                effect_id, "protective_exit_cancel_attempt",
+                {"orderId": int(spec["orderId"])},
+            )
+            result = self.client.cancel_order(int(spec["orderId"]))
+            self.olap.record_broker_fact(
+                effect_id, "protective_exit_cancel_result", dict(result)
+            )
+            cancelled.append(int(spec["orderId"]))
+        return cancelled
+
+    def _finalize_flat_entry(
+        self,
+        effect_id: str,
+        contract: dict[str, Any],
+        *,
+        fact_kind: str,
+        fact: dict[str, Any],
+    ) -> None:
+        intent_id = contract["intent_object_id"]
+        if self.olap.exposure_state(f"exp-{intent_id}") == "open":
+            self.service.apply_position_close(intent_id)
+        with self.olap.atomic_unit():
+            self.olap.record_broker_fact(effect_id, fact_kind, fact)
+            self.olap.advance_effect(effect_id, "terminal_flat")
+
+    def _finalize_confirmed_protective_exit(
+        self,
+        effect_id: str,
+        contract: dict[str, Any],
+        plan,
+        snapshot: list[dict[str, Any]],
+        parent_proof: Optional[dict[str, Any]],
+        verdict: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any]:
+        fill = self._apply_parent_cumulative(
+            effect_id, contract, plan, snapshot, parent_proof, now
+        )
+        if fill.get("refused"):
+            return fill
+        cancelled = self._cancel_open_bracket_legs(effect_id, plan)
+        positions = self.client.position_facts()
+        primary, secondary, _portfolio = self._position_views(
+            contract, plan, positions
+        )
+        still_open = [
+            int(fact["orderId"])
+            for fact in self.client.open_order_facts()
+            if fact.get("orderId") is not None
+            and int(fact["orderId"]) in {
+                int(spec["orderId"]) for spec in plan.transmission_order()
+            }
+            and fact.get("status") in (
+                "PendingSubmit", "PendingCancel", "PreSubmitted", "Submitted"
+            )
+        ]
+        if abs(primary) > 1e-9 or secondary is None \
+                or abs(secondary) > 1e-9 or still_open:
+            return self._refuse_fill_sync(
+                effect_id,
+                "protective_exit_postcheck_failed:"
+                f"positions={primary},portfolio={secondary},open={still_open}",
+            )
+        self._finalize_flat_entry(
+            effect_id, contract,
+            fact_kind="protective_exit_reconciled",
+            fact={
+                "exit_leg": verdict["exit_leg"],
+                "position_units": primary,
+                "portfolio_units": secondary,
+                "cancelled_order_ids": cancelled,
+            },
+        )
+        return {
+            "protective_exit": True,
+            "exit_leg": verdict["exit_leg"],
+            "state": "terminal_flat",
+            "cumulative": fill["cumulative"],
+        }
+
+    def _stable_unattributed_flat(
+        self,
+        effect_id: str,
+        contract: dict[str, Any],
+        plan,
+        snapshot: list[dict[str, Any]],
+        parent_proof: Optional[dict[str, Any]],
+        now: datetime,
+        *,
+        position_units: float,
+        portfolio_units: float,
+    ) -> dict[str, Any]:
+        if self.profile.environment != "paper":
+            return self._refuse_fill_sync(
+                effect_id,
+                "unattributed_flat_auto_reconciliation_is_paper_only",
+            )
+        self.olap.record_broker_fact(
+            effect_id, "flat_convergence_sample", {
+                "position_units": position_units,
+                "portfolio_units": portfolio_units,
+                "flat": True,
+            }
+        )
+        samples = self.olap.broker_facts(effect_id, "flat_convergence_sample")
+        streak = 0
+        for sample in reversed(samples):
+            if sample["fact"].get("flat"):
+                streak += 1
+            else:
+                break
+        if streak < _FLAT_RECONCILIATION_SAMPLES:
+            return {
+                "reconciliation_pending": True,
+                "reason": "flat_without_attributed_exit",
+                "samples": streak,
+                "required_samples": _FLAT_RECONCILIATION_SAMPLES,
+            }
+        fill = self._apply_parent_cumulative(
+            effect_id, contract, plan, snapshot, parent_proof, now
+        )
+        if fill.get("refused"):
+            return fill
+        cancelled = self._cancel_open_bracket_legs(effect_id, plan)
+        positions = self.client.position_facts()
+        primary, secondary, _portfolio = self._position_views(
+            contract, plan, positions
+        )
+        still_open = [
+            int(fact["orderId"])
+            for fact in self.client.open_order_facts()
+            if fact.get("orderId") is not None
+            and int(fact["orderId"]) in {
+                int(spec["orderId"]) for spec in plan.transmission_order()
+            }
+            and fact.get("status") in (
+                "PendingSubmit", "PendingCancel", "PreSubmitted", "Submitted"
+            )
+        ]
+        if abs(primary) > 1e-9 or secondary is None \
+                or abs(secondary) > 1e-9 or still_open:
+            return self._defer_position_reconciliation(
+                effect_id,
+                reason=("flat_post_cancel_open_orders" if still_open
+                        else "flat_post_cancel_views_disagree"),
+                position_units=primary, portfolio_units=secondary,
+            )
+        self._finalize_flat_entry(
+            effect_id, contract,
+            fact_kind="unattributed_flat_reconciled",
+            fact={
+                "samples": streak,
+                "position_units": primary,
+                "portfolio_units": secondary,
+                "cancelled_order_ids": cancelled,
+                "environment": self.profile.environment,
+            },
+        )
+        return {
+            "protective_exit": False,
+            "unattributed_flat": True,
+            "state": "terminal_flat",
+            "samples": streak,
+        }
+
+    def _exit_or_reconciliation_pending(
+        self,
+        effect_id: str,
+        contract: dict[str, Any],
+        plan,
+        snapshot: list[dict[str, Any]],
+        parent_proof: Optional[dict[str, Any]],
+        positions: Optional[list[dict[str, Any]]],
+        now: datetime,
+    ) -> Optional[dict[str, Any]]:
+        if positions is None:
+            return None
+        primary, secondary, portfolio = self._position_views(
+            contract, plan, positions
+        )
+        if secondary is None:
+            if abs(primary) <= 1e-9:
+                return self._defer_position_reconciliation(
+                    effect_id, reason="portfolio_view_unavailable",
+                    position_units=primary, portfolio_units=None,
+                )
+            return None
+        if abs(primary - secondary) > 1e-9:
+            self.olap.record_broker_fact(
+                effect_id, "flat_convergence_sample", {
+                    "position_units": primary,
+                    "portfolio_units": secondary,
+                    "flat": False,
+                }
+            )
+            return self._defer_position_reconciliation(
+                effect_id, reason="position_views_disagree",
+                position_units=primary, portfolio_units=secondary,
+            )
+        if abs(primary) > 1e-9:
+            return None
+
+        child_proofs: dict[str, Optional[dict[str, Any]]] = {}
+        child_order_facts: dict[str, Optional[dict[str, Any]]] = {}
+        by_id = {
+            int(fact["orderId"]): fact
+            for fact in snapshot if fact.get("orderId") is not None
+        }
+        for name, spec, fact_kind in (
+            ("take_profit", plan.take_profit, "take_profit_fill_execution"),
+            ("stop_loss", plan.stop_loss, "stop_loss_fill_execution"),
+        ):
+            proof, _origin = self.controller.order_execution_proof(
+                effect_id, fact_kind=fact_kind,
+                order_id=int(spec["orderId"]),
+            )
+            child_proofs[name] = proof
+            child_order_facts[name] = by_id.get(int(spec["orderId"]))
+        exit_verdict = verify_protective_exit_exact(
+            plan=plan, instrument=contract["instrument"],
+            expected_con_id=contract["expected_con_id"],
+            parent_proof=parent_proof, child_proofs=child_proofs,
+            child_order_facts=child_order_facts,
+            position_facts=positions,
+            portfolio_position_facts=portfolio,
+        )
+        evidence_present = any(child_proofs.values()) or any(
+            fact is not None and fact.get("status") == "Filled"
+            for fact in child_order_facts.values()
+        )
+        if exit_verdict["confirmed"]:
+            return self._finalize_confirmed_protective_exit(
+                effect_id, contract, plan, snapshot, parent_proof,
+                exit_verdict, now,
+            )
+        if evidence_present:
+            return None
+        return self._stable_unattributed_flat(
+            effect_id, contract, plan, snapshot, parent_proof, now,
+            position_units=primary, portfolio_units=secondary,
+        )
+
+    def sync_parent_fill(
+        self, effect_id: str, *, now: Optional[datetime] = None
+    ) -> Optional[dict[str, Any]]:
+        """One monitoring pass over an acknowledged effect:
+
+        1. re-verify SL/TP protection from CURRENT direct broker facts
+           against the immutable contract (finding 069) — any deviation
+           executes recovery and reconciles L0;
+        2. read the parent's direct cumulative ``filled`` fact (finding
+           071) and apply the idempotent cumulative delta through the
+           accepted L0 service API; and
+        3. reconcile the direct broker position against the applied
+           cumulative after every update.
+        """
+        now = now or datetime.now(timezone.utc)
+        effect = self.olap.effect_row(effect_id)
+        if effect is None or effect["state"] != "acknowledged":
+            return None
+        contract = self.olap.effect_contract(effect_id)
+        if contract is None:
+            return self._refuse_fill_sync(effect_id, "missing_effect_contract")
+        account = self.client.connected_account()
+        try:
+            plan = plan_from_contract(contract, account=str(account))
+        except L1ExecutionError as error:
+            return self._refuse_fill_sync(effect_id, str(error))
+
+        verdict, snapshot, parent_proof, position_snapshot = (
+            self.controller.current_protection(
+                effect_id, plan,
+                instrument=contract["instrument"],
+                expected_con_id=contract["expected_con_id"],
+            )
+        )
+        if not verdict["protected"]:
+            exit_or_pending = self._exit_or_reconciliation_pending(
+                effect_id, contract, plan, snapshot, parent_proof,
+                position_snapshot, now,
+            )
+            if exit_or_pending is not None:
+                return exit_or_pending
+            return self._handle_protection_loss(
+                effect_id, contract, plan, verdict, now
+            )
+
+        result = self._apply_parent_cumulative(
+            effect_id, contract, plan, snapshot, parent_proof, now
+        )
+        if result.get("refused"):
+            return result
+        cumulative = float(result["cumulative"])
+        epsilon = 1e-9
 
         # 3. mandatory position reconciliation against direct facts
-        expected_contract = expected_contract_facts(contract["instrument"])
         sign = 1.0 if contract["delta_units"] > 0 else -1.0
         positions = (
             position_snapshot
             if position_snapshot is not None
             else self.client.position_facts()
         )
-        observed = sum(
-            float(p.get("units", 0.0))
-            for p in positions
-            if p.get("symbol") == expected_contract["symbol"]
-            and p.get("currency") == expected_contract["currency"]
-            and p.get("secType") == expected_contract["secType"]
-            and p.get("account") == account
-            and (
-                contract["expected_con_id"] is None
-                or (
-                    p.get("conId") is not None
-                    and int(p["conId"]) == int(contract["expected_con_id"])
-                )
-            )
+        observed = matching_position_units(
+            positions, account=str(account), instrument=contract["instrument"],
+            expected_con_id=contract["expected_con_id"],
         )
         if abs(observed - sign * cumulative) > epsilon:
             return self._refuse_fill_sync(

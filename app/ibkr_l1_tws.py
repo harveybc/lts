@@ -110,10 +110,10 @@ class IbAsyncTwsClient(IbkrClientProtocol):
             total += sign * float(getattr(execution, "shares", 0.0))
         return total if seen else None
 
-    def filled_parent_execution_fact(
+    def filled_order_execution_fact(
         self, order_id: int
     ) -> Optional[dict[str, Any]]:
-        """Direct, restart-retained parent-fill proof from TWS executions.
+        """Direct, restart-retained fill proof for any bracket leg.
 
         Unlike ``open_order_facts``, this does not require the completed-order
         join to remain available.  It reports only fields carried by direct
@@ -172,6 +172,12 @@ class IbAsyncTwsClient(IbkrClientProtocol):
                 or len(contract_identities) != 1 or action is None:
             proof["integrity_error"] = "inconsistent_execution_identity"
         return proof
+
+    def filled_parent_execution_fact(
+        self, order_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Compatibility alias retained for older callers and fixtures."""
+        return self.filled_order_execution_fact(order_id)
 
     def close(self) -> None:
         if getattr(self, "ib", None) is not None and self.ib.isConnected():
@@ -314,6 +320,28 @@ class IbAsyncTwsClient(IbkrClientProtocol):
                 "averageCost": float(position.avgCost),
             }
             for position in self.ib.positions(self._account)
+        ]
+
+    def portfolio_position_facts(self) -> list[dict[str, Any]]:
+        """Second position view sourced from TWS account updates.
+
+        ``positions()`` and ``portfolio()`` arrive through independent IB API
+        request families. Requiring them to converge prevents an empty
+        positions cache immediately after reconnect from cancelling a still
+        protective bracket.
+        """
+        self.ib.sleep(0)
+        return [
+            {
+                "account": str(item.account),
+                "symbol": str(item.contract.symbol),
+                "currency": str(item.contract.currency),
+                "secType": str(item.contract.secType),
+                "conId": int(item.contract.conId or 0),
+                "units": float(item.position),
+                "averageCost": float(item.averageCost),
+            }
+            for item in self.ib.portfolio(self._account)
         ]
 
     def next_order_id(self) -> int:

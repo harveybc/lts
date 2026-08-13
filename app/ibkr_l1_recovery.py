@@ -86,6 +86,7 @@ def _leg_failures(
     expected_con_id: Optional[int],
     quantity_tolerance: float,
     price_tolerance: float,
+    acceptable_statuses: Optional[frozenset[str]] = None,
 ) -> list[str]:
     if observed is None:
         return [f"{name}: no direct broker evidence"]
@@ -98,7 +99,7 @@ def _leg_failures(
         return value
 
     status = _require("status")
-    acceptable = (
+    acceptable = acceptable_statuses or (
         ACCEPTABLE_PARENT_STATUSES if name == "parent"
         else ACCEPTABLE_CHILD_STATUSES
     )
@@ -158,7 +159,8 @@ def _leg_failures(
     return failures
 
 
-def _filled_parent_failures(
+def _execution_proof_failures(
+    name: str,
     spec: Mapping[str, Any],
     proof: Optional[Mapping[str, Any]],
     *,
@@ -167,37 +169,53 @@ def _filled_parent_failures(
     quantity_tolerance: float,
 ) -> list[str]:
     if proof is None:
-        return ["parent: no direct or retained broker execution evidence"]
+        return [f"{name}: no direct or retained broker execution evidence"]
     failures: list[str] = []
     if proof.get("integrity_error"):
-        failures.append("parent: broker execution identity is inconsistent")
+        failures.append(f"{name}: broker execution identity is inconsistent")
     if proof.get("source") != "broker_execution":
-        failures.append("parent: execution proof source is not broker_execution")
+        failures.append(
+            f"{name}: execution proof source is not broker_execution")
     if int(proof.get("orderId", -1)) != int(spec["orderId"]):
-        failures.append("parent: execution orderId mismatch")
+        failures.append(f"{name}: execution orderId mismatch")
     if proof.get("account") != spec["account"]:
-        failures.append("parent: execution account mismatch")
+        failures.append(f"{name}: execution account mismatch")
     if proof.get("action") != spec["action"]:
-        failures.append("parent: execution side mismatch")
+        failures.append(f"{name}: execution side mismatch")
     filled = proof.get("filled")
     if filled is None or abs(
         float(filled) - float(spec["totalQuantity"])
     ) > quantity_tolerance:
         failures.append(
-            f"parent: execution fill {filled!r} != {spec['totalQuantity']!r}"
+            f"{name}: execution fill {filled!r} != {spec['totalQuantity']!r}"
         )
     observed_contract = proof.get("contract")
     if not isinstance(observed_contract, Mapping):
-        failures.append("parent: execution contract missing")
+        failures.append(f"{name}: execution contract missing")
     else:
         for key, expected in contract.items():
             if observed_contract.get(key) != expected:
                 failures.append(
-                    f"parent: execution contract {key} mismatch")
+                    f"{name}: execution contract {key} mismatch")
         if expected_con_id is not None \
                 and observed_contract.get("conId") != expected_con_id:
-            failures.append("parent: execution conId mismatch")
+            failures.append(f"{name}: execution conId mismatch")
     return failures
+
+
+def _filled_parent_failures(
+    spec: Mapping[str, Any],
+    proof: Optional[Mapping[str, Any]],
+    *,
+    contract: Mapping[str, Any],
+    expected_con_id: Optional[int],
+    quantity_tolerance: float,
+) -> list[str]:
+    return _execution_proof_failures(
+        "parent", spec, proof, contract=contract,
+        expected_con_id=expected_con_id,
+        quantity_tolerance=quantity_tolerance,
+    )
 
 
 def _filled_position_failures(
@@ -296,12 +314,168 @@ def verify_bracket_exact(
     return verdict
 
 
+def matching_position_units(
+    positions: list[Mapping[str, Any]],
+    *,
+    account: str,
+    instrument: str,
+    expected_con_id: Optional[int],
+) -> float:
+    """Signed units for the exact account/instrument identity."""
+    contract = expected_contract_facts(instrument)
+    return sum(
+        float(position.get("units", 0.0))
+        for position in positions
+        if position.get("account") == account
+        and position.get("secType") == contract["secType"]
+        and position.get("symbol") == contract["symbol"]
+        and position.get("currency") == contract["currency"]
+        and (
+            expected_con_id is None
+            or position.get("conId") == expected_con_id
+        )
+    )
+
+
+def verify_protective_exit_exact(
+    *,
+    plan: BracketPlan,
+    instrument: str,
+    expected_con_id: Optional[int],
+    parent_proof: Optional[Mapping[str, Any]],
+    child_proofs: Mapping[str, Optional[Mapping[str, Any]]],
+    child_order_facts: Mapping[str, Optional[Mapping[str, Any]]],
+    position_facts: list[Mapping[str, Any]],
+    portfolio_position_facts: list[Mapping[str, Any]],
+    quantity_tolerance: float = 1e-9,
+) -> dict[str, Any]:
+    """Prove one exact SL/TP execution and independently proven flatness.
+
+    A zero position by itself is never an exit. Exactly one protective child
+    must carry a direct or previously retained broker execution, its identity
+    and full quantity must match the immutable plan, and both TWS position
+    request families must agree that the exact account/instrument is flat.
+    """
+    contract = expected_contract_facts(instrument)
+    failures = _execution_proof_failures(
+        "parent", plan.parent, parent_proof, contract=contract,
+        expected_con_id=expected_con_id,
+        quantity_tolerance=quantity_tolerance,
+    )
+    valid_children: list[str] = []
+    child_failures: dict[str, list[str]] = {}
+    for name, spec in (
+        ("take_profit", plan.take_profit),
+        ("stop_loss", plan.stop_loss),
+    ):
+        proof = child_proofs.get(name)
+        order_fact = child_order_facts.get(name)
+        if proof is not None:
+            leg_failures = _execution_proof_failures(
+                name, spec, proof, contract=contract,
+                expected_con_id=expected_con_id,
+                quantity_tolerance=quantity_tolerance,
+            )
+        elif order_fact is not None and order_fact.get("status") == "Filled":
+            leg_failures = _leg_failures(
+                name, spec, order_fact,
+                parent_order_id=int(plan.parent["orderId"]),
+                contract=contract, expected_con_id=expected_con_id,
+                quantity_tolerance=quantity_tolerance,
+                price_tolerance=1e-9,
+                acceptable_statuses=frozenset({"Filled"}),
+            )
+            filled = order_fact.get("filled")
+            remaining = order_fact.get("remaining")
+            if filled is None or abs(
+                float(filled) - float(spec["totalQuantity"])
+            ) > quantity_tolerance:
+                leg_failures.append(
+                    f"{name}: filled {filled!r} != {spec['totalQuantity']!r}"
+                )
+            if remaining is None or abs(float(remaining)) > quantity_tolerance:
+                leg_failures.append(
+                    f"{name}: remaining {remaining!r} is not zero")
+        else:
+            child_failures[name] = []
+            continue
+        child_failures[name] = leg_failures
+        if leg_failures:
+            failures.extend(leg_failures)
+        else:
+            valid_children.append(name)
+    if len(valid_children) != 1:
+        failures.append(
+            "protective_exit: exactly one valid SL/TP execution required; "
+            f"observed {valid_children}"
+        )
+
+    position_units = matching_position_units(
+        position_facts, account=plan.parent["account"],
+        instrument=instrument, expected_con_id=expected_con_id,
+    )
+    portfolio_units = matching_position_units(
+        portfolio_position_facts, account=plan.parent["account"],
+        instrument=instrument, expected_con_id=expected_con_id,
+    )
+    if abs(position_units) > quantity_tolerance:
+        failures.append(
+            f"protective_exit: positions units {position_units} are not flat")
+    if abs(portfolio_units) > quantity_tolerance:
+        failures.append(
+            f"protective_exit: portfolio units {portfolio_units} are not flat")
+    return {
+        "confirmed": not failures,
+        "exit_leg": valid_children[0] if len(valid_children) == 1 else None,
+        "failures": failures,
+        "child_failures": child_failures,
+        "position_units": position_units,
+        "portfolio_units": portfolio_units,
+    }
+
+
 class BracketLifecycleController:
     """Drives one submitted bracket to acknowledged or reconciled-safe."""
 
     def __init__(self, olap: L1ExecutionOlap, client: IbkrClientProtocol) -> None:
         self.olap = olap
         self.client = client
+
+    def order_execution_proof(
+        self,
+        effect_id: str,
+        *,
+        fact_kind: str,
+        order_id: int,
+        allow_retained: bool = True,
+    ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        """Read and durably retain one direct execution proof.
+
+        The generic reader covers parent, take-profit and stop-loss. The old
+        parent-only method remains a compatibility fallback for clients made
+        before protective exits became a first-class lifecycle event.
+        """
+        reader = getattr(self.client, "filled_order_execution_fact", None)
+        if not callable(reader) and fact_kind == "parent_fill_execution":
+            reader = getattr(self.client, "filled_parent_execution_fact", None)
+        direct = reader(int(order_id)) if callable(reader) else None
+        if direct is not None:
+            proof = dict(direct)
+            retained = self.olap.broker_facts(effect_id, fact_kind)
+            previous = retained[-1]["fact"].get("proof") if retained else None
+            if previous != proof:
+                with self.olap.atomic_unit():
+                    self.olap.record_broker_fact(
+                        effect_id, fact_kind, {"proof": proof}
+                    )
+            return proof, "direct_execution"
+        if allow_retained:
+            retained = self.olap.broker_facts(effect_id, fact_kind)
+            if retained:
+                candidate = retained[-1]["fact"].get("proof")
+                if isinstance(candidate, dict):
+                    return dict(candidate), "retained_execution"
+        return None, None
 
     def current_protection(
         self,
@@ -337,27 +511,11 @@ class BracketLifecycleController:
         proof_origin: Optional[str] = None
         positions: Optional[list[dict[str, Any]]] = None
         if not parent_open:
-            reader = getattr(self.client, "filled_parent_execution_fact", None)
-            direct = reader(parent_id) if callable(reader) else None
-            if direct is not None:
-                proof = dict(direct)
-                proof_origin = "direct_execution"
-                retained = self.olap.broker_facts(
-                    effect_id, "parent_fill_execution")
-                previous = retained[-1]["fact"].get("proof") if retained else None
-                if previous != proof:
-                    with self.olap.atomic_unit():
-                        self.olap.record_broker_fact(
-                            effect_id, "parent_fill_execution", {"proof": proof}
-                        )
-            else:
-                retained = self.olap.broker_facts(
-                    effect_id, "parent_fill_execution")
-                if retained:
-                    candidate = retained[-1]["fact"].get("proof")
-                    if isinstance(candidate, dict):
-                        proof = dict(candidate)
-                        proof_origin = "retained_execution"
+            proof, proof_origin = self.order_execution_proof(
+                effect_id,
+                fact_kind="parent_fill_execution",
+                order_id=parent_id,
+            )
             positions = self.client.position_facts()
         verification_snapshot = snapshot if parent_open else [
             fact for fact in snapshot

@@ -1,8 +1,9 @@
 # Multi-Venue Paper Execution
 
-Status: Alpaca, IBKR, shadow and OANDA MT5 read-only observation active;
-Capital.com Demo adapter ready; social-trading accounting lab implemented
-Date: 2026-08-01
+Status: Alpaca, IBKR and OANDA MT5 paper/demo execution active; shadow
+observation active; Capital.com Demo adapter ready; social-trading accounting
+lab implemented
+Date: 2026-08-13
 
 ## Account State
 
@@ -16,9 +17,9 @@ User-reported:
   remain user-owned and are not stored by LTS;
 - Alpaca Paper credentials: provisioned locally and verified by the read-only
   preflight;
-- IBKR TWS Paper: authenticated read-only observer active on
-  `127.0.0.1:7497`; all six initial contracts qualified with zero positions
-  and zero orders.
+- IBKR TWS Paper: authenticated model-authority/L1 runner active on
+  `127.0.0.1:7497`. Six journaled bracket cycles have reached TWS Paper; every
+  risk-increasing entry carries native broker-side SL and TP.
 
 Never commit or paste credentials, raw account IDs or recovery information.
 
@@ -42,7 +43,7 @@ to fabricate portfolio capital.
 | --- | --- | --- |
 | OANDA Global Markets MT5 | FX and available crypto-CFD calibration | eligible after MT5 demo capability and protected-canary gates |
 | Alpaca Trading API Paper | crypto data/API and long-only control | shadow-only until native server-side SL+TP satisfies the common contract |
-| IBKR Individual Margin Paper | equities/ETF and broad multi-asset calibration | eligible after Paper/TWS or Web API capability and protected-canary gates |
+| IBKR Individual Margin Paper | model-controlled USD.CAD protected-bracket execution and broad multi-asset calibration | active in Paper through TWS; no real-capital route |
 | Capital.com Demo API | crypto, FX, index and CFD fallback discovery | GET-only observer; mutation plugin disabled |
 
 The existing `oanda_broker` and OANDA Practice laboratory use REST v20 and are
@@ -162,8 +163,10 @@ Git, documentation, command arguments or chat.
 ## IBKR Paper Startup
 
 IBKR has no API key/secret pair. Start TWS for Linux in Paper mode, authenticate
-interactively with 2FA, enable socket clients, retain Read-Only API and use
-port `7497`. Then run:
+interactively with 2FA, enable socket clients and use port `7497`. Keep the API
+read/write only while the model-authority runner is deliberately active; the
+runner itself rejects non-Paper accounts by fingerprint. Then run the observer
+when needed:
 
 ```bash
 ./examples/scripts/enable_ibkr_paper_observer.sh
@@ -171,6 +174,30 @@ port `7497`. Then run:
 
 IB Gateway Paper may later use port `4002`, but the initial laboratory is
 intentionally pinned to local TWS Paper `7497`.
+
+### IBKR L1 protected-exit reconciliation
+
+The model runner uses one nonterminal effect as the entry gate, persists the
+immutable bracket plan and reconciles parent fills into the shared L0/L1
+SQLite ledger. A normal protective exit is terminal only when exactly one SL
+or TP execution matches the stored account, contract, side, order ID and full
+quantity, and both TWS position views report zero exposure. The remaining
+bracket leg is cancelled and rechecked before the L0 exposure closes. This
+path does not set the global hold.
+
+After a TWS reconnect, a single empty position cache is not proof of an exit
+and never causes protective orders to be cancelled. The runner compares the
+positions-request view with the account-update portfolio view. Disagreement
+leaves the effect nonterminal and blocks new entries while preserving the
+existing bracket. If execution history is unavailable but both independent
+views remain flat for three consecutive samples, Paper mode cancels stale
+children, checks both views again and records an `unattributed_flat_reconciled`
+terminal fact. Malformed execution identity, residual exposure or a failed
+post-cancel check still fails closed into `hold`.
+
+The owner-signed resume procedure is therefore reserved for genuine safety
+holds. It is not part of every successful SL/TP lifecycle; see
+[`security/OWNER_RESUME_SIGNER_SETUP_2026_08_05.md`](security/OWNER_RESUME_SIGNER_SETUP_2026_08_05.md).
 
 ## Capital.com Demo Startup
 

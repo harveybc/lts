@@ -43,11 +43,20 @@ class IbkrClientProtocol(Protocol):
         """Direct broker snapshot of positions."""
         ...
 
+    def portfolio_position_facts(self) -> list[dict[str, Any]]:
+        """Independent account-update snapshot of portfolio positions."""
+        ...
+
+    def filled_order_execution_fact(
+        self, order_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Direct cumulative execution proof for any bracket leg."""
+        ...
+
     def filled_parent_execution_fact(
         self, order_id: int
     ) -> Optional[dict[str, Any]]:
-        """Direct cumulative execution proof retained after an order leaves
-        the open-order set, or ``None`` when the broker has no such proof."""
+        """Backward-compatible alias for ``filled_order_execution_fact``."""
         ...
 
     def connected_account(self) -> Optional[str]:
@@ -290,16 +299,25 @@ class FakeIbkrClient:
         self.calls.append(("position_facts", {}))
         return [dict(p) for p in self._positions]
 
-    def filled_parent_execution_fact(
+    def portfolio_position_facts(self) -> list[dict[str, Any]]:
+        self.calls.append(("portfolio_position_facts", {}))
+        return [dict(p) for p in self._positions]
+
+    def filled_order_execution_fact(
         self, order_id: int
     ) -> Optional[dict[str, Any]]:
         self.calls.append((
-            "filled_parent_execution_fact", {"orderId": int(order_id)}
+            "filled_order_execution_fact", {"orderId": int(order_id)}
         ))
         fact = self._execution_facts.get(int(order_id))
         if fact is None:
             return None
         return {**fact, "contract": dict(fact["contract"])}
+
+    def filled_parent_execution_fact(
+        self, order_id: int
+    ) -> Optional[dict[str, Any]]:
+        return self.filled_order_execution_fact(order_id)
 
     def connected_account(self) -> Optional[str]:
         return self.account
@@ -386,6 +404,43 @@ class FakeIbkrClient:
             "contract": dict(fact["contract"]),
             "execution_ids": [f"fake-execution-{int(order_id)}"],
         }
+
+    def fill_protective_leg(self, order_id: int, units: float) -> None:
+        """Fill one child and apply the resulting risk-reducing position.
+
+        The sibling is cancelled as an IBKR bracket/OCA group would cancel
+        it. Tests can alter that state afterward to exercise delayed OCA
+        convergence.
+        """
+        fact = self._orders[int(order_id)]
+        if not fact["parentId"]:
+            raise ValueError("protective fill requires a child order")
+        increment = min(float(units), fact["remaining"])
+        fact["filled"] += increment
+        fact["remaining"] = fact["totalQuantity"] - fact["filled"]
+        if fact["remaining"] <= 0.0:
+            fact["status"] = "Filled"
+        sign = 1.0 if fact["action"] == "BUY" else -1.0
+        existing = self._own_cash_units(fact["contract"]["symbol"])
+        self.set_position(
+            symbol=fact["contract"]["symbol"],
+            currency=fact["contract"]["currency"],
+            units=existing + sign * increment,
+        )
+        self._execution_facts[int(order_id)] = {
+            "source": "broker_execution",
+            "orderId": int(order_id),
+            "account": fact["account"],
+            "action": fact["action"],
+            "filled": fact["filled"],
+            "contract": dict(fact["contract"]),
+            "execution_ids": [f"fake-execution-{int(order_id)}"],
+        }
+        if fact["status"] == "Filled":
+            for sibling in self._orders.values():
+                if sibling["orderId"] != int(order_id) \
+                        and sibling["parentId"] == fact["parentId"]:
+                    sibling["status"] = "Cancelled"
 
 
 def place_order_sequence(calls: Iterable[tuple[str, dict[str, Any]]]) -> list[int]:

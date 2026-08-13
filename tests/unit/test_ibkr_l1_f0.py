@@ -292,6 +292,122 @@ def test_position_disagreement_refuses_and_holds(env):
     assert env.olap.get_state("halt") == "hold"
 
 
+@pytest.mark.parametrize("leg_index,exit_leg", [
+    (1, "take_profit"),
+    (2, "stop_loss"),
+])
+def test_exact_protective_fill_closes_without_global_hold(
+    env, leg_index, exit_leg
+):
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 20000.0)
+    env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+
+    env.client.fill_protective_leg(order_ids[leg_index], 20000.0)
+    result = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=4)
+    )
+
+    assert result == {
+        "protective_exit": True,
+        "exit_leg": exit_leg,
+        "state": "terminal_flat",
+        "cumulative": 20000.0,
+    }
+    assert env.olap.effect_row(effect_id)["state"] == "terminal_flat"
+    assert env.olap.open_exposures() == []
+    assert env.olap.get_state("halt", "none") == "none"
+    facts = env.olap.broker_facts(effect_id, "protective_exit_reconciled")
+    assert facts[-1]["fact"]["exit_leg"] == exit_leg
+
+
+def test_filled_child_order_fact_closes_when_execution_cache_is_absent(env):
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 20000.0)
+    env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    env.client.alter_order(
+        order_ids[1], status="Filled", filled=20000.0, remaining=0.0
+    )
+    env.client.alter_order(order_ids[2], status="Cancelled")
+    env.client.set_position(symbol="EUR", currency="USD", units=0.0)
+
+    result = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=4)
+    )
+
+    assert result["protective_exit"] is True
+    assert result["exit_leg"] == "take_profit"
+    assert env.olap.get_state("halt", "none") == "none"
+
+
+def test_reconnect_empty_position_cache_does_not_cancel_protection(env):
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 20000.0)
+    env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    expected_portfolio = env.client.position_facts()
+    env.client.set_position(symbol="EUR", currency="USD", units=0.0)
+    env.client.portfolio_position_facts = lambda: expected_portfolio
+    cancels_before = len([
+        call for call in env.client.calls if call[0] == "cancel_order"
+    ])
+
+    result = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=4)
+    )
+
+    assert result["reconciliation_pending"] is True
+    assert result["reason"] == "position_views_disagree"
+    assert env.olap.effect_row(effect_id)["state"] == "acknowledged"
+    assert env.olap.get_state("halt", "none") == "none"
+    assert len([call for call in env.client.calls
+                if call[0] == "cancel_order"]) == cancels_before
+
+
+def test_three_independent_flat_samples_auto_reconcile_paper_exit(env):
+    effect_id, order_ids = _entered(env)
+    env.client.fill_parent(order_ids[0], 20000.0)
+    env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    env.client.set_position(symbol="EUR", currency="USD", units=0.0)
+
+    first = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=4)
+    )
+    second = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=5)
+    )
+    third = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=6)
+    )
+
+    assert first["samples"] == 1 and first["reconciliation_pending"] is True
+    assert second["samples"] == 2 and second["reconciliation_pending"] is True
+    assert third["unattributed_flat"] is True
+    assert third["state"] == "terminal_flat"
+    assert env.olap.effect_row(effect_id)["state"] == "terminal_flat"
+    assert env.olap.open_exposures() == []
+    assert env.olap.get_state("halt", "none") == "none"
+    assert sorted(
+        fact["orderId"] for name, fact in env.client.calls
+        if name == "cancel_order"
+    ) == sorted(order_ids[1:])
+
+
+def test_malformed_protective_execution_still_fails_closed(env):
+    effect_id, order_ids = _entered(env)
+    env.client.auto_fill_market_orders = True
+    env.client.fill_parent(order_ids[0], 20000.0)
+    env.consumer.sync_parent_fill(effect_id, now=NOW + timedelta(seconds=3))
+    env.client.fill_protective_leg(order_ids[1], 20000.0)
+    env.client._execution_facts[order_ids[1]]["account"] = "DU-FOREIGN"
+
+    result = env.consumer.sync_parent_fill(
+        effect_id, now=NOW + timedelta(seconds=4)
+    )
+
+    assert result["protection_lost"] is True
+    assert env.olap.get_state("halt") == "hold"
+
+
 # ── F0.4 (finding 070): exact risk-reducing preflight ──
 
 def _filled_long_with_pending_flatten(env):
