@@ -46,6 +46,7 @@ from app.ibkr_l1_executor import (
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.ibkr_l1_recovery import (
     BracketLifecycleController,
+    CANCELLABLE_OPEN_STATUSES,
     build_flatten_order,
     expected_contract_facts,
     matching_position_units,
@@ -552,8 +553,9 @@ class L1OutboxConsumer:
         cancelled = []
         for spec in plan.transmission_order():
             fact = open_by_id.get(int(spec["orderId"]))
-            if fact is None or fact.get("status") not in (
-                "PendingSubmit", "PendingCancel", "PreSubmitted", "Submitted"
+            if (
+                fact is None
+                or fact.get("status") not in CANCELLABLE_OPEN_STATUSES
             ):
                 continue
             self.olap.record_broker_fact(

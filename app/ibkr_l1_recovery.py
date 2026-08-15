@@ -41,6 +41,10 @@ CACHE_CONVERGENCE_SAMPLES = 3
 OPEN_STATUSES = frozenset(
     {"PendingSubmit", "PendingCancel", "PreSubmitted", "Submitted"}
 )
+# ``PendingCancel`` remains open for reconciliation, but TWS has already
+# accepted the cancellation request.  Sending it again yields error 10148
+# and can flood both the API log and the desktop event queue.
+CANCELLABLE_OPEN_STATUSES = OPEN_STATUSES - {"PendingCancel"}
 
 
 def expected_contract_facts(instrument: str) -> dict[str, Any]:
@@ -617,7 +621,10 @@ class BracketLifecycleController:
             }
             for spec in plan.transmission_order():
                 fact = open_now.get(int(spec["orderId"]))
-                if fact is not None and fact.get("status") in OPEN_STATUSES:
+                if (
+                    fact is not None
+                    and fact.get("status") in CANCELLABLE_OPEN_STATUSES
+                ):
                     self.olap.record_broker_fact(
                         effect_id, "recovery_cancel_attempt",
                         {"orderId": spec["orderId"]},

@@ -299,6 +299,25 @@ def test_cancel_failure_journals_unknown_then_retry_completes(olap):
     assert olap.effect_row(effect_id)["state"] == "terminal_cancelled"
 
 
+def test_pending_cancel_is_observed_without_resubmitting_cancel(olap):
+    """TWS error 10148: a PendingCancel order must be polled, not cancelled
+    again on every recovery pass."""
+    client, controller, plan, effect_id = _submitted(olap)
+    client.drop_order(1002)
+    client.alter_order(1000, status="PendingCancel")
+    client.alter_order(1001, status="PendingCancel")
+
+    first = controller.acknowledge(effect_id, plan, instrument="EUR.USD")
+    second = controller.recover(effect_id, plan, instrument="EUR.USD")
+
+    assert first["recovery"]["state"] == "recovering"
+    assert second["state"] == "recovering"
+    assert sorted(first["recovery"]["still_open"]) == [1000, 1001]
+    assert sorted(second["still_open"]) == [1000, 1001]
+    assert _cancels(client) == []
+    assert olap.get_state("halt") == "hold"
+
+
 def test_recovery_is_idempotent_after_terminal(olap):
     client, controller, plan, effect_id = _submitted(olap)
     client.drop_order(1002)

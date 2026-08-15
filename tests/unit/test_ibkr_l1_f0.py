@@ -10,7 +10,7 @@ from datetime import timedelta
 import pytest
 
 from app.demo_execution_service import DemoExecutionError, DemoExecutionOlap
-from app.ibkr_l1_executor import EFFECT_CONTRACT_SCHEMA
+from app.ibkr_l1_executor import EFFECT_CONTRACT_SCHEMA, plan_from_contract
 from app.ibkr_l1_journal import L1ExecutionOlap
 
 from test_ibkr_l1_outbox import (
@@ -390,6 +390,19 @@ def test_three_independent_flat_samples_auto_reconcile_paper_exit(env):
         fact["orderId"] for name, fact in env.client.calls
         if name == "cancel_order"
     ) == sorted(order_ids[1:])
+
+
+def test_flat_reconciliation_does_not_recancel_pending_cancel_legs(env):
+    effect_id, order_ids = _entered(env)
+    contract = env.olap.effect_contract(effect_id)
+    plan = plan_from_contract(contract, account=ACCOUNT)
+    for order_id in order_ids:
+        env.client.alter_order(order_id, status="PendingCancel")
+
+    cancelled = env.consumer._cancel_open_bracket_legs(effect_id, plan)
+
+    assert cancelled == []
+    assert [call for call in env.client.calls if call[0] == "cancel_order"] == []
 
 
 def test_malformed_protective_execution_still_fails_closed(env):
