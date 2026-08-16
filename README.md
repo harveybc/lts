@@ -196,6 +196,10 @@ Deeper operational docs:
 [`docs/MULTI_VENUE_PAPER_EXECUTION.md`](docs/MULTI_VENUE_PAPER_EXECUTION.md),
 [`docs/OANDA_PRACTICE_EXECUTION_LAB.md`](docs/OANDA_PRACTICE_EXECUTION_LAB.md),
 [`docs/SOCIAL_TRADING_REALITY_LAB.md`](docs/SOCIAL_TRADING_REALITY_LAB.md).
+Record each seated artifact/window with the
+[`paper/demo seat evaluation card`](docs/PAPER_SEAT_EVALUATION_CARD_TEMPLATE.md)
+so simulation-versus-venue claims carry exact identities, horizons, costs and
+direct safety facts.
 
 ## Artifacts, data and outputs
 
