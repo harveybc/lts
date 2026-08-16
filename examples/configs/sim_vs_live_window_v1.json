@@ -1,0 +1,75 @@
+{
+  "schema": "lts.sim_vs_live_window_config.v1",
+  "version": "1.0.0",
+  "comment": "WO2 same-window sim-vs-Paper/Demo comparison (Omega fleet config). The mt5_demo ledger is Dragon-local; until a fleet-readable mirror exists this seat types LEDGER_UNAVAILABLE honestly (F-P1-03). Use sim_vs_live_window_dragon_v1.json on Dragon.",
+  "comparison_db": "~/.local/state/lts/sim-vs-live-comparison.sqlite",
+  "state_file": "~/.local/state/lts/sim-vs-live/state.json",
+  "report_dir": "~/.local/state/lts/sim-vs-live/reports",
+  "incident": {
+    "repo": "~/Documents/GitHub/agent-multi",
+    "config": "~/Documents/GitHub/agent-multi/examples/configs/incident_ledger_v1.json",
+    "machine": "omega",
+    "front": "front2",
+    "source": "lts_sim_vs_live"
+  },
+  "seats": [
+    {
+      "seat": "ibkr_paper:usdcad-4h-linear-live-v1",
+      "venue": "ibkr_paper",
+      "instrument": "USD.CAD",
+      "timeframe": "4h",
+      "expected_asset_id": "fx:USD/CAD",
+      "expected_model_id": "usdcad-4h-linear-live-v1",
+      "execution_ledger": "~/.local/state/lts/ibkr-model-execution.sqlite",
+      "bars_source": "asof_ledger",
+      "artifact_file": "~/.local/share/prediction-provider/live/usdcad_4h_linear_v1/model.json",
+      "lookback_hours": 72,
+      "economic_assumptions": {
+        "sim_reference_price": "recorded_decision_quote_mid",
+        "sim_fill": "entry_slippage_measured_against_recorded_quote_mid",
+        "fees": "not_modeled_and_typed_unavailable",
+        "latency": "observed_lineage_only",
+        "position_sizing": "seat_L0_risk_envelope"
+      }
+    },
+    {
+      "seat": "alpaca_paper:spy-daily-linear-live-v1",
+      "venue": "alpaca_paper",
+      "instrument": "SPY",
+      "timeframe": "1d",
+      "expected_asset_id": "equity:SPY",
+      "expected_model_id": "spy-daily-linear-live-v1",
+      "execution_ledger": "~/.local/state/lts/alpaca-model-execution.sqlite",
+      "bars_source": "asof_ledger",
+      "artifact_file": "~/.local/share/prediction-provider/live/spy_daily_linear_v1/model.json",
+      "lookback_hours": 120,
+      "economic_assumptions": {
+        "sim_reference_price": "recorded_decision_quote_mid",
+        "sim_fill": "entry_slippage_measured_against_recorded_quote_mid",
+        "fees": "not_modeled_and_typed_unavailable",
+        "latency": "observed_lineage_only",
+        "position_sizing": "seat_L0_risk_envelope"
+      }
+    },
+    {
+      "seat": "mt5_demo:ethusdt-4h-linear-live-v1",
+      "venue": "mt5_demo",
+      "instrument": "ETHUSD",
+      "timeframe": "4h",
+      "expected_asset_id": "crypto:ETHUSD",
+      "expected_model_id": "ethusdt-4h-linear-live-v1",
+      "execution_ledger": "~/.local/state/lts/mt5-bridge.sqlite",
+      "bars_source": "mt5_bridge",
+      "bars_count": 60,
+      "artifact_file": "~/.local/share/prediction-provider/live/ethusdt_4h_linear_v1/model.json",
+      "lookback_hours": 96,
+      "economic_assumptions": {
+        "sim_reference_price": "recorded_decision_quote_mid",
+        "sim_fill": "entry_slippage_measured_against_recorded_quote_mid",
+        "fees": "not_modeled_and_typed_unavailable",
+        "latency": "observed_lineage_only",
+        "position_sizing": "seat_L0_risk_envelope"
+      }
+    }
+  ]
+}
