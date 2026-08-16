@@ -43,6 +43,22 @@ owner-gated: without a freshly minted, owner-signed, unconsumed
 capability bound to the exact seat, candidate, incumbent and report
 digests, every call refuses. Tests exercise ONLY isolated temporary
 stores and ledgers.
+
+Corrections of 2026-08-16 (Musashi order §3, findings 257 and 258):
+
+- broker truth is no longer an argument. The orchestrator takes a real
+  :class:`SuccessionVenue` (``app.succession_venue``) that OBSERVES the
+  venue and OWNS the drain executor, and it re-observes orders,
+  positions, balance and equity AFTER the drain — a pre-drain snapshot
+  cannot authorize a switch. The production entry point is
+  ``tools/promote_paper_champion.py``.
+- the ledger commit and the manifest switch are no longer two
+  independent steps. One durable ``promotion_saga`` row carries the
+  exact target manifest BYTES and a ``manifest_pending`` state committed
+  WITH the capability burn, so a crash anywhere is completable or
+  explicitly reversible (``resume_promotion_saga``) without a second
+  capability. While a saga is open, ``succession_pending`` makes every
+  runner refuse new risk and report the split state.
 """
 from __future__ import annotations
 
@@ -55,7 +71,7 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from app.ibkr_l1_capability import _parse_utc, capability_digest
 from app.ibkr_l1_executor import CapabilityRecord
@@ -114,6 +130,61 @@ MISSING_NATIVE_PROTECTION = "MISSING_NATIVE_PROTECTION"
 
 VERDICT_COMPATIBLE = "COMPATIBLE"
 VERDICT_INCOMPATIBLE = "INCOMPATIBLE"
+
+# ── the promotion saga (finding 258) ───────────────────────────────────
+#
+# The defect: the ledger commit (capability burn + successor session) and
+# the filesystem manifest switch were two independent steps. A crash in
+# between burned the capability, moved the active session to the
+# successor and left the manifest naming the incumbent — permanently,
+# because a re-run then selected against the CHANGED active session and
+# found its capability spent. Authority and pointer could disagree
+# forever with no operation able to reconcile them.
+#
+# The correction: one durable, resumable saga row. The exact target
+# manifest BYTES (not a recipe for them) and the exact previous bytes are
+# persisted BEFORE anything is burned; the burn commits together with the
+# `manifest_pending` state; and finalize/rollback are two idempotent
+# transitions that need no second capability and never re-select against
+# the already-changed active session.
+
+SAGA_SCHEMA_VERSION = "lts.succession.saga.v1"
+
+SAGA_PREPARED = "prepared"
+SAGA_MANIFEST_PENDING = "manifest_pending"
+SAGA_ROLLING_BACK = "rolling_back"
+SAGA_COMPLETED = "completed"
+SAGA_ROLLED_BACK = "rolled_back"
+SAGA_ABORTED = "aborted"
+#: while the saga is in ANY of these, the seat's authority and its
+#: manifest may disagree: runners refuse new risk and status says so.
+SAGA_OPEN_STATES = (SAGA_PREPARED, SAGA_MANIFEST_PENDING, SAGA_ROLLING_BACK)
+SAGA_TERMINAL_STATES = (SAGA_COMPLETED, SAGA_ROLLED_BACK, SAGA_ABORTED)
+
+#: Every point at which a crash must leave a completable-or-rollbackable
+#: state. The orchestrator calls ``boundary(name)`` after each one; the
+#: crash matrix injects a raise at every name in this tuple.
+BOUNDARY_FACTS_OBSERVED = "facts_observed"
+BOUNDARY_CAPABILITY_VALIDATED = "capability_validated"
+BOUNDARY_DRAIN = "drain"
+BOUNDARY_FACTS_REFRESHED = "facts_refreshed"
+BOUNDARY_LEDGER_PREPARED = "ledger_prepared"
+BOUNDARY_CAPABILITY_BURNED = "capability_burned"
+BOUNDARY_MANIFEST_TEMP_WRITTEN = "manifest_temp_written"
+BOUNDARY_MANIFEST_RENAMED = "manifest_renamed"
+BOUNDARY_LEDGER_FINALIZED = "ledger_finalized"
+
+PROMOTION_BOUNDARIES = (
+    BOUNDARY_FACTS_OBSERVED,
+    BOUNDARY_CAPABILITY_VALIDATED,
+    BOUNDARY_DRAIN,
+    BOUNDARY_FACTS_REFRESHED,
+    BOUNDARY_LEDGER_PREPARED,
+    BOUNDARY_CAPABILITY_BURNED,
+    BOUNDARY_MANIFEST_TEMP_WRITTEN,
+    BOUNDARY_MANIFEST_RENAMED,
+    BOUNDARY_LEDGER_FINALIZED,
+)
 
 
 class SuccessionError(RuntimeError):
@@ -222,12 +293,16 @@ class CandidateContract:
     preprocessing_sha256: str
     action: ActionContract
     execution: ExecutionContract
+    #: the on-disk config the seat manifest must point at after a switch;
+    #: empty means "this descriptor cannot build a successor manifest".
+    config_file: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "model_id": self.model_id, "model_kind": self.model_kind,
             "artifact_file": self.artifact_file,
             "artifact_sha256": self.artifact_sha256,
+            "config_file": self.config_file,
             "config_sha256": self.config_sha256,
             "asset_id": self.asset_id, "timeframe": self.timeframe,
             "observation_dim": self.observation_dim,
@@ -236,6 +311,85 @@ class CandidateContract:
             "action": self.action.to_dict(),
             "execution": self.execution.to_dict(),
         }
+
+
+# ── direct venue facts (finding 257: broker truth is never an argument) ─
+
+
+@dataclass(frozen=True)
+class VenueFacts:
+    """One instantaneous observation of DIRECT broker truth.
+
+    Every field must come from the venue's OWN fact interface (REST
+    account/orders/positions, the TWS session, the MT5 bridge snapshot the
+    terminal itself posted). ``source`` names that interface verbatim so a
+    reader can tell a direct observation from a derived one. Nothing in
+    this module ever constructs a ``VenueFacts`` from operator-supplied
+    JSON: an entry point that accepts fake account/order/position input as
+    broker truth is exactly the defect this type exists to prevent.
+    """
+
+    venue: str
+    account_fingerprint: str
+    instrument: str
+    observed_at: datetime
+    cash: float
+    equity: float
+    open_orders: tuple[Any, ...]
+    positions: tuple[Any, ...]
+    instrument_capability: Mapping[str, Any]
+    source: str
+
+    @property
+    def flat(self) -> bool:
+        return not self.open_orders and not self.positions
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "venue": self.venue,
+            "account_fingerprint": self.account_fingerprint,
+            "instrument": self.instrument,
+            "observed_at": self.observed_at.isoformat(),
+            "cash": self.cash,
+            "equity": self.equity,
+            "open_orders": len(self.open_orders),
+            "positions": len(self.positions),
+            "instrument_capability": dict(self.instrument_capability),
+            "source": self.source,
+        }
+
+    def summary(self) -> dict[str, Any]:
+        """Counts and typed availability only — no balances, no tickets."""
+        data = self.to_dict()
+        data.pop("cash")
+        data.pop("equity")
+        data["balance_available"] = True
+        data["equity_available"] = True
+        return data
+
+
+class SuccessionVenue(Protocol):
+    """The narrow interface a real seat must implement to be promotable.
+
+    ``fetch_facts`` is a fresh DIRECT observation every time it is called
+    — the orchestrator calls it again AFTER the drain because a pre-drain
+    snapshot can never authorize a switch (finding 257/258 correction).
+    """
+
+    venue: str
+
+    def fetch_facts(self) -> VenueFacts:
+        ...
+
+    def drain_for_succession(
+        self,
+        *,
+        reason: str,
+        incumbent_session_id: str,
+        successor_artifact_sha256: str,
+        now: datetime,
+    ) -> list[dict[str, Any]]:
+        ...
 
 
 # ── stage 1: artifact compatibility preflight ──────────────────────────
@@ -998,6 +1152,13 @@ def _carry_sql(
     session_id = _session_id(
         venue, account, symbol, successor["model_id"],
         successor["artifact_sha256"], successor["config_sha256"])
+    if con.execute("SELECT 1 FROM live_model_sessions WHERE session_id=?",
+                   (session_id,)).fetchone() is not None:
+        # A rolled-back succession leaves the deterministic session id
+        # occupied; a later, legitimately re-authorized promotion of the
+        # SAME candidate must still be able to open a session.
+        session_id = session_id + "-" + hashlib.sha256(
+            now.isoformat().encode()).hexdigest()[:8]
     con.execute(
         "INSERT INTO live_model_sessions VALUES "
         "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1008,16 +1169,58 @@ def _carry_sql(
     return session_id
 
 
+def _post_drain_facts(
+    venue: Any, *, before: VenueFacts, seat: SeatContract,
+) -> VenueFacts:
+    """Re-observe the venue AFTER the drain and prove it is the same seat.
+
+    Finding 257/258 correction: a pre-drain snapshot can never authorize a
+    switch. The refreshed observation must name the same account and the
+    same instrument, or the route moved under us and everything refuses.
+    """
+    after = venue.fetch_facts()
+    if not isinstance(after, VenueFacts):
+        raise SuccessionError(
+            "venue.fetch_facts() must return direct VenueFacts; operator"
+            " supplied broker truth is never accepted")
+    if after.account_fingerprint != before.account_fingerprint:
+        raise SuccessionError(
+            "the venue account changed between the pre-drain and"
+            " post-drain observations; refusing")
+    if after.instrument != before.instrument or after.venue != seat.venue:
+        raise SuccessionError(
+            "the venue route changed between the pre-drain and post-drain"
+            " observations; refusing")
+    if after.observed_at < before.observed_at:
+        raise SuccessionError(
+            "the post-drain observation is older than the pre-drain"
+            " observation — a stale snapshot cannot authorize a switch")
+    return after
+
+
+def _actual_balance(facts: VenueFacts) -> tuple[float, float]:
+    try:
+        balance = float(facts.cash)
+        equity = float(facts.equity)
+    except (TypeError, ValueError) as exc:
+        raise SuccessionError(
+            "broker account snapshot lacks cash/equity — the successor"
+            " starting state must be an ACTUAL broker fact, never a"
+            " default") from exc
+    if balance != balance or equity != equity:      # NaN is unknown
+        raise SuccessionError(
+            "broker cash/equity is not a finite number — unknown is a"
+            " refusal")
+    return balance, equity
+
+
 def drain_and_carry_session(
     *,
     store: L1ExecutionOlap,
-    executor: Any,
+    venue: Any,
     seat: SeatContract,
     successor: Mapping[str, str],
     account_fingerprint: str,
-    open_orders: Sequence[Any],
-    positions: Sequence[Any],
-    account: Mapping[str, Any],
     reason: str,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
@@ -1025,11 +1228,12 @@ def drain_and_carry_session(
     carry the ACTUAL post-close balance/equity into the successor session
     (Alpaca 2026-08-03 precedent; both model hashes recorded).
 
-    ``open_orders``/``positions``/``account`` are DIRECT broker facts
-    gathered THIS tick by the caller; this function never opens a socket.
-    While the seat is not flat (and the contract says ``close_all``) the
-    result is a typed ``draining_for_succession`` — no carry happens and
-    nothing is consumed."""
+    The orders/positions/balance/equity that decide and authorize the
+    carry are DIRECT facts observed AFTER the drain, through
+    ``venue.fetch_facts()``. Pre-drain facts only decide whether the drain
+    is attempted. While the seat is not flat (and the contract says
+    ``close_all``) the result is a typed ``draining_for_succession`` — no
+    carry happens and nothing is consumed."""
     now = now or _utc_now()
     for key in ("model_id", "artifact_sha256", "config_sha256"):
         if not successor.get(key):
@@ -1041,7 +1245,12 @@ def drain_and_carry_session(
         raise SuccessionError(
             "no active incumbent session for this seat — unknown"
             " incumbency is a refusal, not an empty carry")
-    drained = executor.drain_for_succession(reason)
+    before = venue.fetch_facts()
+    drained = venue.drain_for_succession(
+        reason=reason, incumbent_session_id=incumbent["session_id"],
+        successor_artifact_sha256=successor["artifact_sha256"], now=now)
+    facts = _post_drain_facts(venue, before=before, seat=seat)
+    open_orders, positions = facts.open_orders, facts.positions
     if open_orders or positions:
         if (positions and not open_orders
                 and seat.execution.transfer_policy == "transfer_permitted"):
@@ -1056,17 +1265,12 @@ def drain_and_carry_session(
                 "open_orders": len(open_orders),
                 "positions": len(positions),
                 "transfer_policy": seat.execution.transfer_policy,
+                "facts_source": facts.source,
+                "facts_observed_at": facts.observed_at.isoformat(),
             }
     else:
         transferred = []
-    try:
-        balance = float(account["cash"])
-        equity = float(account["equity"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SuccessionError(
-            "broker account snapshot lacks cash/equity — the successor"
-            " starting state must be an ACTUAL broker fact, never a"
-            " default") from exc
+    balance, equity = _actual_balance(facts)
     session_id = _carry_sql(
         con, venue=seat.venue, account=account_fingerprint,
         symbol=seat.instrument,
@@ -1096,6 +1300,8 @@ def drain_and_carry_session(
         "transferred_positions": transferred,
         "drained": list(drained),
         "reason": reason,
+        "facts_source": facts.source,
+        "facts_observed_at": facts.observed_at.isoformat(),
         "at": now.isoformat(),
     }
     store.set_state(
@@ -1115,7 +1321,22 @@ def _fsync_dir(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_write(target: Path, data: bytes) -> None:
+def _atomic_write(
+    target: Path,
+    data: bytes,
+    *,
+    boundary: Optional[Callable[[str], None]] = None,
+    temp_boundary: str = "",
+    rename_boundary: str = "",
+) -> None:
+    """tmp + fsync + rename, with the two crash boundaries NAMED.
+
+    ``boundary`` (default ``None``) is called after the temp file is
+    durable and again after the rename+directory fsync. Production passes
+    nothing; the crash-injection tests pass a callable that raises, which
+    is how "crash after temp write" and "crash after rename" become
+    reproducible instead of theoretical.
+    """
     tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
     descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
@@ -1123,8 +1344,12 @@ def _atomic_write(target: Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        if boundary is not None and temp_boundary:
+            boundary(temp_boundary)
         os.replace(tmp, target)
         _fsync_dir(target.parent)
+        if boundary is not None and rename_boundary:
+            boundary(rename_boundary)
     finally:
         if tmp.exists():
             tmp.unlink()
@@ -1135,6 +1360,7 @@ def switch_manifest_atomically(
     new_manifest: Mapping[str, Any] | bytes,
     *,
     expected_previous_sha256: Optional[str] = None,
+    boundary: Optional[Callable[[str], None]] = None,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """Flip the seat's manifest pointer atomically (tmp+fsync+rename).
@@ -1169,7 +1395,9 @@ def switch_manifest_atomically(
     preserved = manifest_path.parent / (
         f"{manifest_path.name}.prev.{previous_sha256[:8]}.{stamp}")
     _atomic_write(preserved, previous_bytes)
-    _atomic_write(manifest_path, new_bytes)
+    _atomic_write(manifest_path, new_bytes, boundary=boundary,
+                  temp_boundary=BOUNDARY_MANIFEST_TEMP_WRITTEN,
+                  rename_boundary=BOUNDARY_MANIFEST_RENAMED)
     return {
         "schema": SWITCH_SCHEMA,
         "manifest_file": str(manifest_path),
@@ -1327,65 +1555,771 @@ def record_outgoing_shadow_decision(
     }
 
 
+# ── the resumable promotion saga (finding 258) ─────────────────────────
+
+_SAGA_TABLE = """
+CREATE TABLE IF NOT EXISTS promotion_saga (
+    saga_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    state TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    account_fingerprint TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    capability_sha256 TEXT NOT NULL,
+    nonce_sha256 TEXT NOT NULL,
+    capability_metadata_json TEXT NOT NULL,
+    incumbent_session_id TEXT NOT NULL,
+    incumbent_model_id TEXT NOT NULL,
+    incumbent_artifact_sha256 TEXT NOT NULL,
+    incumbent_config_sha256 TEXT NOT NULL,
+    successor_model_id TEXT NOT NULL,
+    successor_artifact_sha256 TEXT NOT NULL,
+    successor_config_sha256 TEXT NOT NULL,
+    successor_session_id TEXT,
+    carry_balance REAL NOT NULL,
+    carry_equity REAL NOT NULL,
+    manifest_file TEXT NOT NULL,
+    manifest_previous_sha256 TEXT NOT NULL,
+    manifest_previous_bytes BLOB NOT NULL,
+    manifest_target_sha256 TEXT NOT NULL,
+    manifest_target_bytes BLOB NOT NULL,
+    preserved_path TEXT,
+    outgoing_shadow_json TEXT NOT NULL,
+    facts_json TEXT NOT NULL,
+    audit_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome_reason TEXT
+)
+"""
+
+_SAGA_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_promotion_saga_per_seat
+ON promotion_saga(venue, account_fingerprint, instrument)
+WHERE state IN ('prepared','manifest_pending','rolling_back')
+"""
+
+_SAGA_COLUMNS = (
+    "saga_id", "schema_version", "state", "venue", "account_fingerprint",
+    "instrument", "timeframe", "capability_sha256", "nonce_sha256",
+    "capability_metadata_json", "incumbent_session_id",
+    "incumbent_model_id", "incumbent_artifact_sha256",
+    "incumbent_config_sha256", "successor_model_id",
+    "successor_artifact_sha256", "successor_config_sha256",
+    "successor_session_id", "carry_balance", "carry_equity",
+    "manifest_file", "manifest_previous_sha256", "manifest_previous_bytes",
+    "manifest_target_sha256", "manifest_target_bytes", "preserved_path",
+    "outgoing_shadow_json", "facts_json", "audit_json", "created_at",
+    "updated_at", "finished_at", "outcome_reason",
+)
+
+
+def ensure_saga_schema(store: L1ExecutionOlap) -> None:
+    """Idempotent DDL, safe INSIDE an open ledger transaction.
+
+    Deliberately two ``execute`` calls rather than ``executescript``:
+    ``executescript`` COMMITs whatever transaction is open, which would
+    silently break the atomicity of the very unit this saga exists to
+    guarantee.
+    """
+    store._con.execute(_SAGA_TABLE)
+    store._con.execute(_SAGA_INDEX)
+
+
+def _saga_dict(row: Sequence[Any]) -> dict[str, Any]:
+    saga = dict(zip(_SAGA_COLUMNS, row))
+    saga["capability_metadata"] = json.loads(
+        saga["capability_metadata_json"])
+    saga["outgoing_shadow"] = json.loads(saga["outgoing_shadow_json"])
+    saga["facts"] = json.loads(saga["facts_json"])
+    saga["audit"] = json.loads(saga["audit_json"])
+    for key in ("manifest_previous_bytes", "manifest_target_bytes"):
+        saga[key] = bytes(saga[key])
+    return saga
+
+
+def _select_saga(store: L1ExecutionOlap, where: str,
+                 params: tuple) -> Optional[dict[str, Any]]:
+    ensure_saga_schema(store)
+    row = store._con.execute(
+        f"SELECT {','.join(_SAGA_COLUMNS)} FROM promotion_saga WHERE"
+        f" {where}", params).fetchone()
+    return None if row is None else _saga_dict(row)
+
+
+def saga_row(store: L1ExecutionOlap, saga_id: str) -> Optional[dict[str, Any]]:
+    return _select_saga(store, "saga_id=?", (saga_id,))
+
+
+def open_promotion_saga(
+    store: L1ExecutionOlap, *, venue: str, account_fingerprint: str,
+    instrument: str,
+) -> Optional[dict[str, Any]]:
+    """The one open saga for this seat, or None. Open means the seat's
+    authority and its manifest may disagree right now."""
+    placeholders = ",".join("?" for _ in SAGA_OPEN_STATES)
+    return _select_saga(
+        store,
+        "venue=? AND account_fingerprint=? AND instrument=? AND state IN"
+        f" ({placeholders})",
+        (venue, account_fingerprint, instrument, *SAGA_OPEN_STATES))
+
+
+def succession_pending(
+    store: L1ExecutionOlap, *, venue: str, instrument: str,
+    account_fingerprint: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Runner-facing gate (order §3.4).
+
+    Returns a typed, heartbeat-safe summary while a promotion saga is
+    open for this seat, else None. While it returns a value the runner
+    must refuse NEW risk: the ledger's active session and the manifest
+    the runner would load are not provably the same model.
+    """
+    ensure_saga_schema(store)
+    placeholders = ",".join("?" for _ in SAGA_OPEN_STATES)
+    where = f"venue=? AND instrument=? AND state IN ({placeholders})"
+    params: tuple = (venue, instrument, *SAGA_OPEN_STATES)
+    if account_fingerprint:
+        where = ("venue=? AND account_fingerprint=? AND instrument=? AND"
+                 f" state IN ({placeholders})")
+        params = (venue, account_fingerprint, instrument, *SAGA_OPEN_STATES)
+    saga = _select_saga(store, where, params)
+    if saga is None:
+        return None
+    manifest = Path(saga["manifest_file"])
+    try:
+        current_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    except OSError:
+        current_sha256 = ""
+    if current_sha256 == saga["manifest_target_sha256"]:
+        manifest_points_at = "successor"
+    elif current_sha256 == saga["manifest_previous_sha256"]:
+        manifest_points_at = "incumbent"
+    else:
+        manifest_points_at = "unknown"
+    return {
+        "schema": SAGA_SCHEMA_VERSION,
+        "saga_id": saga["saga_id"],
+        "state": saga["state"],
+        "venue": saga["venue"],
+        "instrument": saga["instrument"],
+        "ledger_authority": (
+            "successor" if saga["state"] in (
+                SAGA_MANIFEST_PENDING, SAGA_ROLLING_BACK) else "incumbent"),
+        "manifest_points_at": manifest_points_at,
+        "split_authority": (
+            saga["state"] in (SAGA_MANIFEST_PENDING, SAGA_ROLLING_BACK)
+            and manifest_points_at != "successor"),
+        "incumbent_model_id": saga["incumbent_model_id"],
+        "successor_model_id": saga["successor_model_id"],
+        "manifest_file": saga["manifest_file"],
+        "since": saga["created_at"],
+        "detail": (
+            "a promotion saga is open for this seat; new risk is refused"
+            " until it is completed or explicitly rolled back"
+            " (tools/promote_paper_champion.py --action resume-complete"
+            " | resume-rollback)"),
+    }
+
+
+def _saga_id(record: CapabilityRecord) -> str:
+    return "promotion-saga-" + record.nonce_sha256[:16]
+
+
+def _mark_capability(con: sqlite3.Connection, capability_sha256: str,
+                     state: str, reason: str) -> None:
+    """Keep the burn (the nonce stays spent forever) and record WHY the
+    spent capability did not seat a successor."""
+    row = con.execute(
+        "SELECT metadata_json FROM l1_capabilities WHERE capability_sha256=?",
+        (capability_sha256,)).fetchone()
+    metadata = json.loads(row[0]) if row else {}
+    metadata["spent_outcome"] = state
+    metadata["spent_reason"] = reason[:400]
+    con.execute(
+        "UPDATE l1_capabilities SET state=?, metadata_json=? "
+        "WHERE capability_sha256=?",
+        (state, json.dumps(metadata, sort_keys=True), capability_sha256))
+
+
+def prepare_promotion_saga(
+    store: L1ExecutionOlap,
+    *,
+    seat: SeatContract,
+    candidate: CandidateContract,
+    incumbent: Mapping[str, Any],
+    record: CapabilityRecord,
+    facts: VenueFacts,
+    target_manifest: Mapping[str, Any] | bytes,
+    outgoing_shadow: Mapping[str, Any],
+    audit: Mapping[str, Any],
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Persist the WHOLE intended switch before anything is burned.
+
+    The exact target manifest bytes and the exact current bytes are stored
+    in the ledger, so the operation is completable (or reversible) from
+    the row alone — no recomputation, no second capability, no dependence
+    on any file that a crash could have half-written.
+    """
+    now = now or _utc_now()
+    ensure_saga_schema(store)
+    manifest_path = Path(
+        os.path.expandvars(str(seat.manifest_file))).expanduser()
+    if not manifest_path.is_file():
+        raise SuccessionError(
+            f"seat manifest {manifest_path} does not exist — a promotion"
+            " switches an existing pointer, it never creates a seat")
+    previous_bytes = manifest_path.read_bytes()
+    previous_sha256 = hashlib.sha256(previous_bytes).hexdigest()
+    if isinstance(target_manifest, (bytes, bytearray)):
+        target_bytes = bytes(target_manifest)
+        json.loads(target_bytes)
+    else:
+        target_bytes = json.dumps(
+            dict(target_manifest), indent=1, sort_keys=True).encode() + b"\n"
+    target_sha256 = hashlib.sha256(target_bytes).hexdigest()
+    if target_sha256 == previous_sha256:
+        raise SuccessionError(
+            "target manifest is byte-identical to the current manifest —"
+            " there is nothing to switch")
+    existing = open_promotion_saga(
+        store, venue=seat.venue,
+        account_fingerprint=facts.account_fingerprint,
+        instrument=seat.instrument)
+    if existing is not None:
+        raise SuccessionError(
+            f"seat already has an open promotion saga"
+            f" {existing['saga_id']} in state {existing['state']}; finish"
+            " or roll it back before starting another")
+    saga_id = _saga_id(record)
+    values = (
+        saga_id, SAGA_SCHEMA_VERSION, SAGA_PREPARED, seat.venue,
+        facts.account_fingerprint, seat.instrument, seat.timeframe,
+        record.capability_sha256, record.nonce_sha256,
+        json.dumps(dict(record.metadata), sort_keys=True),
+        str(incumbent["session_id"]), str(incumbent["model_id"]),
+        str(incumbent["artifact_sha256"]), str(incumbent["config_sha256"]),
+        candidate.model_id, candidate.artifact_sha256,
+        candidate.config_sha256, None,
+        float(facts.cash), float(facts.equity),
+        str(manifest_path), previous_sha256, previous_bytes,
+        target_sha256, target_bytes, None,
+        json.dumps(dict(outgoing_shadow), sort_keys=True),
+        json.dumps(facts.to_dict(), sort_keys=True),
+        json.dumps(dict(audit), sort_keys=True, default=str),
+        now.isoformat(), now.isoformat(), None, None,
+    )
+    try:
+        with store.atomic_unit():
+            store._con.execute(
+                "INSERT INTO promotion_saga VALUES"
+                f" ({','.join('?' for _ in _SAGA_COLUMNS)})", values)
+    except sqlite3.IntegrityError as exc:
+        raise SuccessionError(
+            "a promotion saga already exists for this capability or seat;"
+            " a capability that entered a saga is spent — mint a fresh one"
+        ) from exc
+    return saga_row(store, saga_id) or {}
+
+
+def commit_ledger_authority(
+    store: L1ExecutionOlap,
+    saga: Mapping[str, Any],
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """``prepared`` → ``manifest_pending`` in ONE ledger transaction.
+
+    The capability burn, the incumbent close, the successor open, the
+    outgoing-shadow registration and the DECLARATION that the manifest is
+    not yet switched all commit together. After this returns there is a
+    window in which authority and pointer disagree — but the window is
+    now a durable, named, resumable state instead of an invisible gap.
+    """
+    now = now or _utc_now()
+    saga_id = str(saga["saga_id"])
+    con = store._con
+    try:
+        with store.atomic_unit():
+            current = saga_row(store, saga_id)
+            if current is None:
+                raise SuccessionError(f"promotion saga {saga_id} is gone")
+            if current["state"] == SAGA_MANIFEST_PENDING:
+                return current                      # idempotent replay
+            if current["state"] != SAGA_PREPARED:
+                raise SuccessionError(
+                    f"promotion saga {saga_id} is {current['state']};"
+                    " only a prepared saga can take ledger authority")
+            if store.nonce_consumed(current["nonce_sha256"]):
+                raise SuccessionError(
+                    "this capability was already consumed; promotion needs"
+                    " a freshly minted capability")
+            still = _active_session(
+                con, current["venue"], current["account_fingerprint"],
+                current["instrument"])
+            if (still is None
+                    or still["session_id"] != current["incumbent_session_id"]):
+                raise SuccessionError(
+                    "the incumbent session changed while promoting —"
+                    " re-run against current seat truth")
+            store.consume_capability(
+                current["capability_sha256"], current["nonce_sha256"],
+                {**current["capability_metadata"],
+                 "consumed_for": "paper_promotion",
+                 "saga_id": saga_id},
+                saga_id)
+            session_id = _carry_sql(
+                con, venue=current["venue"],
+                account=current["account_fingerprint"],
+                symbol=current["instrument"],
+                incumbent_session_id=current["incumbent_session_id"],
+                successor={
+                    "model_id": current["successor_model_id"],
+                    "artifact_sha256": current["successor_artifact_sha256"],
+                    "config_sha256": current["successor_config_sha256"],
+                },
+                balance=float(current["carry_balance"]),
+                equity=float(current["carry_equity"]), now=now)
+            store.set_state(
+                f"outgoing_shadow:{current['venue']}:{current['instrument']}",
+                current["outgoing_shadow_json"])
+            audit = dict(current["audit"])
+            audit["state"] = "promoted_ledger_committed"
+            audit["saga_id"] = saga_id
+            audit.setdefault("incoming", {})["session_id"] = session_id
+            con.execute(
+                "UPDATE promotion_saga SET state=?, successor_session_id=?,"
+                " audit_json=?, updated_at=? WHERE saga_id=?",
+                (SAGA_MANIFEST_PENDING, session_id,
+                 json.dumps(audit, sort_keys=True, default=str),
+                 now.isoformat(), saga_id))
+            store.set_state(
+                f"last_promotion:{current['venue']}:{current['instrument']}",
+                json.dumps(audit, sort_keys=True, default=str))
+    except sqlite3.IntegrityError as exc:
+        raise SuccessionError(
+            "capability burn conflicted with a concurrent consumer;"
+            " treat this capability as spent") from exc
+    return saga_row(store, saga_id) or {}
+
+
+def _switch_manifest_for_saga(
+    saga: Mapping[str, Any],
+    *,
+    now: datetime,
+    boundary: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Idempotent, byte-exact pointer flip driven ONLY by the saga row."""
+    manifest_path = Path(str(saga["manifest_file"]))
+    target_bytes = bytes(saga["manifest_target_bytes"])
+    target_sha256 = str(saga["manifest_target_sha256"])
+    previous_sha256 = str(saga["manifest_previous_sha256"])
+    if not manifest_path.is_file():
+        raise SuccessionError(
+            f"seat manifest {manifest_path} disappeared while the"
+            " promotion saga was pending; refusing to recreate a seat")
+    current_bytes = manifest_path.read_bytes()
+    current_sha256 = hashlib.sha256(current_bytes).hexdigest()
+    if current_sha256 == target_sha256:
+        return {
+            "schema": SWITCH_SCHEMA,
+            "manifest_file": str(manifest_path),
+            "previous_sha256": previous_sha256,
+            "new_sha256": target_sha256,
+            "preserved_path": saga.get("preserved_path"),
+            "already_switched": True,
+            "switched_at": now.isoformat(),
+        }
+    if current_sha256 != previous_sha256:
+        raise SuccessionError(
+            "the seat manifest is neither the recorded previous nor the"
+            f" recorded target manifest (found {current_sha256[:16]}…);"
+            " a third party changed it — refusing to complete or roll"
+            " back until the owner reconciles it")
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    preserved = manifest_path.parent / (
+        f"{manifest_path.name}.prev.{previous_sha256[:8]}.{stamp}")
+    _atomic_write(preserved, current_bytes)
+    _atomic_write(manifest_path, target_bytes, boundary=boundary,
+                  temp_boundary=BOUNDARY_MANIFEST_TEMP_WRITTEN,
+                  rename_boundary=BOUNDARY_MANIFEST_RENAMED)
+    written = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    if written != target_sha256:
+        raise SuccessionError(
+            "the switched manifest does not hash to the recorded target"
+            " byte snapshot; refusing to declare the promotion complete")
+    return {
+        "schema": SWITCH_SCHEMA,
+        "manifest_file": str(manifest_path),
+        "previous_sha256": previous_sha256,
+        "new_sha256": target_sha256,
+        "preserved_path": str(preserved),
+        "already_switched": False,
+        "switched_at": now.isoformat(),
+    }
+
+
+def finalize_promotion_saga(
+    store: L1ExecutionOlap,
+    saga: Mapping[str, Any],
+    *,
+    now: Optional[datetime] = None,
+    boundary: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """``manifest_pending`` → ``completed``. Idempotent in both halves:
+    the switch is a no-op when the manifest already carries the recorded
+    target bytes, and a completed saga finalizes to itself."""
+    now = now or _utc_now()
+    saga_id = str(saga["saga_id"])
+    current = saga_row(store, saga_id)
+    if current is None:
+        raise SuccessionError(f"promotion saga {saga_id} is gone")
+    if current["state"] == SAGA_COMPLETED:
+        return {**_saga_result(current), "replayed": True}
+    if current["state"] != SAGA_MANIFEST_PENDING:
+        raise SuccessionError(
+            f"promotion saga {saga_id} is {current['state']}; only a"
+            " manifest_pending saga can be completed")
+    switch = _switch_manifest_for_saga(current, now=now, boundary=boundary)
+    with store.atomic_unit():
+        store._con.execute(
+            "UPDATE promotion_saga SET state=?, preserved_path=?,"
+            " updated_at=?, finished_at=?, outcome_reason=?"
+            " WHERE saga_id=? AND state=?",
+            (SAGA_COMPLETED, switch.get("preserved_path"), now.isoformat(),
+             now.isoformat(), "manifest switched to the recorded target"
+             " byte snapshot", saga_id, SAGA_MANIFEST_PENDING))
+    if boundary is not None:
+        boundary(BOUNDARY_LEDGER_FINALIZED)
+    completed = saga_row(store, saga_id) or {}
+    result = {**_saga_result(completed), "manifest_switch": switch}
+    store.set_state(
+        f"last_promotion:{completed['venue']}:{completed['instrument']}",
+        json.dumps(result, sort_keys=True, default=str))
+    return result
+
+
+def _rollback_manifest_for_saga(
+    saga: Mapping[str, Any], *, now: datetime,
+) -> dict[str, Any]:
+    manifest_path = Path(str(saga["manifest_file"]))
+    previous_bytes = bytes(saga["manifest_previous_bytes"])
+    previous_sha256 = str(saga["manifest_previous_sha256"])
+    target_sha256 = str(saga["manifest_target_sha256"])
+    if not manifest_path.is_file():
+        raise SuccessionError(
+            f"seat manifest {manifest_path} is missing; rollback refused")
+    current_sha256 = hashlib.sha256(
+        manifest_path.read_bytes()).hexdigest()
+    if current_sha256 == previous_sha256:
+        return {"schema": ROLLBACK_SCHEMA, "restored": False,
+                "manifest_file": str(manifest_path),
+                "restored_sha256": previous_sha256,
+                "rolled_back_at": now.isoformat()}
+    if current_sha256 != target_sha256:
+        raise SuccessionError(
+            "the seat manifest is neither the recorded previous nor the"
+            f" recorded target manifest (found {current_sha256[:16]}…);"
+            " rollback refused")
+    _atomic_write(manifest_path, previous_bytes)
+    written = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    if written != previous_sha256:
+        raise SuccessionError(
+            "the restored manifest does not hash to the recorded previous"
+            " byte snapshot; rollback refused")
+    return {"schema": ROLLBACK_SCHEMA, "restored": True,
+            "manifest_file": str(manifest_path),
+            "restored_sha256": previous_sha256,
+            "rolled_back_from_sha256": target_sha256,
+            "rolled_back_at": now.isoformat()}
+
+
+def rollback_promotion_saga(
+    store: L1ExecutionOlap,
+    saga: Mapping[str, Any],
+    *,
+    reason: str,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Explicitly undo the SAME operation, coherently.
+
+    ``prepared``        → ``aborted``: nothing was burned by the ledger
+      yet, so the burn happens HERE with the abort reason. A capability
+      that entered a saga is spent whatever the outcome — the store shows
+      it CONSUMED and the ledger row records why.
+    ``manifest_pending``/``rolling_back`` → ``rolled_back``: the manifest
+      is restored to the recorded previous bytes FIRST (so a crash mid
+      rollback never leaves the successor manifest with the incumbent
+      seated), then one ledger unit closes the successor session,
+      reactivates the incumbent session unchanged, clears the outgoing
+      shadow registration and marks the spent capability with the reason.
+    """
+    now = now or _utc_now()
+    saga_id = str(saga["saga_id"])
+    con = store._con
+    current = saga_row(store, saga_id)
+    if current is None:
+        raise SuccessionError(f"promotion saga {saga_id} is gone")
+    if current["state"] in (SAGA_ROLLED_BACK, SAGA_ABORTED):
+        return {**_saga_result(current), "replayed": True}
+    if current["state"] == SAGA_COMPLETED:
+        raise SuccessionError(
+            f"promotion saga {saga_id} already completed; a completed"
+            " promotion is undone by a NEW owner-signed succession, never"
+            " by a rollback")
+    if current["state"] == SAGA_PREPARED:
+        with store.atomic_unit():
+            if not store.nonce_consumed(current["nonce_sha256"]):
+                store.consume_capability(
+                    current["capability_sha256"], current["nonce_sha256"],
+                    {**current["capability_metadata"],
+                     "consumed_for": "paper_promotion_aborted",
+                     "saga_id": saga_id},
+                    saga_id)
+            _mark_capability(con, current["capability_sha256"],
+                             "consumed_saga_aborted", reason)
+            con.execute(
+                "UPDATE promotion_saga SET state=?, updated_at=?,"
+                " finished_at=?, outcome_reason=? WHERE saga_id=? AND"
+                " state=?",
+                (SAGA_ABORTED, now.isoformat(), now.isoformat(), reason,
+                 saga_id, SAGA_PREPARED))
+        return {**_saga_result(saga_row(store, saga_id) or {}),
+                "manifest_rollback": {"restored": False,
+                                      "detail": "manifest was never"
+                                                " switched"}}
+    # manifest_pending / rolling_back
+    if current["state"] == SAGA_MANIFEST_PENDING:
+        with store.atomic_unit():
+            con.execute(
+                "UPDATE promotion_saga SET state=?, updated_at=?,"
+                " outcome_reason=? WHERE saga_id=? AND state=?",
+                (SAGA_ROLLING_BACK, now.isoformat(), reason, saga_id,
+                 SAGA_MANIFEST_PENDING))
+        current = saga_row(store, saga_id) or current
+    restored = _rollback_manifest_for_saga(current, now=now)
+    with store.atomic_unit():
+        successor_session = current.get("successor_session_id")
+        if successor_session:
+            con.execute(
+                "UPDATE live_model_sessions SET state='rolled_back',"
+                " ended_at=? WHERE session_id=? AND state='active'",
+                (now.isoformat(), successor_session))
+        con.execute(
+            "UPDATE live_model_sessions SET state='active', ended_at=NULL,"
+            " ending_balance=NULL, ending_equity=NULL WHERE session_id=?",
+            (current["incumbent_session_id"],))
+        store.set_state(
+            f"outgoing_shadow:{current['venue']}:{current['instrument']}",
+            "")
+        _mark_capability(con, current["capability_sha256"],
+                         "consumed_saga_rolled_back", reason)
+        con.execute(
+            "UPDATE promotion_saga SET state=?, updated_at=?,"
+            " finished_at=?, outcome_reason=? WHERE saga_id=?",
+            (SAGA_ROLLED_BACK, now.isoformat(), now.isoformat(), reason,
+             saga_id))
+    rolled = saga_row(store, saga_id) or {}
+    result = {**_saga_result(rolled), "manifest_rollback": restored}
+    store.set_state(
+        f"last_promotion:{rolled['venue']}:{rolled['instrument']}",
+        json.dumps(result, sort_keys=True, default=str))
+    return result
+
+
+def _saga_result(saga: Mapping[str, Any]) -> dict[str, Any]:
+    """The typed, JSON-safe view of a saga row (never the raw bytes)."""
+    if not saga:
+        return {}
+    state = str(saga["state"])
+    return {
+        "schema": PROMOTION_RESULT_SCHEMA,
+        "saga_id": saga["saga_id"],
+        "saga_state": state,
+        "state": {
+            SAGA_COMPLETED: "promoted",
+            SAGA_ROLLED_BACK: "rolled_back",
+            SAGA_ABORTED: "aborted",
+            SAGA_PREPARED: "prepared",
+            SAGA_MANIFEST_PENDING: "manifest_pending",
+            SAGA_ROLLING_BACK: "rolling_back",
+        }.get(state, state),
+        "venue": saga["venue"],
+        "instrument": saga["instrument"],
+        "timeframe": saga["timeframe"],
+        "capability_consumed": state != SAGA_PREPARED,
+        "capability_sha256": saga["capability_sha256"],
+        "incumbent": {
+            "session_id": saga["incumbent_session_id"],
+            "model_id": saga["incumbent_model_id"],
+            "artifact_sha256": saga["incumbent_artifact_sha256"],
+        },
+        "successor": {
+            "session_id": saga["successor_session_id"],
+            "model_id": saga["successor_model_id"],
+            "artifact_sha256": saga["successor_artifact_sha256"],
+        },
+        "manifest_file": saga["manifest_file"],
+        "manifest_previous_sha256": saga["manifest_previous_sha256"],
+        "manifest_target_sha256": saga["manifest_target_sha256"],
+        "outgoing_shadow": saga["outgoing_shadow"],
+        "audit": saga["audit"],
+        "created_at": saga["created_at"],
+        "finished_at": saga["finished_at"],
+        "outcome_reason": saga["outcome_reason"],
+    }
+
+
+def resume_promotion_saga(
+    store: L1ExecutionOlap,
+    *,
+    venue: str,
+    account_fingerprint: str,
+    instrument: str,
+    action: str = "auto",
+    reason: str = "",
+    now: Optional[datetime] = None,
+    boundary: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Finish the SAME interrupted operation after a restart.
+
+    No second capability is minted or selected, and nothing is decided by
+    re-reading the active session (which the interrupted operation may
+    already have changed): every fact comes from the saga row.
+
+    ``auto`` completes a ``manifest_pending``/``rolling_back`` saga in the
+    direction it already committed to, and aborts a ``prepared`` one —
+    a prepared saga's authorizing venue facts are stale after a crash.
+    """
+    now = now or _utc_now()
+    if action not in ("auto", "complete", "rollback"):
+        raise SuccessionError(
+            f"unknown resume action {action!r}; use auto|complete|rollback")
+    saga = open_promotion_saga(
+        store, venue=venue, account_fingerprint=account_fingerprint,
+        instrument=instrument)
+    if saga is None:
+        raise SuccessionError(
+            "no open promotion saga for this seat; nothing to resume")
+    state = saga["state"]
+    if state == SAGA_ROLLING_BACK:
+        if action == "complete":
+            raise SuccessionError(
+                "this saga already committed to a rollback; it can only be"
+                " finished as a rollback")
+        return rollback_promotion_saga(
+            store, saga,
+            reason=reason or saga.get("outcome_reason")
+            or "resumed rollback", now=now)
+    if state == SAGA_PREPARED:
+        if action == "complete":
+            committed = commit_ledger_authority(store, saga, now=now)
+            if boundary is not None:
+                boundary(BOUNDARY_CAPABILITY_BURNED)
+            return finalize_promotion_saga(
+                store, committed, now=now, boundary=boundary)
+        return rollback_promotion_saga(
+            store, saga,
+            reason=reason or "resume: a prepared saga's post-drain venue"
+                             " facts are stale after a restart",
+            now=now)
+    if action == "rollback":
+        return rollback_promotion_saga(
+            store, saga, reason=reason or "owner-requested rollback",
+            now=now)
+    return finalize_promotion_saga(
+        store, saga, now=now, boundary=boundary)
+
+
 # ── orchestrator ───────────────────────────────────────────────────────
 
 
 def promote_paper_champion(
     *,
     store: L1ExecutionOlap,
-    executor: Any,
+    venue: Any,
     seat: SeatContract,
     candidate: CandidateContract,
     compatibility_report: Mapping[str, Any],
     shadow_report: Mapping[str, Any],
     strategy_config: Mapping[str, Any],
-    instrument_capability: Mapping[str, Any],
     capability_store_dir: Path,
-    account_fingerprint: str,
-    open_orders: Sequence[Any],
-    positions: Sequence[Any],
-    account: Mapping[str, Any],
     new_manifest: Mapping[str, Any] | bytes,
     allowed_signers: Path = PROMOTION_ALLOWED_SIGNERS,
     require_root_pin: bool = True,
     explicit_capability: Optional[Path] = None,
     outgoing_shadow_days: float = OUTGOING_SHADOW_DEFAULT_DAYS,
+    boundary: Optional[Callable[[str], None]] = None,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """Execute one owner-approved Paper succession, fail-closed.
 
-    Order of operations (each refusal leaves the capability unconsumed
-    and the seat untouched):
+    ``venue`` is a real :class:`SuccessionVenue`: it OBSERVES direct
+    broker facts and OWNS the drain executor. Broker truth is never a
+    caller-supplied argument (finding 257), and the facts that authorize
+    the switch are re-observed AFTER the drain (a pre-drain snapshot
+    cannot authorize anything).
 
-    1. re-verify the compatibility proof (verdict + recomputed digest);
-    2. re-verify the shadow evidence (binding + recomputed digest);
-    3. assert native SL/TP on the successor's opening orders;
-    4. establish the ACTUAL incumbent session and require it to match
-       the capability's incumbent binding;
-    5. drain; while the seat is not flat this returns the typed
-       ``draining_for_succession`` result — nothing is consumed;
-    6. select + validate the ONE owner-signed capability;
-    7. ONE ``BEGIN IMMEDIATE`` ledger unit: re-check the nonce, burn the
-       capability (UNIQUE digest/nonce), carry the actual post-close
+    Order of operations — each refusal before stage 7 leaves the
+    capability unconsumed and the seat untouched:
+
+    1. observe direct venue facts                  [facts_observed]
+    2. re-verify the compatibility proof (verdict + recomputed digest);
+    3. re-verify the shadow evidence (binding + recomputed digest);
+    4. assert native SL/TP from the venue's OWN instrument capability;
+    5. establish the ACTUAL incumbent session, refuse if a saga is open,
+       select + validate the ONE owner-signed capability
+                                                   [capability_validated]
+    6. drain through the journaled lifecycle       [drain]
+       and RE-OBSERVE the venue                    [facts_refreshed]
+       — while the refreshed facts are not flat this returns the typed
+       ``draining_for_succession`` result and nothing is consumed;
+    7. persist the whole intended switch, target manifest bytes included
+                                                   [ledger_prepared]
+    8. ONE ledger unit: burn the capability, carry the ACTUAL post-drain
        balance/equity into the successor session, register the outgoing
-       shadow window and persist the full audit document;
-    8. atomically switch the manifest pointer (previous preserved,
-       ``rollback_manifest`` is the one typed undo).
+       shadow window and DECLARE ``manifest_pending``
+                                                   [capability_burned]
+    9. flip the manifest pointer                   [manifest_temp_written]
+                                                   [manifest_renamed]
+       and mark the saga completed                 [ledger_finalized]
 
-    A crash between 7 and 8 leaves a burned capability, a committed
-    ledger promotion and the incumbent manifest — fail-closed: the
-    runner keeps refusing the successor until the switch is completed
-    (re-run with the committed audit doc) or rolled back; the ledger
-    audit row names both states.
+    A crash at ANY boundary leaves exactly one open saga row that
+    ``resume_promotion_saga`` can complete or explicitly roll back
+    without a second capability. Until it does, ``succession_pending``
+    makes every runner refuse new risk for that seat.
     """
     now = now or _utc_now()
+
+    def mark(name: str) -> None:
+        if boundary is not None:
+            boundary(name)
+
+    facts = venue.fetch_facts()
+    if not isinstance(facts, VenueFacts):
+        raise SuccessionError(
+            "venue.fetch_facts() must return direct VenueFacts; operator"
+            " supplied broker truth is never accepted")
+    if facts.venue != seat.venue or facts.instrument != seat.instrument:
+        raise SuccessionError(
+            "the venue facts describe a different seat than the contract")
+    mark(BOUNDARY_FACTS_OBSERVED)
 
     compatibility_sha = require_compatible(compatibility_report, candidate)
     shadow_sha = require_shadow_evidence(shadow_report, candidate)
     protection = assert_native_protection(
         strategy_config=strategy_config,
-        instrument_capability=instrument_capability)
+        instrument_capability=facts.instrument_capability)
+    if outgoing_shadow_days < OUTGOING_SHADOW_DEFAULT_DAYS:
+        raise SuccessionError(
+            f"outgoing shadow window must be at least"
+            f" {OUTGOING_SHADOW_DEFAULT_DAYS} days (doc 32 S3)")
 
+    account_fingerprint = facts.account_fingerprint
     con = store._con
     incumbent = _active_session(
         con, seat.venue, account_fingerprint, seat.instrument)
@@ -1393,6 +2327,14 @@ def promote_paper_champion(
         raise SuccessionError(
             "no active incumbent session for this seat — promotion"
             " succeeds an incumbent, it never seats into the unknown")
+    already = open_promotion_saga(
+        store, venue=seat.venue, account_fingerprint=account_fingerprint,
+        instrument=seat.instrument)
+    if already is not None:
+        raise SuccessionError(
+            f"seat has an open promotion saga {already['saga_id']} in"
+            f" state {already['state']}; resume or roll it back before"
+            " starting another promotion")
 
     binding = PromotionBinding(
         seat=seat, candidate=candidate,
@@ -1408,34 +2350,31 @@ def promote_paper_champion(
         require_root_pin=require_root_pin)
     record = chosen.record
     assert record is not None  # ENTRY_VALID always carries the record
+    mark(BOUNDARY_CAPABILITY_VALIDATED)
 
-    drained = executor.drain_for_succession(
-        reason=f"owner_promotion:{candidate.model_id}")
-    if open_orders or positions:
-        if not (positions and not open_orders
+    drained = venue.drain_for_succession(
+        reason=f"owner_promotion:{candidate.model_id}",
+        incumbent_session_id=incumbent["session_id"],
+        successor_artifact_sha256=candidate.artifact_sha256,
+        now=now)
+    mark(BOUNDARY_DRAIN)
+    facts = _post_drain_facts(venue, before=facts, seat=seat)
+    mark(BOUNDARY_FACTS_REFRESHED)
+    if not facts.flat:
+        if not (facts.positions and not facts.open_orders
                 and seat.execution.transfer_policy == "transfer_permitted"):
             return {
                 "schema": PROMOTION_RESULT_SCHEMA,
                 "state": "draining_for_succession",
                 "capability_consumed": False,
                 "drained": list(drained),
-                "open_orders": len(open_orders),
-                "positions": len(positions),
+                "open_orders": len(facts.open_orders),
+                "positions": len(facts.positions),
+                "facts_source": facts.source,
+                "facts_observed_at": facts.observed_at.isoformat(),
             }
+    balance, equity = _actual_balance(facts)
 
-    try:
-        balance = float(account["cash"])
-        equity = float(account["equity"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SuccessionError(
-            "broker account snapshot lacks cash/equity — the successor"
-            " starting state must be an ACTUAL broker fact") from exc
-
-    successor = {
-        "model_id": candidate.model_id,
-        "artifact_sha256": candidate.artifact_sha256,
-        "config_sha256": candidate.config_sha256,
-    }
     shadow_registration = {
         "schema": OUTGOING_SHADOW_SCHEMA,
         "venue": seat.venue,
@@ -1450,15 +2389,9 @@ def promote_paper_champion(
             now + timedelta(days=float(outgoing_shadow_days))
         ).isoformat(),
     }
-    if outgoing_shadow_days < OUTGOING_SHADOW_DEFAULT_DAYS:
-        raise SuccessionError(
-            f"outgoing shadow window must be at least"
-            f" {OUTGOING_SHADOW_DEFAULT_DAYS} days (doc 32 S3)")
-
-    effect_id = f"succession-{record.nonce_sha256[:16]}"
     audit = {
         "schema": PROMOTION_RESULT_SCHEMA,
-        "state": "promoted_ledger_committed",
+        "state": "promotion_prepared",
         "venue": seat.venue,
         "instrument": seat.instrument,
         "timeframe": seat.timeframe,
@@ -1473,66 +2406,34 @@ def promote_paper_champion(
             "ending_equity": equity,
         },
         "incoming": {
-            "model_id": successor["model_id"],
-            "artifact_sha256": successor["artifact_sha256"],
-            "config_sha256": successor["config_sha256"],
+            "model_id": candidate.model_id,
+            "artifact_sha256": candidate.artifact_sha256,
+            "config_sha256": candidate.config_sha256,
             "starting_balance": balance,
             "starting_equity": equity,
         },
         "protection": protection,
+        "drained": list(drained),
+        "post_drain_facts": facts.to_dict(),
         "at": now.isoformat(),
     }
-    try:
-        with store.atomic_unit():
-            if store.nonce_consumed(record.nonce_sha256):
-                raise SuccessionError(
-                    "this capability was already consumed; promotion"
-                    " needs a freshly minted capability")
-            still_incumbent = _active_session(
-                con, seat.venue, account_fingerprint, seat.instrument)
-            if (still_incumbent is None
-                    or still_incumbent["session_id"]
-                    != incumbent["session_id"]):
-                raise SuccessionError(
-                    "the incumbent session changed while promoting —"
-                    " re-run against current seat truth")
-            store.consume_capability(
-                record.capability_sha256, record.nonce_sha256,
-                {**record.metadata, "consumed_for": "paper_promotion"},
-                effect_id)
-            session_id = _carry_sql(
-                con, venue=seat.venue, account=account_fingerprint,
-                symbol=seat.instrument,
-                incumbent_session_id=incumbent["session_id"],
-                successor=successor, balance=balance, equity=equity,
-                now=now)
-            audit["incoming"]["session_id"] = session_id
-            store.set_state(
-                _outgoing_key(seat),
-                json.dumps(shadow_registration, sort_keys=True))
-            store.set_state(
-                f"last_promotion:{seat.venue}:{seat.instrument}",
-                json.dumps(audit, sort_keys=True, default=str))
-    except sqlite3.IntegrityError as exc:
-        raise SuccessionError(
-            "capability burn conflicted with a concurrent consumer;"
-            " treat this capability as spent") from exc
+    saga = prepare_promotion_saga(
+        store, seat=seat, candidate=candidate, incumbent=incumbent,
+        record=record, facts=facts, target_manifest=new_manifest,
+        outgoing_shadow=shadow_registration, audit=audit, now=now)
+    mark(BOUNDARY_LEDGER_PREPARED)
 
-    switch = switch_manifest_atomically(
-        seat.manifest_file, new_manifest, now=now)
-    result = {
-        **audit,
-        "state": "promoted",
-        "capability_consumed": True,
+    saga = commit_ledger_authority(store, saga, now=now)
+    mark(BOUNDARY_CAPABILITY_BURNED)
+
+    result = finalize_promotion_saga(
+        store, saga, now=now, boundary=boundary)
+    return {
+        **result,
         "drained": list(drained),
-        "manifest_switch": switch,
-        "outgoing_shadow": shadow_registration,
+        "protection": protection,
         "ignored_capability_files": [
             {"file": entry.path.name, "kind": entry.kind}
             for entry in ignored
         ],
     }
-    store.set_state(
-        f"last_promotion:{seat.venue}:{seat.instrument}",
-        json.dumps(result, sort_keys=True, default=str))
-    return result

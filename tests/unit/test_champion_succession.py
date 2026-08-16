@@ -51,6 +51,7 @@ from app.champion_succession import (
     PromotionBinding,
     SeatContract,
     SuccessionError,
+    VenueFacts,
     assert_native_protection,
     candidate_shadow_replay,
     classify_promotion_store,
@@ -309,12 +310,54 @@ def seed_incumbent_session(olap, seat, balance=100000.0):
     )
 
 
-class FakeExecutor:
-    def __init__(self):
-        self.reasons = []
+class FakeVenue:
+    """Test double for the TRANSPORT only.
 
-    def drain_for_succession(self, reason):
+    It implements the same ``SuccessionVenue`` interface the real
+    adapters in ``app.succession_venue`` implement, so every fact the
+    orchestrator uses still arrives through ``fetch_facts()`` and every
+    drain still goes through the venue object. ``after_drain`` lets a
+    test make the venue tell a DIFFERENT truth once the drain has run —
+    which is the only way to prove that pre-drain snapshots never
+    authorize a switch.
+    """
+
+    venue = "alpaca_paper"
+
+    def __init__(self, *, cash="98750.25", equity="98901.10",
+                 open_orders=(), positions=(), after_drain=None,
+                 instrument="SPY", fingerprint=FINGERPRINT,
+                 capability=None):
+        self.state = {"cash": cash, "equity": equity,
+                      "open_orders": tuple(open_orders),
+                      "positions": tuple(positions)}
+        self.after_drain = after_drain
+        self.instrument = instrument
+        self.fingerprint = fingerprint
+        self.capability = capability or dict(GOOD_CAPABILITY_FLAGS)
+        self.reasons = []
+        self.observations = 0
+        self.drained = False
+
+    def fetch_facts(self):
+        state = dict(self.state)
+        if self.drained and self.after_drain:
+            state.update(self.after_drain)
+        self.observations += 1
+        return VenueFacts(
+            venue=self.venue, account_fingerprint=self.fingerprint,
+            instrument=self.instrument,
+            observed_at=NOW + timedelta(seconds=self.observations),
+            cash=state["cash"], equity=state["equity"],
+            open_orders=tuple(state["open_orders"]),
+            positions=tuple(state["positions"]),
+            instrument_capability=self.capability,
+            source="fixture:in-memory")
+
+    def drain_for_succession(self, *, reason, incumbent_session_id,
+                             successor_artifact_sha256, now):
         self.reasons.append(reason)
+        self.drained = True
         return [{"effect_id": "l1e-fixture", "actions": ["cancel"]}]
 
 
@@ -573,12 +616,11 @@ def test_drain_waits_while_not_flat_and_never_carries(
     olap = sessions_schema
     seed_incumbent_session(olap, seat)
     result = drain_and_carry_session(
-        store=olap, executor=FakeExecutor(), seat=seat,
+        store=olap, seat=seat,
+        venue=FakeVenue(after_drain={"open_orders": ({"id": "o1"},)}),
         successor={"model_id": "challenger-linear-v2",
                    "artifact_sha256": "3" * 64, "config_sha256": "4" * 64},
         account_fingerprint=FINGERPRINT,
-        open_orders=[{"id": "o1"}], positions=[],
-        account={"cash": "98750.25", "equity": "98901.10"},
         reason="test_drain", now=NOW)
     assert result["state"] == "draining_for_succession"
     assert result["carried"] is False
@@ -594,12 +636,10 @@ def test_carry_uses_actual_post_close_balance(sessions_schema, seat):
     olap = sessions_schema
     seed_incumbent_session(olap, seat, balance=100000.0)
     result = drain_and_carry_session(
-        store=olap, executor=FakeExecutor(), seat=seat,
+        store=olap, seat=seat, venue=FakeVenue(),
         successor={"model_id": "challenger-linear-v2",
                    "artifact_sha256": "3" * 64, "config_sha256": "4" * 64},
         account_fingerprint=FINGERPRINT,
-        open_orders=[], positions=[],
-        account={"cash": "98750.25", "equity": "98901.10"},
         reason="test_carry", now=NOW)
     assert result["schema"] == CARRY_SCHEMA and result["carried"] is True
     assert result["outgoing"]["ending_balance"] == 98750.25
@@ -626,12 +666,12 @@ def test_transfer_refused_under_close_all_contract(sessions_schema, seat):
     olap = sessions_schema
     seed_incumbent_session(olap, seat)
     result = drain_and_carry_session(
-        store=olap, executor=FakeExecutor(), seat=seat,
+        store=olap, seat=seat, venue=FakeVenue(
+            cash="1.0", equity="1.0",
+            after_drain={"positions": ({"symbol": "SPY", "qty": "5"},)}),
         successor={"model_id": "x", "artifact_sha256": "3" * 64,
                    "config_sha256": "4" * 64},
         account_fingerprint=FINGERPRINT,
-        open_orders=[], positions=[{"symbol": "SPY", "qty": "5"}],
-        account={"cash": "1.0", "equity": "1.0"},
         reason="test_transfer_refusal", now=NOW)
     assert result["state"] == "draining_for_succession"
     assert result["transfer_policy"] == "close_all"
@@ -642,11 +682,10 @@ def test_missing_account_fact_is_a_refusal(sessions_schema, seat):
     seed_incumbent_session(olap, seat)
     with pytest.raises(SuccessionError, match="ACTUAL broker fact"):
         drain_and_carry_session(
-            store=olap, executor=FakeExecutor(), seat=seat,
+            store=olap, seat=seat, venue=FakeVenue(cash=None, equity=None),
             successor={"model_id": "x", "artifact_sha256": "3" * 64,
                        "config_sha256": "4" * 64},
             account_fingerprint=FINGERPRINT,
-            open_orders=[], positions=[], account={},
             reason="test_missing_fact", now=NOW)
 
 
@@ -757,14 +796,10 @@ def test_outgoing_shadow_window_below_seven_days_refuses(olap, seat):
 
 def promote(olap, seat, candidate, cap_store, signers, **overrides):
     defaults = dict(
-        store=olap, executor=FakeExecutor(), seat=seat,
+        store=olap, venue=FakeVenue(), seat=seat,
         candidate=candidate,
         strategy_config=GOOD_STRATEGY,
-        instrument_capability=GOOD_CAPABILITY_FLAGS,
         capability_store_dir=cap_store,
-        account_fingerprint=FINGERPRINT,
-        open_orders=[], positions=[],
-        account={"cash": "98750.25", "equity": "98901.10"},
         new_manifest={"schema":
                       "prediction_provider.live_linear_manifest.v1",
                       "model_id": "challenger-linear-v2"},
@@ -800,9 +835,9 @@ def test_full_promotion_happy_path(promotion_world):
                      compatibility_report=compat, shadow_report=shadow)
     assert result["state"] == "promoted"
     assert result["capability_consumed"] is True
-    # session carry at the ACTUAL balance
-    assert result["incoming"]["starting_balance"] == 98750.25
-    assert result["outgoing"]["ending_balance"] == 98750.25
+    # session carry at the ACTUAL POST-DRAIN balance
+    assert result["audit"]["incoming"]["starting_balance"] == 98750.25
+    assert result["audit"]["outgoing"]["ending_balance"] == 98750.25
     # manifest flipped and previous preserved
     manifest = json.loads(Path(seat.manifest_file).read_bytes())
     assert manifest["model_id"] == "challenger-linear-v2"
@@ -849,7 +884,8 @@ def test_promotion_waits_flat_without_consuming(promotion_world):
         promotion_world)
     result = promote(olap, seat, candidate, cap_store, signers,
                      compatibility_report=compat, shadow_report=shadow,
-                     positions=[{"symbol": "SPY", "qty": "5"}])
+                     venue=FakeVenue(after_drain={
+                         "positions": ({"symbol": "SPY", "qty": "5"},)}))
     assert result["state"] == "draining_for_succession"
     assert result["capability_consumed"] is False
     # incumbent stays seated, manifest untouched
