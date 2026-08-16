@@ -1,0 +1,54 @@
+SEAT TRUTH -- PUBLIC-SAFE SUMMARY  2026-08-16T04:22:39.373550+00:00
+schema lts.seat_truth_public.v1 (from lts.seat_truth_inventory.v1)
+private packet sha256 9f430245d389d45741d9894df52b9e0567ee9f6aaf72c91667cd3a1459b9fdc2
+private packet path   ~/.local/state/lts/evidence/seat_truth/seat_truth_private_20260816T042239Z.json  (0600 file / 0700 dir, never committed)
+balances, equity, margin, sizes, prices, tickets, broker order ids and account/server fingerprints are NOT in this file
+==============================================================================================================
+                                  alpaca_paper_spy_1d                    | ibkr_paper_usdcad_4h                   | mt5_demo_ethusd_4h                    
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+venue                             alpaca_paper                           | ibkr_paper                             | mt5_demo                              
+environment class                 paper                                  | paper                                  | demo                                  
+symbol                            SPY                                    | USD.CAD                                | ETHUSD                                
+timeframe                         1d                                     | 4h                                     | 4h                                    
+model id                          spy-daily-linear-live-v1               | usdcad-4h-linear-live-v1               | ethusdt-4h-linear-live-v1             
+artifact sha256                   b0ab77e0377d6224afd480817e1d867041ee234953b85717fdaae16bd5f5e8bb | dc95edcbceca9a86e4395d2cd268bedbfc6b82812d9248b22712b835b891c0fd | 539f946071a1870672c2d2c1ce7b1ce0f0d4b4317a15b2d082b59b32c98d10bf
+config sha256                     1125679a5eae4a4272e6e4e161b2307de26fcf28a09479b24c53f0ea149717e1 | 7aa17ae70fef8892a4c1a64539f0370b29d91204d539fcdf64a7c1069ae0aae9 | 193cbeaecc759850d5eaae27879769aaf24c0c6f6172c5acc3bac860a3b20b3a
+code revision                     5f80e803936374b90fac6c3cd4850e9634678815 | 5f80e803936374b90fac6c3cd4850e9634678815 | 4fcec851994f9e73ada60e1122a3c5e4acce7928
+runner heartbeat                  available[direct_runner] fresh         | available[direct_runner] fresh         | available[direct_runner] fresh        
+runner ledger                     available[direct_runner_ledger] STALE(62.4h) | available[direct_runner_ledger] STALE(33.7h) | available[direct_runner_ledger] STALE(39.4h)
+direct venue probe                available[direct_venue] fresh          | available[direct_venue] fresh          | available[direct_runner_ledger] fresh 
+manifest join                     available[direct_file]                 | available[direct_file]                 | available[direct_file]                
+seat binding matches              yes                                    | yes                                    | yes                                   
+direct venue binding matches      yes                                    | yes                                    | yes                                   
+write-enabled                     yes                                    | yes                                    | -                                     
+join gaps                         0                                      | 0                                      | 0                                     
+live-inference eligible           no                                     | no                                     | no                                    
+live-execution eligible           no                                     | no                                     | no                                    
+last closed input bar             2026-08-12T04:00:00+00:00              | 2026-08-14T12:00:00+00:00              | 2026-08-14T13:00:00+00:00             
+decision current for bar          yes                                    | yes                                    | yes                                   
+last decision action              short                                  | short                                  | short                                 
+last decision outcome             would_be_order                         | would_be_order                         | would_be_order                        
+venue position rows               1                                      | 0                                      | 1                                     
+venue reports flat                no                                     | yes                                    | no                                    
+venue open orders                 1                                      | -                                      | 0                                     
+venue open orders state           available[direct_venue] fresh          | unavailable(reqAllOpenOrders_rebinding_risk) | available[direct_runner_ledger] fresh 
+native protection orders          3                                      | -                                      | 1                                     
+runner-tracked open orders        -                                      | 1                                      | -                                     
+runner-tracked cancel attempts    -                                      | 44                                     | -                                     
+heartbeat open orders             1                                      | 1                                      | 0                                     
+ledger open exposure row          yes                                    | yes                                    | -                                     
+halt active                       -                                      | no                                     | no                                    
+runner state                      monitoring                             | monitoring                             | monitoring                            
+
+IBKR ORDER/EXPOSURE RESOLUTION: flat_at_venue__ledger_exposure_row_stale_open
+  Direct TWS positions()/portfolio() (authoritative, account-scoped) report FLAT while the runner ledger still carries an open exposure row: reconciliation is pending behind one non-terminal runner-tracked order, so the exposure row is an accounting residue, not market risk.
+  * direct flatness: yes
+  * venue position rows: 0; portfolio rows: 0
+  * ledger open exposure present: yes
+  * runner-tracked open order present: yes (cancel attempts 44)
+  * venue-scoped open orders: unavailable(reqAllOpenOrders_rebinding_risk)
+
+TYPED UNAVAILABLE FACTS: 3
+  - alpaca_paper_spy_1d.control_state.halt: no_halt_row
+  - ibkr_paper_usdcad_4h.broker_state.direct_venue.open_orders_venue_scoped: reqAllOpenOrders_rebinding_risk
+  - ibkr_order_exposure_resolution.venue_scoped_open_orders: reqAllOpenOrders_rebinding_risk
