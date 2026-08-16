@@ -1,12 +1,14 @@
 # LTS — Live Trading System
 
-LTS is the execution endpoint of this trading stack: a plugin-based Python
-trading framework that turns model predictions into venue orders and
-observations. It provides a multi-user, multi-portfolio core (FastAPI + SQL
-persistence), six plugin families loaded via entry points, per-venue CLIs and
-systemd units for paper/demo execution labs, and a model-authority / L1
-execution layer that binds hash-verified model artifacts to order intents
-using [trading-contracts](https://github.com/harveybc/trading-contracts).
+LTS is a plugin-based Python trading framework that turns model predictions
+into venue orders and observations. It provides a multi-user, multi-portfolio
+core (FastAPI + SQL persistence), six plugin families loaded via entry points,
+per-venue CLIs and systemd units for paper/demo execution labs, and a
+model-authority / L1 execution layer that binds hash-verified model artifacts
+to order intents using
+[trading-contracts](https://github.com/harveybc/trading-contracts). It is the
+execution end of this stack; model training and prediction serving live in
+sibling repositories.
 
 ## Status
 
@@ -17,6 +19,20 @@ using [trading-contracts](https://github.com/harveybc/trading-contracts).
 are OANDA practice, Alpaca paper, IBKR paper, an MT5 bridge and a Capital.com
 demo lab. Real-capital trading is **not** enabled anywhere in this
 repository, and none of the examples or strategies are financial advice.
+
+## Run this with an AI agent
+
+Paste this into Claude Code, Cursor, Codex, GitHub Copilot or any coding agent
+with shell access:
+
+> Read `AGENTS.md` in this repository and follow the **Agent quickstart**
+> section end to end: set up the environment, run the smoke test, execute the
+> example offline fixture report, then tell me the exact URL or file paths
+> where I can see the results and one query I should try first.
+
+`AGENTS.md` is the [agents.md](https://agents.md) convention, read natively by
+most coding agents. Its quickstart is strictly offline — connecting to a
+broker needs your own credentials and is deliberately excluded.
 
 ## Role and non-responsibilities
 
@@ -132,13 +148,20 @@ From the repository root:
 PYTHONPATH=./ python -m app.main --help
 ```
 
-Verified: exits 0 and prints the argument reference (`--load_config`, plugin
-selection flags, remote-config options). Repository-owned example
-configurations live in [`examples/configs/`](examples/configs/) (paper
-execution lab) and [`examples/config/`](examples/config/) (phase inference
-configs). Executing a venue lab additionally requires paper/demo credentials
-supplied via environment or local config and was not executed for this
-document (unverified).
+Verified: exits 0. Note that the help text itself is inherited from an
+ancestor project and does not describe LTS (see [Limitations](#limitations)).
+
+Repository-owned example configurations live in
+[`examples/configs/`](examples/configs/) (paper execution lab) and
+[`examples/config/`](examples/config/) (phase inference configs). Executing a
+venue lab additionally requires paper/demo credentials supplied via
+environment or local config and was not executed for this document
+(unverified).
+
+The offline paths are the test suite (below), the read-only report tools in
+[`tools/`](tools/) pointed at fixture ledgers, and the
+`backtrader_simulation_broker` plugin, whose only imports are `csv`,
+`logging`, `datetime`, `typing` and `app.plugin_base`.
 
 ## Configuration
 
@@ -153,12 +176,22 @@ multi-venue shadow are in [`examples/systemd/`](examples/systemd/).
 ## Tests and validation
 
 ```bash
-python -m pytest -q --collect-only
+python -m pytest -q                 # full suite
+python -m pytest -q tests/unit      # unit subset
+python run_tests.py unit            # wrapper: unit|integration|system|acceptance|all
 ```
 
-Observed result: `661 tests collected in 0.78s` (collection clean).
-Full-suite execution was not run for this document — some tests boot venue
-labs and a sibling `prediction_provider` checkout (see [`tests/`](tests/)).
+Observed on Python 3.12.13: `701 passed in 13.92s` for the full suite and
+`569 passed in 3.78s` for `tests/unit`, with a clean working tree afterwards.
+`pytest.ini` sets `testpaths = tests`, which deliberately excludes the
+root-level `test_*.py` files that hit live endpoints — do not run `pytest .`
+from the repository root. The declared markers are auto-applied from file
+paths by `tests/conftest.py`; there is no offline/live marker, so select tests
+by path.
+
+An agent-executable version of this recipe, including a fixture-only run of
+the read-only reporting tool, is in [`AGENTS.md`](AGENTS.md).
+
 Deeper operational docs:
 [`docs/MULTI_VENUE_PAPER_EXECUTION.md`](docs/MULTI_VENUE_PAPER_EXECUTION.md),
 [`docs/OANDA_PRACTICE_EXECUTION_LAB.md`](docs/OANDA_PRACTICE_EXECUTION_LAB.md),
@@ -173,8 +206,13 @@ Deeper operational docs:
   model-authority layer; they are produced by predictor/agent-multi, not
   here.
 - Reproducibility: decision-to-order flows journal their intents and
-  execution reports as trading-contracts models, so a run can be audited
-  from its journal plus the pinned artifact hashes.
+  execution reports as trading-contracts models. Two read-only tools consume
+  those journals — [`tools/rolling_evidence_report.py`](tools/rolling_evidence_report.py)
+  (24-hour / 7-day coverage and lifecycle counts) and
+  [`tools/live_sim_replay.py`](tools/live_sim_replay.py) (live-versus-simulation
+  replay). Both open every ledger with `mode=ro`, take all paths from their
+  config so they can be pointed at fixtures, and report an unreadable source
+  as `unavailable` rather than substituting a value.
 
 ## Safety, security and credentials
 
@@ -190,11 +228,17 @@ Deeper operational docs:
 
 ## Limitations
 
-- **Committed runtime residue.** The repository currently tracks artifacts
-  of past runs (`lts_trading.db`, `lts_security_test.db`, `app.log`,
-  `model.bin`, `config_out.json`, `prediction_provider.pid`,
-  `live_api_integration_results.json`). Treat them as historical residue,
-  not as inputs or documentation.
+- **Committed runtime residue.** Four artifacts of past runs are tracked:
+  `model.bin`, `config_out.json`, `prediction_provider.pid` and
+  `live_api_integration_results.json`. Treat them as historical residue, not
+  as inputs or documentation. `lts_trading.db`, `lts_security_test.db` and
+  `app.log` also appear in the working tree but are gitignored — they are
+  rewritten by any default-config run from the repository root, because
+  `app/config.py` defaults `database_url` to `sqlite:///./lts_trading.db`
+  and `app/main.py` logs to `app.log`.
+- **Incomplete packaging of two plugin directories.** `plugins_aaa/` and
+  `plugins_core/` have no `__init__.py`, so `find_packages()` omits them and a
+  non-editable install ships without them. Install editable.
 - **`oanda_broker` prototype.** It is registered as a first-class plugin but
   implements an OANDA REST-v20 prototype that is incompatible with the OANDA
   Global Markets MT5 flow; the maintained OANDA path is the practice lab via
@@ -206,9 +250,12 @@ Deeper operational docs:
 - Parts of [`app/cli.py`](app/cli.py) retain argument text inherited from an
   ancestor project; the venue CLIs listed above are the operational entry
   points.
-- Some root-level files (`arima_predictor.py`, `predictor.bat`,
-  `ls_pred.bat`, `STATUS.md`) are historical and may reference environments
-  that no longer exist.
+- Several root-level files are historical and may reference environments that
+  no longer exist: `arima_predictor.py`, `predictor.bat`, `ls_pred.bat`,
+  `STATUS.md` (its test counts predate the current suite),
+  `COMPLETION_SUMMARY.md`, `DOCUMENTATION_SUMMARY.md`, and the raw prompt
+  files `start_prompt.md` and `prompt.txt` — the latter describes a different
+  project entirely.
 
 ## License
 
