@@ -24,8 +24,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from typing import Any, Optional
 
+from app import as_of_lineage
+from app.as_of_lineage import (
+    AsOfLineageContradiction,
+    AsOfLineageError,
+)
 from app.demo_execution_service import DemoExecutionError, DemoExecutionOlap, _utc_now
 
 EFFECT_STATES = frozenset({
@@ -116,12 +122,113 @@ CREATE TABLE IF NOT EXISTS l1_effect_contracts (
 """
 
 
+#: v1 (finding 259): ``input_sha256`` sat inside the uniqueness key, so a
+#: changed input hash minted a NEW row instead of contradicting the one due
+#: decision. The table is kept readable and migratable — never rewritten or
+#: dropped — while v2 below is the authoritative append-only evidence.
+_AS_OF_V1_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS as_of_input_bars ("
+    " venue TEXT NOT NULL, model_id TEXT NOT NULL,"
+    " timeframe TEXT NOT NULL, bar_close TEXT NOT NULL,"
+    " input_sha256 TEXT NOT NULL, feature_contract TEXT NOT NULL,"
+    " source TEXT NOT NULL, bars_json TEXT NOT NULL,"
+    " bars_sha256 TEXT NOT NULL, recorded_at TEXT NOT NULL,"
+    " UNIQUE(venue, model_id, timeframe, bar_close, input_sha256))"
+)
+
+_AS_OF_V1_COLUMNS = (
+    "venue", "model_id", "timeframe", "bar_close", "input_sha256",
+    "feature_contract", "source", "bars_json", "bars_sha256", "recorded_at",
+)
+
+#: v2: one append-only row per (row_state, normalized due-decision identity).
+#: ``identity_sha256`` binds venue+account_fingerprint+instrument+decision_id;
+#: ``lineage_sha256`` binds that identity together with EVERY lineage and
+#: content field, so a contradiction is a hash comparison, not a heuristic.
+_AS_OF_V2_SCHEMA = """
+CREATE TABLE IF NOT EXISTS as_of_input_bars_v2 (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema TEXT NOT NULL,
+    row_state TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    account_fingerprint TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    artifact_sha256 TEXT NOT NULL,
+    config_sha256 TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
+    bar_close TEXT NOT NULL,
+    input_sha256 TEXT NOT NULL,
+    feature_contract TEXT NOT NULL,
+    bars_sha256 TEXT NOT NULL,
+    bars_json TEXT NOT NULL,
+    source TEXT NOT NULL,
+    identity_sha256 TEXT NOT NULL,
+    lineage_sha256 TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    UNIQUE(row_state, identity_sha256)
+);
+CREATE INDEX IF NOT EXISTS as_of_v2_by_identity
+    ON as_of_input_bars_v2(identity_sha256);
+CREATE INDEX IF NOT EXISTS as_of_v2_by_route
+    ON as_of_input_bars_v2(venue, account_fingerprint, instrument, bar_close);
+CREATE TABLE IF NOT EXISTS as_of_lineage_incidents (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    schema TEXT NOT NULL,
+    event TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    incident_key TEXT NOT NULL,
+    identity_sha256 TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    account_fingerprint TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
+    UNIQUE(event, incident_key)
+);
+"""
+
+_AS_OF_V2_COLUMNS = (
+    "schema", "row_state", "recorded_at", "venue", "account_fingerprint",
+    "instrument", "decision_id", "model_id", "artifact_sha256",
+    "config_sha256", "timeframe", "bar_close", "input_sha256",
+    "feature_contract", "bars_sha256", "bars_json", "source",
+    "identity_sha256", "lineage_sha256", "origin",
+)
+
+_INCIDENT_COLUMNS = (
+    "schema", "event", "recorded_at", "incident_key", "identity_sha256",
+    "reason_code", "venue", "account_fingerprint", "instrument",
+    "decision_id", "detail_json",
+)
+
+
+class _Contradiction(Exception):
+    """Internal: unwinds the atomic unit so the refused write leaves nothing
+    behind, then becomes a public :class:`AsOfLineageContradiction` once the
+    durable incident has been landed in its own transaction."""
+
+    def __init__(self, existing: dict[str, Any], candidate: dict[str, Any],
+                 row_state: str) -> None:
+        super().__init__("as-of lineage contradiction")
+        self.existing = existing
+        self.candidate = candidate
+        self.row_state = row_state
+
+
 class L1ExecutionOlap(DemoExecutionOlap):
     """The accepted L0 ledger plus the L1 effects/capability tables."""
 
     def __init__(self, path) -> None:
         super().__init__(path)
         self._con.executescript(_L1_SCHEMA)
+        self.database_path = str(path)
+        self.as_of_journal_path = as_of_lineage.journal_path_for(path)
+        self._as_of_schema_ready = False
+        self._ensure_as_of_schema()
 
     # -- effects -----------------------------------------------------------
     def create_effect(
@@ -343,6 +450,567 @@ class L1ExecutionOlap(DemoExecutionOlap):
         ]
         return [dict(zip(columns, row))
                 for row in self._con.execute(query, params)]
+
+    # -- as-of input bars, v2 (findings 259/260) ---------------------------
+
+    def _ensure_as_of_schema(self) -> None:
+        """Create both tables once per connection.
+
+        ``executescript`` commits any pending transaction, so this must never
+        run inside an ``atomic_unit``: the flag keeps it to construction time
+        while leaving every call site safe to state its own precondition.
+        """
+        if self._as_of_schema_ready:
+            return
+        self._con.execute(_AS_OF_V1_SCHEMA)
+        self._con.executescript(_AS_OF_V2_SCHEMA)
+        self._as_of_schema_ready = True
+
+    # ---- legacy v1: readable and migratable, never authoritative ----
+
+    def record_as_of_input_bars(self, fact: dict[str, Any]) -> bool:
+        """LEGACY v1 writer, retained so an existing ledger stays readable
+        and testable. Finding 259: this key admits contradictory rows for one
+        due decision — production writes go through
+        :meth:`record_due_bar_decision_with_as_of` instead."""
+        required = ("venue", "model_id", "timeframe", "bar_close",
+                    "input_sha256", "feature_contract", "source", "bars")
+        missing = [key for key in required if not fact.get(key)]
+        if missing:
+            raise DemoExecutionError(f"as-of bars fact missing {missing}")
+        bars_json, bars_sha256 = as_of_lineage.canonical_bars(fact["bars"])
+        self._ensure_as_of_schema()
+        key = (fact["venue"], fact["model_id"], fact["timeframe"],
+               fact["bar_close"], fact["input_sha256"])
+        with self.atomic_unit():
+            row = self._con.execute(
+                "SELECT bars_sha256 FROM as_of_input_bars WHERE venue=?"
+                " AND model_id=? AND timeframe=? AND bar_close=?"
+                " AND input_sha256=?", key,
+            ).fetchone()
+            if row is not None:
+                if row[0] != bars_sha256:
+                    raise DemoExecutionError(
+                        "as-of input bars are immutable: same decision"
+                        " identity, different bar content")
+                return False
+            self._con.execute(
+                "INSERT INTO as_of_input_bars VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (*key, fact["feature_contract"], fact["source"], bars_json,
+                 bars_sha256, _utc_now().isoformat()),
+            )
+            return True
+
+    def as_of_input_bars_row(
+        self, *, venue: str, model_id: str, timeframe: str, bar_close: str,
+        input_sha256: str,
+    ) -> Optional[dict[str, Any]]:
+        """LEGACY v1 reader (kept so migrated ledgers stay inspectable)."""
+        self._ensure_as_of_schema()
+        row = self._con.execute(
+            "SELECT venue, model_id, timeframe, bar_close, input_sha256,"
+            " feature_contract, source, bars_json, bars_sha256, recorded_at"
+            " FROM as_of_input_bars WHERE venue=? AND model_id=?"
+            " AND timeframe=? AND bar_close=? AND input_sha256=?",
+            (venue, model_id, timeframe, bar_close, input_sha256),
+        ).fetchone()
+        if row is None:
+            return None
+        fact = dict(zip(_AS_OF_V1_COLUMNS, row))
+        fact["bars"] = json.loads(fact["bars_json"])
+        return fact
+
+    def legacy_as_of_input_bars(self) -> list[dict[str, Any]]:
+        self._ensure_as_of_schema()
+        return [dict(zip(_AS_OF_V1_COLUMNS, row)) for row in self._con.execute(
+            "SELECT venue, model_id, timeframe, bar_close, input_sha256,"
+            " feature_contract, source, bars_json, bars_sha256, recorded_at"
+            " FROM as_of_input_bars ORDER BY rowid")]
+
+    # ---- v2 writes ----
+
+    def _as_of_row(self, *, row_state: str, identity_sha256: str,
+                   ) -> Optional[dict[str, Any]]:
+        row = self._con.execute(
+            f"SELECT {','.join(_AS_OF_V2_COLUMNS)} FROM as_of_input_bars_v2"
+            " WHERE row_state=? AND identity_sha256=?",
+            (row_state, identity_sha256),
+        ).fetchone()
+        return None if row is None else dict(zip(_AS_OF_V2_COLUMNS, row))
+
+    def _insert_as_of(self, normalized: dict[str, Any], *, row_state: str,
+                      origin: str) -> None:
+        self._con.execute(
+            f"INSERT INTO as_of_input_bars_v2 ({','.join(_AS_OF_V2_COLUMNS)})"
+            f" VALUES ({','.join('?' for _ in _AS_OF_V2_COLUMNS)})",
+            (as_of_lineage.AS_OF_SCHEMA, row_state, _utc_now().isoformat(),
+             *(normalized[key] for key in (
+                 "venue", "account_fingerprint", "instrument", "decision_id",
+                 "model_id", "artifact_sha256", "config_sha256", "timeframe",
+                 "bar_close", "input_sha256", "feature_contract",
+                 "bars_sha256", "bars_json", "source", "identity_sha256",
+                 "lineage_sha256")),
+             origin),
+        )
+
+    def _raise_contradiction(self, event: _Contradiction) -> None:
+        """Land ONE durable incident (its own transaction, after the refused
+        write has already rolled back) and re-raise as the public error."""
+        diverging = as_of_lineage.diverging_fields(
+            event.existing, event.candidate)
+        incident = self.record_as_of_lineage_incident(
+            reason_code=as_of_lineage.REASON_CONTRADICTION,
+            identity=event.candidate,
+            detail={
+                "diverging_fields": diverging,
+                "row_state": event.row_state,
+                "retained_lineage_sha256": event.existing["lineage_sha256"],
+                "refused_lineage_sha256": event.candidate["lineage_sha256"],
+                "retained_bars_sha256": event.existing["bars_sha256"],
+                "refused_bars_sha256": event.candidate["bars_sha256"],
+                "retained_recorded_at": event.existing.get("recorded_at"),
+            },
+        )
+        raise AsOfLineageContradiction(
+            "as-of lineage contradiction for one due-decision identity:"
+            f" {diverging} changed; the retained row stands and this write is"
+            " refused",
+            identity_sha256=event.candidate["identity_sha256"],
+            diverging=diverging, incident=incident,
+        ) from None
+
+    def record_as_of_pending(self, fact: dict[str, Any]) -> dict[str, Any]:
+        """Explicit, recoverable PENDING linkage written before the risk
+        action, carrying the COMPLETE normalized due-decision identity.
+
+        This is never an orphan: it is typed ``pending``, the comparator
+        refuses to treat it as evidence, and :meth:`resolve_pending_as_of`
+        either binds it to its due-decision fact or reports it. A pending or
+        bound row that already contradicts this content refuses here — before
+        anything is submitted.
+        """
+        normalized = as_of_lineage.normalize(fact)
+        self._ensure_as_of_schema()
+        try:
+            with self.atomic_unit():
+                bound = self._as_of_row(
+                    row_state=as_of_lineage.BOUND,
+                    identity_sha256=normalized["identity_sha256"])
+                if bound is not None:
+                    if bound["lineage_sha256"] != normalized["lineage_sha256"]:
+                        raise _Contradiction(bound, normalized,
+                                             as_of_lineage.BOUND)
+                    return {"state": "already_bound", "appended": False,
+                            "identity_sha256": normalized["identity_sha256"]}
+                pending = self._as_of_row(
+                    row_state=as_of_lineage.PENDING,
+                    identity_sha256=normalized["identity_sha256"])
+                if pending is not None:
+                    if pending["lineage_sha256"] != normalized["lineage_sha256"]:
+                        raise _Contradiction(pending, normalized,
+                                             as_of_lineage.PENDING)
+                    return {"state": as_of_lineage.PENDING, "appended": False,
+                            "identity_sha256": normalized["identity_sha256"]}
+                self._insert_as_of(normalized, row_state=as_of_lineage.PENDING,
+                                   origin="runner_pre_decision")
+                return {"state": as_of_lineage.PENDING, "appended": True,
+                        "identity_sha256": normalized["identity_sha256"]}
+        except _Contradiction as event:
+            self._raise_contradiction(event)
+
+    def record_due_bar_decision_with_as_of(
+        self, decision: dict[str, Any], as_of: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist the due-decision FACT and its exact as-of BARS as ONE
+        logical operation (finding 260's orphan/loss window).
+
+        Both writes share a single ``BEGIN IMMEDIATE`` unit: a crash between
+        them rolls both back, so the ledger never holds an as-of row without
+        its due-decision fact and never holds a decision whose as-of evidence
+        silently vanished. The as-of fact must project the SAME normalized
+        identity and lineage as the decision fact, otherwise nothing is
+        written at all.
+        """
+        normalized = as_of_lineage.normalize(as_of)
+        projected = as_of_lineage.identity_of_decision(decision)
+        mismatched = sorted(
+            key for key in as_of_lineage.IDENTITY_FIELDS
+            + as_of_lineage.LINEAGE_FIELDS + ("input_sha256",)
+            if normalized[key] != projected[key]
+        )
+        if mismatched:
+            raise AsOfLineageError(
+                "as-of fact does not describe this due decision:"
+                f" {mismatched} disagree")
+        self._ensure_as_of_schema()
+        try:
+            with self.atomic_unit():
+                existing = self._as_of_row(
+                    row_state=as_of_lineage.BOUND,
+                    identity_sha256=normalized["identity_sha256"])
+                if existing is not None:
+                    if existing["lineage_sha256"] != normalized["lineage_sha256"]:
+                        raise _Contradiction(existing, normalized,
+                                             as_of_lineage.BOUND)
+                    # byte-identical replay: idempotent, no row, no incident
+                    result = {
+                        "decision_appended": self.record_due_bar_decision(
+                            decision),
+                        "as_of_appended": False, "as_of_state": "idempotent",
+                        "identity_sha256": normalized["identity_sha256"],
+                    }
+                else:
+                    pending = self._as_of_row(
+                        row_state=as_of_lineage.PENDING,
+                        identity_sha256=normalized["identity_sha256"])
+                    if (pending is not None
+                            and pending["lineage_sha256"]
+                            != normalized["lineage_sha256"]):
+                        raise _Contradiction(pending, normalized,
+                                             as_of_lineage.PENDING)
+                    # the due-decision FACT lands first: an as-of row can
+                    # never precede the identity it belongs to
+                    decision_appended = self.record_due_bar_decision(decision)
+                    self._insert_as_of(
+                        normalized, row_state=as_of_lineage.BOUND,
+                        origin="runner_atomic_bind")
+                    result = {"decision_appended": decision_appended,
+                              "as_of_appended": True,
+                              "as_of_state": as_of_lineage.BOUND,
+                              "identity_sha256": normalized["identity_sha256"]}
+        except _Contradiction as event:
+            self._raise_contradiction(event)
+        # the evidence for this identity is now whole again: close any
+        # self-healing incident it carried (a contradiction never lands here)
+        for reason in sorted(as_of_lineage.SELF_HEALING_REASONS):
+            self.resolve_as_of_lineage_incident(
+                identity_sha256=normalized["identity_sha256"],
+                reason_code=reason,
+                note="as-of evidence bound for this due-decision identity")
+        return result
+
+    # ---- v2 reads ----
+
+    def as_of_bound_row(self, decision: dict[str, Any],
+                        ) -> Optional[dict[str, Any]]:
+        """The bound as-of row for one due-bar decision, joined ONLY on the
+        normalized identity and verified against the decision's lineage.
+
+        A row whose lineage disagrees is not returned as evidence — an
+        account/route collision or a swapped artifact can therefore never
+        lend its bars to another decision.
+        """
+        self._ensure_as_of_schema()
+        projected = as_of_lineage.identity_of_decision(decision)
+        row = self._as_of_row(row_state=as_of_lineage.BOUND,
+                              identity_sha256=projected["identity_sha256"])
+        if row is None:
+            return None
+        drift = [key for key in as_of_lineage.LINEAGE_FIELDS + ("input_sha256",)
+                 if str(row[key]) != projected[key]]
+        if drift:
+            return None
+        row["bars"] = json.loads(row["bars_json"])
+        return row
+
+    def as_of_rows(self, *, row_state: Optional[str] = None,
+                   venue: Optional[str] = None) -> list[dict[str, Any]]:
+        self._ensure_as_of_schema()
+        query = (f"SELECT {','.join(_AS_OF_V2_COLUMNS)}"
+                 " FROM as_of_input_bars_v2")
+        clauses, params = [], []
+        if row_state:
+            clauses.append("row_state=?")
+            params.append(row_state)
+        if venue:
+            clauses.append("venue=?")
+            params.append(venue)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        return [dict(zip(_AS_OF_V2_COLUMNS, row))
+                for row in self._con.execute(query + " ORDER BY seq", params)]
+
+    def due_bar_decision_row(self, *, venue: str, model_id: str,
+                             timeframe: str, bar_close: str,
+                             ) -> Optional[dict[str, Any]]:
+        """The single effective due-bar decision fact for one bar identity
+        (the C1 table is unique on exactly this key)."""
+        columns = (
+            "venue", "account_fingerprint", "asset_id", "instrument",
+            "timeframe", "bar_close", "decided_at", "feature_cutoff",
+            "input_sha256", "config_sha256", "model_id", "artifact_sha256",
+            "manifest_sha256", "action", "score", "outcome", "reason",
+            "risk_envelope_json", "quote_json", "decision_id",
+            "effect_or_command_id",
+        )
+        try:
+            row = self._con.execute(
+                f"SELECT {','.join(columns)} FROM due_bar_decisions"
+                " WHERE venue=? AND model_id=? AND timeframe=?"
+                " AND bar_close=?",
+                (venue, model_id, timeframe, bar_close),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        return None if row is None else dict(zip(columns, row))
+
+    def unresolved_as_of_pendings(self) -> list[dict[str, Any]]:
+        """Pending linkages with no bound row — the recoverable state left by
+        a crash between the pre-decision write and the atomic bind."""
+        self._ensure_as_of_schema()
+        return [dict(zip(_AS_OF_V2_COLUMNS, row)) for row in self._con.execute(
+            f"SELECT {','.join('p.' + name for name in _AS_OF_V2_COLUMNS)}"
+            " FROM as_of_input_bars_v2 AS p WHERE p.row_state=?"
+            " AND NOT EXISTS (SELECT 1 FROM as_of_input_bars_v2 AS b"
+            "  WHERE b.row_state=? AND b.identity_sha256=p.identity_sha256)"
+            " ORDER BY p.seq",
+            (as_of_lineage.PENDING, as_of_lineage.BOUND))]
+
+    def resolve_pending_as_of(self) -> dict[str, Any]:
+        """Recover every unresolved pending linkage, exactly once.
+
+        - the due-decision fact exists with matching lineage -> append the
+          bound row (the crash is repaired, no orphan, no contradiction);
+        - the fact exists with DIFFERENT lineage -> refuse and land one
+          durable incident; the pending row is never promoted;
+        - the fact does not exist -> the decision never happened; the pending
+          row stays typed ``pending`` and is reported, never invented into
+          evidence.
+        """
+        self._ensure_as_of_schema()
+        outcome = {"bound": [], "contradicted": [], "still_pending": []}
+        for pending in self.unresolved_as_of_pendings():
+            decision = self.due_bar_decision_row(
+                venue=pending["venue"], model_id=pending["model_id"],
+                timeframe=pending["timeframe"],
+                bar_close=pending["bar_close"])
+            if decision is None or as_of_lineage.identity_of_decision(
+                    decision)["identity_sha256"] != pending["identity_sha256"]:
+                # the due decision never landed under this identity, so no
+                # comparison row lost its inputs: typed and counted, never an
+                # incident and never promoted into evidence
+                outcome["still_pending"].append(pending["identity_sha256"])
+                continue
+            projected = as_of_lineage.identity_of_decision(decision)
+            drift = [key for key
+                     in as_of_lineage.LINEAGE_FIELDS + ("input_sha256",)
+                     if str(pending[key]) != projected[key]]
+            if drift:
+                candidate = dict(pending)
+                candidate.update({key: projected[key] for key in drift})
+                candidate["lineage_sha256"] = as_of_lineage.lineage_digest(
+                    candidate)
+                try:
+                    self._raise_contradiction(
+                        _Contradiction(pending, candidate,
+                                       as_of_lineage.PENDING))
+                except AsOfLineageContradiction:
+                    outcome["contradicted"].append(pending["identity_sha256"])
+                continue
+            with self.atomic_unit():
+                if self._as_of_row(
+                        row_state=as_of_lineage.BOUND,
+                        identity_sha256=pending["identity_sha256"]) is None:
+                    self._insert_as_of(pending, row_state=as_of_lineage.BOUND,
+                                       origin="pending_recovery")
+            self.resolve_as_of_lineage_incident(
+                identity_sha256=pending["identity_sha256"],
+                reason_code=as_of_lineage.REASON_PENDING_UNRESOLVED,
+                note="pending linkage recovered and bound")
+            outcome["bound"].append(pending["identity_sha256"])
+        return outcome
+
+    # ---- durable incidents ----
+
+    def record_as_of_lineage_incident(
+        self, *, reason_code: str, identity: dict[str, Any],
+        detail: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Land ONE durable incident per (identity, typed reason).
+
+        Written twice on purpose: into the ledger's append-only incident
+        table AND into a sidecar journal beside the ledger file, because
+        finding 260's worst case is the ledger itself refusing writes. Both
+        sinks dedup on the same key, so the pair is still exactly one
+        incident. Routing/paging stays with the existing fleet incident
+        router — this is the durable FACT, not a second alerting stack.
+        """
+        if reason_code not in as_of_lineage.REASONS:
+            raise AsOfLineageError(f"untyped lineage reason {reason_code!r}")
+        identity_sha256 = str(
+            identity.get("identity_sha256")
+            or as_of_lineage.identity_of_decision(identity)["identity_sha256"])
+        record = {
+            "schema": as_of_lineage.INCIDENT_SCHEMA,
+            "event": "opened",
+            "recorded_at": _utc_now().isoformat(),
+            "incident_key": as_of_lineage.incident_key(
+                identity_sha256, reason_code),
+            "identity_sha256": identity_sha256,
+            "reason_code": reason_code,
+            "venue": str(identity.get("venue") or "unknown"),
+            "account_fingerprint": str(
+                identity.get("account_fingerprint") or "unknown"),
+            "instrument": str(identity.get("instrument") or "unknown"),
+            "decision_id": str(identity.get("decision_id") or "unknown"),
+            "detail_json": json.dumps(detail, sort_keys=True, default=str),
+        }
+        record["journaled"] = as_of_lineage.append_journal(
+            self.as_of_journal_path, record)
+        try:
+            record["persisted"] = self._insert_incident(record)
+        except Exception:
+            # recording an incident must never raise a second failure over
+            # the first; the sidecar journal already holds the evidence
+            record["persisted"] = False
+        return record
+
+    def _insert_incident(self, record: dict[str, Any]) -> bool:
+        try:
+            self._ensure_as_of_schema()
+            cursor = self._con.execute(
+                "INSERT OR IGNORE INTO as_of_lineage_incidents"
+                f" ({','.join(_INCIDENT_COLUMNS)})"
+                f" VALUES ({','.join('?' for _ in _INCIDENT_COLUMNS)})",
+                tuple(record[name] for name in _INCIDENT_COLUMNS),
+            )
+            return cursor.rowcount == 1
+        except sqlite3.Error:
+            # the sidecar journal already holds this incident; a ledger that
+            # cannot record its own failure is exactly why it exists
+            return False
+
+    def resolve_as_of_lineage_incident(
+        self, *, identity_sha256: str, reason_code: str, note: str,
+    ) -> bool:
+        """Append the ``resolved`` event for one open incident.
+
+        A contradiction is NOT self-healing: only an explicit, recorded call
+        closes it, and the closure keeps the original ``opened`` row.
+        """
+        if reason_code not in as_of_lineage.REASONS:
+            raise AsOfLineageError(f"untyped lineage reason {reason_code!r}")
+        key = as_of_lineage.incident_key(identity_sha256, reason_code)
+        self._ensure_as_of_schema()
+        opened = self._con.execute(
+            "SELECT venue, account_fingerprint, instrument, decision_id"
+            " FROM as_of_lineage_incidents WHERE event='opened'"
+            " AND incident_key=?", (key,),
+        ).fetchone()
+        journal = as_of_lineage.read_journal(self.as_of_journal_path)
+        if opened is None:
+            match = next((item for item in journal
+                          if item.get("event") == "opened"
+                          and item.get("incident_key") == key), None)
+            if match is None:
+                return False
+            opened = (match.get("venue"), match.get("account_fingerprint"),
+                      match.get("instrument"), match.get("decision_id"))
+        record = {
+            "schema": as_of_lineage.INCIDENT_SCHEMA,
+            "event": "resolved",
+            "recorded_at": _utc_now().isoformat(),
+            "incident_key": key,
+            "identity_sha256": identity_sha256,
+            "reason_code": reason_code,
+            "venue": str(opened[0]), "account_fingerprint": str(opened[1]),
+            "instrument": str(opened[2]), "decision_id": str(opened[3]),
+            "detail_json": json.dumps({"note": note}, sort_keys=True),
+        }
+        journaled = as_of_lineage.append_journal(
+            self.as_of_journal_path, record)
+        try:
+            persisted = self._insert_incident(record)
+        except Exception:
+            persisted = False
+        return bool(journaled or persisted)
+
+    def as_of_lineage_events(self) -> list[dict[str, Any]]:
+        """Every incident event from BOTH sinks, merged. Duplicates collapse
+        on ``(event, incident_key)`` in :func:`as_of_lineage.open_incidents`."""
+        events: list[dict[str, Any]] = []
+        try:
+            self._ensure_as_of_schema()
+            events.extend(
+                dict(zip(_INCIDENT_COLUMNS, row)) for row in self._con.execute(
+                    f"SELECT {','.join(_INCIDENT_COLUMNS)}"
+                    " FROM as_of_lineage_incidents ORDER BY seq"))
+        except sqlite3.Error:
+            pass
+        events.extend(as_of_lineage.read_journal(self.as_of_journal_path))
+        return events
+
+    def as_of_lineage_health(self) -> dict[str, Any]:
+        """Durable comparison-lineage health for the runner heartbeat.
+
+        Derived from the durable incident events, so a restart cannot wash a
+        degradation away and a report can name the same incident.
+        """
+        try:
+            return as_of_lineage.health(self.as_of_lineage_events())
+        except Exception as exc:                     # never break a heartbeat
+            return {
+                "comparison_lineage_state": as_of_lineage.DEGRADED,
+                "comparison_lineage_reason":
+                    f"health_unreadable: {type(exc).__name__}",
+                "comparison_lineage_open_incidents": None,
+                "comparison_lineage_last_incident": None,
+            }
+
+    def migrate_as_of_v1_to_v2(self) -> dict[str, Any]:
+        """Forward-migrate legacy v1 rows that a due-decision fact can bind.
+
+        v1 rows are READ, never altered or dropped. A v1 row is migrated only
+        when exactly one due-bar decision supplies the missing identity
+        (account fingerprint, instrument, decision id) and its lineage agrees;
+        an ambiguous or contradictory v1 row is reported, never guessed into
+        evidence.
+        """
+        self._ensure_as_of_schema()
+        report = {"migrated": 0, "already_present": 0, "unbindable": [],
+                  "contradictory": []}
+        for legacy in self.legacy_as_of_input_bars():
+            decision = self.due_bar_decision_row(
+                venue=legacy["venue"], model_id=legacy["model_id"],
+                timeframe=legacy["timeframe"],
+                bar_close=legacy["bar_close"])
+            if decision is None:
+                report["unbindable"].append({
+                    "venue": legacy["venue"], "model_id": legacy["model_id"],
+                    "bar_close": legacy["bar_close"],
+                    "candidate_decisions": 0})
+                continue
+            if decision["input_sha256"] != legacy["input_sha256"]:
+                report["contradictory"].append({
+                    "venue": legacy["venue"], "bar_close": legacy["bar_close"],
+                    "decision_input_sha256": decision["input_sha256"],
+                    "legacy_input_sha256": legacy["input_sha256"]})
+                continue
+            normalized = as_of_lineage.normalize({
+                **{key: decision[key] for key in
+                   as_of_lineage.IDENTITY_FIELDS + as_of_lineage.LINEAGE_FIELDS},
+                "input_sha256": legacy["input_sha256"],
+                "feature_contract": legacy["feature_contract"],
+                "source": legacy["source"],
+                "bars_json": legacy["bars_json"],
+            })
+            with self.atomic_unit():
+                existing = self._as_of_row(
+                    row_state=as_of_lineage.BOUND,
+                    identity_sha256=normalized["identity_sha256"])
+                if existing is not None:
+                    if existing["lineage_sha256"] != normalized["lineage_sha256"]:
+                        report["contradictory"].append({
+                            "venue": legacy["venue"],
+                            "bar_close": legacy["bar_close"],
+                            "reason": "v2 row already binds different content"})
+                    else:
+                        report["already_present"] += 1
+                    continue
+                self._insert_as_of(normalized, row_state=as_of_lineage.BOUND,
+                                   origin="v1_migration")
+                report["migrated"] += 1
+        return report
 
     def effects_with_key_prefix(self, prefix: str) -> list[dict[str, Any]]:
         """All effects whose idempotency key starts with ``prefix``."""

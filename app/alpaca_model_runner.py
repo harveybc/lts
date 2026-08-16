@@ -15,6 +15,7 @@ from typing import Any, Optional
 from prediction_provider_mechanics import build_closed_bar_features
 from trading_contracts import AssetIntent, BrokerCapabilitySnapshot, InstrumentCapability
 
+from app import as_of_lineage
 from app.alpaca_l1 import AlpacaL1Executor, AlpacaL1Profile, AlpacaPaperTradingClient
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
@@ -210,6 +211,10 @@ class AlpacaModelRunner:
         )
         self.manifest = self.selector.manifest
         self.policy = self.selector.policy
+        # WO2/260: the exact as-of window of the CURRENT due decision, carried
+        # from inference to the single atomic decision+bars write
+        self._as_of: Optional[dict[str, Any]] = None
+        self._as_of_outcome: dict[str, Any] = {}
 
     def _account_facts(self) -> tuple[dict[str, Any], str]:
         account = self.client.account()
@@ -242,6 +247,7 @@ class AlpacaModelRunner:
 
     def tick(self, *, allow_execution: bool = True) -> dict[str, Any]:
         now = _utc_now()
+        self._recover_as_of_pendings()
         selection_error = None
         try:
             if self.selector.refresh():
@@ -304,6 +310,7 @@ class AlpacaModelRunner:
         bars = _bars(self.client, self.profile.symbol, self.config["data"]["start"])
         observation = build_closed_bar_features(bars[-60:])
         inference = self.policy.predict(observation)
+        self._open_as_of(observation, bars[-60:])
         self.sessions.record_inference(current["session_id"], inference)
         if not allow_execution:
             self._record_due_bar(inference, outcome="inference_only",
@@ -378,38 +385,88 @@ class AlpacaModelRunner:
         return {"state": state, "inference": inference,
                 "decision": decision, "executions": executions}
 
+    # -- as-of comparison lineage (findings 259/260) -----------------------
+
+    def _open_as_of(self, observation, bars) -> None:
+        """Open the recoverable PENDING linkage for this due decision before
+        any risk action. Never raises into the tick."""
+        self._as_of = as_of_lineage.build_as_of_fact(
+            venue="alpaca_paper",
+            account_fingerprint=self.profile.account_fingerprint,
+            instrument=self.profile.symbol,
+            model_id=self.policy.model_id,
+            artifact_sha256=self.policy.artifact_sha256,
+            config_sha256=self.manifest["config_sha256"],
+            timeframe=self.config["model"]["expected_timeframe"],
+            source="alpaca_iex_daily_bars",
+            observation=observation, bars=bars,
+        )
+        self._as_of_outcome = as_of_lineage.begin_as_of(self.store,
+                                                        self._as_of)
+        if not self._as_of_outcome.get("ok"):
+            print(json.dumps({"as_of_lineage_refused": self._as_of_outcome},
+                             sort_keys=True, default=str), flush=True)
+
+    def _recover_as_of_pendings(self) -> dict[str, Any]:
+        """Repair any pending linkage a crash left between the two writes.
+        Never raises into the tick."""
+        try:
+            return self.store.resolve_pending_as_of()
+        except Exception as exc:
+            print(json.dumps({"as_of_pending_recovery_error":
+                              f"{type(exc).__name__}: {exc}"[:200]}),
+                  flush=True)
+            return {}
+
+    def comparison_lineage_health(self) -> dict[str, Any]:
+        try:
+            return self.store.as_of_lineage_health()
+        except Exception as exc:
+            return {"comparison_lineage_state": as_of_lineage.DEGRADED,
+                    "comparison_lineage_reason":
+                        f"health_unreadable: {type(exc).__name__}",
+                    "comparison_lineage_open_incidents": None,
+                    "comparison_lineage_last_incident": None}
+
     def _record_due_bar(self, inference, *, outcome, reason=None,
                         quote=None, risk=None, effect_id=None):
         """Order C1: one normalized decision fact per due closed bar —
-        HOLDs and refusals included. Never raises into the tick."""
+        HOLDs and refusals included — persisted together with the EXACT as-of
+        bars of that decision as ONE logical operation. Never raises into the
+        tick; trading safety is untouched by an evidence failure."""
         if not inference or not inference.get("last_closed_bar"):
             return
-        try:
-            self.store.record_due_bar_decision({
-                "venue": "alpaca_paper",
-                "account_fingerprint": self.profile.account_fingerprint,
-                "asset_id": self.policy.asset_id,
-                "instrument": self.profile.symbol,
-                "timeframe": self.config["model"]["expected_timeframe"],
-                "bar_close": inference["last_closed_bar"],
-                "decided_at": _utc_now().isoformat(),
-                "feature_cutoff": inference["last_closed_bar"],
-                "input_sha256": inference["input_sha256"],
-                "config_sha256": self.manifest["config_sha256"],
-                "model_id": self.policy.model_id,
-                "artifact_sha256": self.policy.artifact_sha256,
-                "manifest_sha256": self.manifest.get("manifest_sha256"),
-                "action": inference["action"],
-                "score": inference.get("probability_up"),
-                "outcome": outcome, "reason": reason,
-                "risk_envelope": risk, "quote": quote,
-                "decision_id":
-                    f"{self.policy.model_id}:{inference['last_closed_bar']}",
-                "effect_or_command_id": effect_id,
-            })
-        except Exception as exc:
-            print(json.dumps({"due_bar_fact_error": str(exc)[:160]}),
-                  flush=True)
+        decision_id = \
+            f"{self.policy.model_id}:{inference['last_closed_bar']}"
+        fact = {
+            "venue": "alpaca_paper",
+            "account_fingerprint": self.profile.account_fingerprint,
+            "asset_id": self.policy.asset_id,
+            "instrument": self.profile.symbol,
+            "timeframe": self.config["model"]["expected_timeframe"],
+            "bar_close": inference["last_closed_bar"],
+            "decided_at": _utc_now().isoformat(),
+            "feature_cutoff": inference["last_closed_bar"],
+            "input_sha256": inference["input_sha256"],
+            "config_sha256": self.manifest["config_sha256"],
+            "model_id": self.policy.model_id,
+            "artifact_sha256": self.policy.artifact_sha256,
+            "manifest_sha256": self.manifest.get("manifest_sha256"),
+            "action": inference["action"],
+            "score": inference.get("probability_up"),
+            "outcome": outcome, "reason": reason,
+            "risk_envelope": risk, "quote": quote,
+            "decision_id": decision_id,
+            "effect_or_command_id": effect_id,
+        }
+        as_of = self._as_of if (self._as_of
+                                and self._as_of["decision_id"] == decision_id
+                                and self._as_of["input_sha256"]
+                                == inference["input_sha256"]) else None
+        result = as_of_lineage.persist_due_bar(self.store, fact, as_of)
+        if not result.get("ok"):
+            print(json.dumps({"due_bar_fact_error": result}, sort_keys=True,
+                             default=str), flush=True)
 
     def close(self) -> None:
         self.store.close()
@@ -418,6 +475,9 @@ class AlpacaModelRunner:
         runtime = {
             **payload,
             **linear_model_identity(self.selector),
+            # 260: the loss of comparison lineage is now visible in health,
+            # derived from durable incidents so a restart cannot wash it away
+            **self.comparison_lineage_health(),
             "venue": "alpaca_paper",
             "environment": "paper",
             "read_only": False,

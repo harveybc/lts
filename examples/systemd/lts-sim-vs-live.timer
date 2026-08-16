@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the LTS sim-vs-live comparison every 30 minutes (one fleet timer; rows dedup by identity)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=lts-sim-vs-live.service
+
+[Install]
+WantedBy=timers.target

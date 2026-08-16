@@ -1,0 +1,37 @@
+{
+  "schema": "lts.sim_vs_live_window_config.v1",
+  "version": "1.0.0",
+  "comment": "WO2 same-window sim-vs-Demo comparison, Dragon machine: only the MT5 ETH Demo seat lives here. Rows accumulate in Dragon's own append-only comparison ledger; fleet aggregation reads it via the evidence mirror, never by treating a consolidated alert as the direct source.",
+  "comparison_db": "~/.local/state/lts/sim-vs-live-comparison.sqlite",
+  "state_file": "~/.local/state/lts/sim-vs-live/state.json",
+  "report_dir": "~/.local/state/lts/sim-vs-live/reports",
+  "incident": {
+    "repo": "~/Documents/GitHub/agent-multi",
+    "config": "~/Documents/GitHub/agent-multi/examples/configs/incident_ledger_v1.json",
+    "machine": "dragon",
+    "front": "front2",
+    "source": "lts_sim_vs_live"
+  },
+  "seats": [
+    {
+      "seat": "mt5_demo:ethusdt-4h-linear-live-v1",
+      "venue": "mt5_demo",
+      "instrument": "ETHUSD",
+      "timeframe": "4h",
+      "expected_asset_id": "crypto:ETHUSD",
+      "expected_model_id": "ethusdt-4h-linear-live-v1",
+      "execution_ledger": "~/.local/state/lts/mt5-bridge.sqlite",
+      "bars_source": "mt5_bridge",
+      "bars_count": 60,
+      "artifact_file": "~/.local/share/prediction-provider/live/ethusdt_4h_linear_v1/model.json",
+      "lookback_hours": 96,
+      "economic_assumptions": {
+        "sim_reference_price": "recorded_decision_quote_mid",
+        "sim_fill": "entry_slippage_measured_against_recorded_quote_mid",
+        "fees": "not_modeled_and_typed_unavailable",
+        "latency": "observed_lineage_only",
+        "position_sizing": "seat_L0_risk_envelope"
+      }
+    }
+  ]
+}
