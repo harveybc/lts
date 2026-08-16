@@ -1,0 +1,155 @@
+{
+ "collected_at": "2026-08-16T04:40:00+00:00",
+ "entry_point": "tools/promote_paper_champion.py --action promote",
+ "note": "live run against the three current Paper/Demo seats with the best currently materialized v2-shape candidate; every seat refuses at the compatibility pre-gate, so no broker session was opened, no capability was touched and no manifest moved",
+ "schema": "lts.succession.cli_verdict_run.v1",
+ "seats": {
+  "ethusd": {
+   "candidate": {
+    "artifact_sha256": "59c8cbb37176f832f13d59b26a73b59f06710f4b4ba291498ece7b405d2ff40c",
+    "config_sha256": "98a0eb6f756cf2b8ce88f11a3dcdbc8899edcd0c5d44702c056d7518ec846030",
+    "feature_count": 83,
+    "model_id": "p1lr-v2-cdf30aeb-seed101-P1N_LR1E4-post_easy",
+    "model_kind": "sb3_sac",
+    "observation_dim": 2660
+   },
+   "code": "CANDIDATE_INCOMPATIBLE",
+   "compatibility_report_sha256": "25508e143cda39d983bbfba80e2b65d03763557451343341a32d685e95523c48",
+   "exit_code": 3,
+   "incompatibilities": [
+    {
+     "code": "OBSERVATION_DIM_MISMATCH",
+     "detail": "candidate expects a 2660-dim observation; live provisioning produces 11 dims",
+     "missing_feature_count": null
+    },
+    {
+     "code": "NO_COMPATIBLE_FEATURE_PROVISIONING",
+     "detail": "live provisioning lacks 80 of the 83 features the candidate requires",
+     "missing_feature_count": 80
+    },
+    {
+     "code": "PREPROCESSING_CONTRACT_MISMATCH",
+     "detail": "candidate preprocessing hash does not equal the live provisioning preprocessing hash \u2014 same names never prove same semantics",
+     "missing_feature_count": null
+    },
+    {
+     "code": "ACTION_CONTRACT_MISMATCH",
+     "detail": "candidate action contract 'continuous_threshold'/['long', 'short', 'hold'] is not the seat contract 'probability_threshold'/['long', 'short', 'hold']",
+     "missing_feature_count": null
+    }
+   ],
+   "instrument": "ETHUSD",
+   "stages_reached": [
+    "seat_and_candidate_loaded",
+    "compatibility_pre_gate"
+   ],
+   "state": "refused",
+   "timeframe": "4h",
+   "venue": "mt5_demo",
+   "verdict": "INCOMPATIBLE"
+  },
+  "spy": {
+   "candidate": {
+    "artifact_sha256": "59c8cbb37176f832f13d59b26a73b59f06710f4b4ba291498ece7b405d2ff40c",
+    "config_sha256": "98a0eb6f756cf2b8ce88f11a3dcdbc8899edcd0c5d44702c056d7518ec846030",
+    "feature_count": 83,
+    "model_id": "p1lr-v2-cdf30aeb-seed101-P1N_LR1E4-post_easy",
+    "model_kind": "sb3_sac",
+    "observation_dim": 2660
+   },
+   "code": "CANDIDATE_INCOMPATIBLE",
+   "compatibility_report_sha256": "94bada28785df9e4776728d73cf23585007bf543c737ad437f475b04564a4464",
+   "exit_code": 3,
+   "incompatibilities": [
+    {
+     "code": "SYMBOL_MISMATCH",
+     "detail": "candidate asset 'crypto:ETHUSD' is not the seat asset 'equity:SPY'",
+     "missing_feature_count": null
+    },
+    {
+     "code": "TIMEFRAME_MISMATCH",
+     "detail": "candidate timeframe '4h' is not the seat timeframe '1d'",
+     "missing_feature_count": null
+    },
+    {
+     "code": "OBSERVATION_DIM_MISMATCH",
+     "detail": "candidate expects a 2660-dim observation; live provisioning produces 11 dims",
+     "missing_feature_count": null
+    },
+    {
+     "code": "NO_COMPATIBLE_FEATURE_PROVISIONING",
+     "detail": "live provisioning lacks 80 of the 83 features the candidate requires",
+     "missing_feature_count": 80
+    },
+    {
+     "code": "PREPROCESSING_CONTRACT_MISMATCH",
+     "detail": "candidate preprocessing hash does not equal the live provisioning preprocessing hash \u2014 same names never prove same semantics",
+     "missing_feature_count": null
+    },
+    {
+     "code": "ACTION_CONTRACT_MISMATCH",
+     "detail": "candidate action contract 'continuous_threshold'/['long', 'short', 'hold'] is not the seat contract 'probability_threshold'/['long', 'short', 'hold']",
+     "missing_feature_count": null
+    }
+   ],
+   "instrument": "SPY",
+   "stages_reached": [
+    "seat_and_candidate_loaded",
+    "compatibility_pre_gate"
+   ],
+   "state": "refused",
+   "timeframe": "1d",
+   "venue": "alpaca_paper",
+   "verdict": "INCOMPATIBLE"
+  },
+  "usdcad": {
+   "candidate": {
+    "artifact_sha256": "59c8cbb37176f832f13d59b26a73b59f06710f4b4ba291498ece7b405d2ff40c",
+    "config_sha256": "98a0eb6f756cf2b8ce88f11a3dcdbc8899edcd0c5d44702c056d7518ec846030",
+    "feature_count": 83,
+    "model_id": "p1lr-v2-cdf30aeb-seed101-P1N_LR1E4-post_easy",
+    "model_kind": "sb3_sac",
+    "observation_dim": 2660
+   },
+   "code": "CANDIDATE_INCOMPATIBLE",
+   "compatibility_report_sha256": "c9adbcc98052bf905eb5ab9d0b73dd6caa8ab6445e2905d917b27b25786ae9ed",
+   "exit_code": 3,
+   "incompatibilities": [
+    {
+     "code": "SYMBOL_MISMATCH",
+     "detail": "candidate asset 'crypto:ETHUSD' is not the seat asset 'fx:USD/CAD'",
+     "missing_feature_count": null
+    },
+    {
+     "code": "OBSERVATION_DIM_MISMATCH",
+     "detail": "candidate expects a 2660-dim observation; live provisioning produces 11 dims",
+     "missing_feature_count": null
+    },
+    {
+     "code": "NO_COMPATIBLE_FEATURE_PROVISIONING",
+     "detail": "live provisioning lacks 80 of the 83 features the candidate requires",
+     "missing_feature_count": 80
+    },
+    {
+     "code": "PREPROCESSING_CONTRACT_MISMATCH",
+     "detail": "candidate preprocessing hash does not equal the live provisioning preprocessing hash \u2014 same names never prove same semantics",
+     "missing_feature_count": null
+    },
+    {
+     "code": "ACTION_CONTRACT_MISMATCH",
+     "detail": "candidate action contract 'continuous_threshold'/['long', 'short', 'hold'] is not the seat contract 'probability_threshold'/['long', 'short', 'hold']",
+     "missing_feature_count": null
+    }
+   ],
+   "instrument": "USD.CAD",
+   "stages_reached": [
+    "seat_and_candidate_loaded",
+    "compatibility_pre_gate"
+   ],
+   "state": "refused",
+   "timeframe": "4h",
+   "venue": "ibkr_paper",
+   "verdict": "INCOMPATIBLE"
+  }
+ }
+}
