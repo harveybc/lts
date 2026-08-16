@@ -16,6 +16,7 @@ from prediction_provider_mechanics import build_closed_bar_features
 from trading_contracts import AssetIntent, BrokerCapabilitySnapshot, InstrumentCapability
 
 from app.alpaca_l1 import AlpacaL1Executor, AlpacaL1Profile, AlpacaPaperTradingClient
+from app.champion_succession import succession_pending
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
@@ -181,11 +182,28 @@ def _bars(client: AlpacaPaperTradingClient, symbol: str, start: str) -> list[dic
 
 
 class AlpacaModelRunner:
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        client_factory: Optional[Any] = None,
+    ) -> None:
+        """``client_factory`` injects the TRANSPORT only (the HTTP client).
+
+        Every other object — profile, ledger, L0 service, L1 executor,
+        session store, selector — is the real one. Succession tests and
+        the succession CLI construct this runner exactly as systemd does.
+        """
         self.config = config
-        key = os.environ[config["secrets"]["api_key_env"]]
-        secret = os.environ[config["secrets"]["api_secret_env"]]
-        self.client = AlpacaPaperTradingClient(key, secret)
+        key = os.environ.get(config["secrets"]["api_key_env"], "")
+        secret = os.environ.get(config["secrets"]["api_secret_env"], "")
+        if client_factory is None:
+            if not key or not secret:
+                raise AlpacaModelRunnerError(
+                    "Alpaca Paper API credentials are not in the"
+                    " environment")
+            self.client = AlpacaPaperTradingClient(key, secret)
+        else:
+            self.client = client_factory(key, secret)
         self.profile = AlpacaL1Profile.load(_path(config["profile_file"]))
         config["service"]["database_path"] = str(
             _path(config["service"]["database_path"])
@@ -240,8 +258,28 @@ class AlpacaModelRunner:
             )],
         )
 
+    def succession_gate(self) -> Optional[dict[str, Any]]:
+        """Order §3.4: while a promotion saga is open for this seat, the
+        ledger's active session and the manifest this runner would load
+        are not provably the same model. New risk is refused and the
+        split state is reported until the saga completes or rolls back.
+        A gate that cannot be evaluated is itself a refusal."""
+        try:
+            return succession_pending(
+                self.store, venue="alpaca_paper",
+                instrument=self.profile.symbol,
+                account_fingerprint=self.profile.account_fingerprint)
+        except Exception as exc:
+            return {"state": "gate_unavailable",
+                    "detail": f"{type(exc).__name__}: {exc}"[:200],
+                    "split_authority": None}
+
     def tick(self, *, allow_execution: bool = True) -> dict[str, Any]:
         now = _utc_now()
+        pending = self.succession_gate()
+        if pending is not None:
+            return {"state": "blocked_succession_pending",
+                    "succession": pending, "orders_submitted": 0}
         selection_error = None
         try:
             if self.selector.refresh():
@@ -415,9 +453,11 @@ class AlpacaModelRunner:
         self.store.close()
 
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
+        pending = payload.get("succession") or self.succession_gate()
         runtime = {
             **payload,
             **linear_model_identity(self.selector),
+            "succession_state": pending or "none",
             "venue": "alpaca_paper",
             "environment": "paper",
             "read_only": False,

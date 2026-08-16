@@ -15,6 +15,7 @@ from prediction_provider_mechanics import build_closed_bar_features
 from trading_contracts import AssetIntent, BrokerCapabilitySnapshot, InstrumentCapability
 
 from app.alpaca_model_runner import ModelSessionStore
+from app.champion_succession import succession_pending
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_adapter import L1ExecutionError
 from app.ibkr_l1_journal import L1ExecutionOlap
@@ -208,8 +209,26 @@ class IbkrModelRunner:
             )],
         )
 
+    def succession_gate(self) -> Optional[dict[str, Any]]:
+        """Order §3.4: an open promotion saga means ledger authority and
+        the seat manifest may disagree. Refuse new risk, report the split
+        state. A gate that cannot be evaluated is itself a refusal."""
+        try:
+            return succession_pending(
+                self.olap, venue="ibkr_paper",
+                instrument=self.profile.instrument,
+                account_fingerprint=self.profile.account_fingerprint)
+        except Exception as exc:
+            return {"state": "gate_unavailable",
+                    "detail": f"{type(exc).__name__}: {exc}"[:200],
+                    "split_authority": None}
+
     def tick(self) -> dict[str, Any]:
         now = _utc_now()
+        pending = self.succession_gate()
+        if pending is not None:
+            return {"state": "blocked_succession_pending",
+                    "succession": pending, "orders_submitted": 0}
         selection_error = None
         try:
             if self.selector.refresh():
@@ -392,9 +411,11 @@ class IbkrModelRunner:
             self.olap.close()
 
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
+        pending = payload.get("succession") or self.succession_gate()
         runtime = {
             **payload,
             **linear_model_identity(self.selector),
+            "succession_state": pending or "none",
             "venue": "ibkr_paper",
             "environment": "paper",
             "read_only": False,

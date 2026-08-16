@@ -20,6 +20,7 @@ from trading_contracts import (
 )
 
 from app.alpaca_model_runner import ModelSessionStore
+from app.champion_succession import succession_pending
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
@@ -391,8 +392,26 @@ class Mt5ModelRunner:
             input_sha256=input_sha256,
         )
 
+    def succession_gate(self) -> Optional[dict[str, Any]]:
+        """Order §3.4: an open promotion saga means ledger authority and
+        the seat manifest may disagree. Refuse new risk, report the split
+        state. A gate that cannot be evaluated is itself a refusal."""
+        try:
+            return succession_pending(
+                self.l0, venue="mt5_demo",
+                instrument=self.config["route"]["symbol"],
+                account_fingerprint=self.bridge_config.account_fingerprint)
+        except Exception as exc:
+            return {"state": "gate_unavailable",
+                    "detail": f"{type(exc).__name__}: {exc}"[:200],
+                    "split_authority": None}
+
     def tick(self) -> dict[str, Any]:
         now = _utc_now()
+        pending = self.succession_gate()
+        if pending is not None:
+            return {"state": "blocked_succession_pending",
+                    "succession": pending, "commands_queued": 0}
         selection_error = None
         try:
             if self.selector.refresh():
@@ -623,9 +642,11 @@ class Mt5ModelRunner:
         self.bridge_store.close()
 
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
+        pending = payload.get("succession") or self.succession_gate()
         runtime = {
             **payload,
             **linear_model_identity(self.selector),
+            "succession_state": pending or "none",
             "venue": "mt5_demo",
             "environment": "demo",
             "read_only": False,
