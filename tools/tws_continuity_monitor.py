@@ -175,6 +175,38 @@ def exposure_state(ledger_probe: dict) -> str:
     return "flat"
 
 
+def session_state(probes: dict, heartbeat_connected: bool) -> str:
+    """Classify the operator-visible TWS session without guessing auth state.
+
+    A running Java process with no listening API socket is the common state
+    when TWS is at its login screen, socket clients are disabled, or startup
+    has not completed. The monitor cannot distinguish those cases safely, so
+    it reports the exact bounded action they share.
+    """
+    if not probes["process"].get("present"):
+        return "process_absent"
+    if not probes["port"].get("listening"):
+        return "login_or_api_required"
+    if not heartbeat_connected:
+        return "api_session_degraded"
+    return "authenticated"
+
+
+def outage_timing(now: datetime, previous_state: dict,
+                  healthy: bool) -> tuple[str | None, float]:
+    """Preserve the first observed outage time across repeated monitor runs."""
+    if healthy:
+        return None, 0.0
+    started_raw = previous_state.get("outage_started_at")
+    try:
+        started = datetime.fromisoformat(started_raw)
+        if started.tzinfo is None:
+            raise ValueError("naive outage timestamp")
+    except (TypeError, ValueError):
+        started = now
+    return iso(started), max(0.0, (now - started).total_seconds())
+
+
 def assess(probes: dict, config: dict, now: datetime,
            previous_state: dict) -> tuple[list[dict], dict]:
     """Pure decision core: probes -> (emissions, next monitor state)."""
@@ -194,6 +226,7 @@ def assess(probes: dict, config: dict, now: datetime,
         heartbeat_fresh
         and heartbeat.get("state") in HEALTHY_HEARTBEAT_STATES
     )
+    current_session_state = session_state(probes, heartbeat_connected)
 
     reasons = []
     if not probes["process"]["present"]:
@@ -209,6 +242,8 @@ def assess(probes: dict, config: dict, now: datetime,
             f"runner heartbeat state {heartbeat.get('state')!r}")
 
     tws_healthy = not reasons
+    outage_started_at, outage_age_seconds = outage_timing(
+        now, previous_state, tws_healthy)
 
     restart_delta = None
     if restarts.get("readable"):
@@ -238,6 +273,9 @@ def assess(probes: dict, config: dict, now: datetime,
                 "account_fingerprint": heartbeat.get("account_fingerprint"),
                 "restart_count": restarts.get("n_restarts"),
                 "restart_delta": restart_delta,
+                "session_state": current_session_state,
+                "outage_started_at": outage_started_at,
+                "outage_age_seconds": round(outage_age_seconds, 1),
                 "operator_action": config["operator_action"],
                 "summary": "TWS Paper continuity lost: " + "; ".join(reasons),
             },
@@ -253,6 +291,7 @@ def assess(probes: dict, config: dict, now: datetime,
                 "heartbeat_state": heartbeat.get("state"),
                 "heartbeat_age_seconds": round(
                     heartbeat.get("age_seconds", -1), 1),
+                "session_state": current_session_state,
                 "exposure_state": exposure,
                 "halt": ledger_probe.get("halt"),
             },
@@ -343,6 +382,9 @@ def assess(probes: dict, config: dict, now: datetime,
         "n_restarts": restarts.get("n_restarts",
                                    previous_state.get("n_restarts")),
         "tws_healthy": tws_healthy,
+        "session_state": current_session_state,
+        "outage_started_at": outage_started_at,
+        "outage_age_seconds": round(outage_age_seconds, 1),
         "exposure_state": exposure,
     }
     return emissions, next_state

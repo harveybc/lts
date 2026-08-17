@@ -133,6 +133,42 @@ def test_listening_port_alone_is_not_healthy():
     assert not state["tws_healthy"]
 
 
+def test_running_process_without_api_is_login_or_api_required():
+    probes = healthy_probes(port={"listening": False})
+    emissions, state = monitor.assess(probes, CONFIG, NOW, {})
+    incident = _observed(emissions, "tws_unavailable")[0]
+    assert incident["payload"]["session_state"] == "login_or_api_required"
+    assert state["session_state"] == "login_or_api_required"
+    assert state["outage_started_at"] == "2026-08-04T18:00:00+00:00"
+    assert state["outage_age_seconds"] == 0.0
+
+
+def test_outage_age_preserves_first_observation_until_recovery():
+    probes = healthy_probes(port={"listening": False})
+    previous = {
+        "tws_healthy": False,
+        "outage_started_at": "2026-08-04T17:45:00+00:00",
+    }
+    emissions, state = monitor.assess(probes, CONFIG, NOW, previous)
+    incident = _observed(emissions, "tws_unavailable")[0]
+    assert incident["payload"]["outage_age_seconds"] == 900.0
+    assert state["outage_started_at"] == previous["outage_started_at"]
+
+
+def test_recovery_clears_outage_timing_and_reports_authenticated():
+    previous = {
+        "tws_healthy": False,
+        "outage_started_at": "2026-08-04T17:45:00+00:00",
+    }
+    emissions, state = monitor.assess(
+        healthy_probes(), CONFIG, NOW, previous)
+    recovered = _recovered(emissions, "tws_unavailable")[0]
+    assert recovered["evidence"]["session_state"] == "authenticated"
+    assert state["session_state"] == "authenticated"
+    assert state["outage_started_at"] is None
+    assert state["outage_age_seconds"] == 0.0
+
+
 def test_stale_heartbeat_is_unhealthy_even_with_port():
     probes = healthy_probes()
     probes["heartbeat"]["age_seconds"] = 50000.0

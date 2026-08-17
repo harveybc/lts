@@ -13,6 +13,7 @@
   "quantity_decimals": 0,
   "max_decision_age_seconds": 300,
   "loop_seconds": 60,
+  "connect_backoff_max_seconds": 30,
   "heartbeat_path": "~/.local/state/lts/ibkr-model-runner-heartbeat.json",
   "service": {
     "venue": "ibkr_paper",

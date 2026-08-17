@@ -18,7 +18,7 @@
   "incident_repo": "/home/harveybc/Documents/GitHub/agent-multi",
   "incident_config": "/home/harveybc/Documents/GitHub/agent-multi/examples/configs/incident_ledger_v1.json",
   "incident_db_override": null,
-  "operator_action": "Start and authenticate TWS Paper on Omega (port 7497); enable daily Auto restart in Lock-and-Exit settings; the runner reconnects and reconciles automatically; the hold stays until cleared by the owner",
+  "operator_action": "Start and authenticate the local TWS or IB Gateway Paper session; enable daily Auto restart and disable Auto logoff in Lock-and-Exit settings; perform the broker-required weekly human reauthentication; never give broker credentials or 2FA to an agent; the runner reconnects and reconciles automatically and any hold stays until cleared by the owner",
   "operator_action_clock": "Inspect lts-ibkr-model-runner journal for inference/data errors; verify market data subscription and bar feed",
   "operator_action_loop": "journalctl --user -u lts-ibkr-model-runner.service for the crash cause; do not clear holds"
 }

@@ -175,6 +175,17 @@ when needed:
 IB Gateway Paper may later use port `4002`, but the initial laboratory is
 intentionally pinned to local TWS Paper `7497`.
 
+TWS/IB Gateway is not an unattended credential service. Configure **Auto
+restart**, disable **Auto logoff**, and choose a daily restart window under
+Global Configuration -> Lock and Exit. A human must still complete the
+broker-required weekly reauthentication. Use the Offline release channel for
+the seated terminal so a rollout cannot silently change the application during
+an evidence window. Broker credentials and 2FA must never be delegated to a
+cloud agent, desktop bot or language model; the API remains loopback-only.
+
+Continuity operation and the objective Paper acceptance/retirement criteria are
+defined in [`IBKR_PAPER_CONTINUITY_RUNBOOK.md`](IBKR_PAPER_CONTINUITY_RUNBOOK.md).
+
 ### IBKR L1 protected-exit reconciliation
 
 The model runner uses one nonterminal effect as the entry gate, persists the
