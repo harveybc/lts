@@ -51,8 +51,10 @@ from app.champion_succession import (  # noqa: E402
     OUTGOING_SHADOW_DEFAULT_DAYS,
     PROMOTION_ALLOWED_SIGNERS,
     PROMOTION_STORE,
+    VERDICT_ACTIVITY_EVIDENT,
     VERDICT_COMPATIBLE,
     SuccessionError,
+    candidate_activity_report,
     candidate_shadow_replay,
     ensure_saga_schema,
     open_promotion_saga,
@@ -232,10 +234,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             " opened and nothing was consumed",
             incompatibility_codes=codes))
         return report
+
+    # -- stage 2b: direct trading-activity evidence (finding 269) -------
+    # Still no broker session: the evidence is the campaign's own
+    # terminal record, read from bytes. Absence is a typed refusal.
+    activity = candidate_activity_report(
+        candidate, args.terminal_record, now=now)
+    activity_codes = [item["code"] for item in activity["problems"]]
+    stage("activity_evidence_pre_gate",
+          verdict=activity["verdict"], codes=activity_codes,
+          terminal_record_sha256=activity["terminal_record_sha256"],
+          report_sha256=activity["report_sha256"])
+    report["activity"] = activity
+    if activity["verdict"] != VERDICT_ACTIVITY_EVIDENT:
+        report.update(_refusal(
+            "CANDIDATE_WITHOUT_ACTIVITY_EVIDENCE",
+            "promotion demands a terminal record whose activity-eligible"
+            " checkpoint IS the candidate artifact; no broker session"
+            " was opened and nothing was consumed (finding 269)",
+            activity_codes=activity_codes))
+        return report
     if args.action == "preflight":
         report["state"] = "compatible_preflight_only"
-        report["detail"] = ("compatibility only; no venue facts were"
-                            " obtained and nothing was promoted")
+        report["detail"] = ("compatibility and activity evidence only;"
+                            " no venue facts were obtained and nothing"
+                            " was promoted")
         return report
 
     # -- stage 3: seat exclusivity --------------------------------------
@@ -255,6 +278,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         compatibility, evidence_dir / "compatibility_report.json",
         "compatibility")
     report["compatibility"] = compatibility
+    activity = _stable_evidence(
+        activity, evidence_dir / "activity_report.json", "activity")
+    report["activity"] = activity
 
     venue = build_venue(config)
     try:
@@ -301,7 +327,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         successor_manifest = build_successor_manifest(seat, candidate)
         result = promote_paper_champion(
             store=store, venue=venue, seat=seat, candidate=candidate,
-            compatibility_report=compatibility, shadow_report=shadow,
+            compatibility_report=compatibility,
+            activity_report=activity, shadow_report=shadow,
             strategy_config=config["strategy"],
             capability_store_dir=Path(args.capability_store),
             new_manifest=successor_manifest,
@@ -424,6 +451,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--candidate-descriptor", type=Path,
         help="candidate MODEL descriptor (hashes and contracts only;"
              " never broker facts)")
+    parser.add_argument(
+        "--terminal-record", type=Path,
+        help="the candidate's terminal cell record from its own"
+             " campaign — the DIRECT activity-eligible checkpoint"
+             " evidence promotion demands (finding 269); omitting it"
+             " is a typed refusal, never a pass")
     parser.add_argument(
         "--action", default="promote",
         choices=["promote", "preflight", "status", "resume-complete",

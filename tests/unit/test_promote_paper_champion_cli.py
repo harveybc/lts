@@ -86,9 +86,19 @@ def seat_world(tmp_path):
     candidate = _candidate(challenger, "crypto:ETHUSD", "4h")
     descriptor = _write_candidate_descriptor(
         tmp_path / "candidate.json", candidate)
+    # finding 269: the candidate's own terminal cell record — the
+    # DIRECT activity-eligible checkpoint evidence promotion demands.
+    terminal_record = tmp_path / "cell_record.json"
+    terminal_record.write_text(json.dumps({
+        "schema": "agent_multi.p1_difficulty_lr_cell_record.v2",
+        "activity_status": "active",
+        "promotion_eligible": True,
+        "best_model_path": candidate.artifact_file,
+        "best_model_sha256": candidate.artifact_sha256}, indent=1))
     return {"config": config, "config_path": config_path, "seat": seat,
             "candidate": candidate, "descriptor": descriptor,
             "incumbent": incumbent, "challenger": challenger,
+            "terminal_record": terminal_record,
             "tmp_path": tmp_path, "now": now}
 
 
@@ -96,6 +106,7 @@ def _argv(world, *extra, action="promote"):
     return [
         "--runner-config", str(world["config_path"]),
         "--candidate-descriptor", str(world["descriptor"]),
+        "--terminal-record", str(world["terminal_record"]),
         "--action", action,
         "--evidence-dir", str(world["tmp_path"] / "evidence"),
         "--json", str(world["tmp_path"] / "report.json"),
@@ -192,13 +203,14 @@ def test_cli_reaches_the_orchestrator_and_refuses_without_a_capability(
     assert "no valid signed promotion capability" in report["detail"]
     stages = [stage["stage"] for stage in report["stages"]]
     assert stages == ["seat_and_candidate_loaded", "compatibility_pre_gate",
+                      "activity_evidence_pre_gate",
                       "seat_exclusivity", "direct_venue_facts",
                       "executor_bound", "shadow_replay"]
-    facts_stage = report["stages"][3]
+    facts_stage = report["stages"][4]
     assert facts_stage["source"] == "mt5_demo:execution_bridge:v2"
     assert facts_stage["balance_available"] is True
     assert "cash" not in facts_stage           # counts, never balances
-    assert report["stages"][4]["executor"] == (
+    assert report["stages"][5]["executor"] == (
         "app.mt5_execution_bridge.Mt5ExecutionStore")
     binding = report["mint_binding"]
     assert binding["compatibility_report_sha256"]

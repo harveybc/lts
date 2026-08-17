@@ -33,6 +33,7 @@ from app.champion_succession import (
     ActionContract,
     CandidateContract,
     ExecutionContract,
+    candidate_activity_report,
     candidate_shadow_replay,
     preflight_candidate,
     promote_paper_champion,
@@ -179,9 +180,21 @@ def _promote(store, venue, seat, candidate, incumbent, tmp_path, now,
         tmp_path, seat, candidate, incumbent,
         (compatibility["report_sha256"], shadow["report_sha256"]), now)
     venue.bind_executor()
+    record = Path(candidate.artifact_file).parent / (
+        f"cell_record_{candidate.model_id}.json")
+    if not record.exists():
+        record.write_text(json.dumps({
+            "schema":
+                "agent_multi.p1_difficulty_lr_cell_record.v2",
+            "activity_status": "active",
+            "promotion_eligible": True,
+            "best_model_path": candidate.artifact_file,
+            "best_model_sha256": candidate.artifact_sha256}))
+    activity = candidate_activity_report(candidate, record, now=now)
     return promote_paper_champion(
         store=store, venue=venue, seat=seat, candidate=candidate,
-        compatibility_report=compatibility, shadow_report=shadow,
+        compatibility_report=compatibility,
+        activity_report=activity, shadow_report=shadow,
         strategy_config={"stop_fraction": 0.01,
                          "take_profit_fraction": 0.02},
         capability_store_dir=store_dir,

@@ -45,6 +45,7 @@ from app.champion_succession import (
     BOUNDARY_MANIFEST_RENAMED,
     BOUNDARY_MANIFEST_TEMP_WRITTEN,
     PROMOTION_BOUNDARIES,
+    candidate_activity_report,
     SAGA_ABORTED,
     SAGA_COMPLETED,
     SAGA_MANIFEST_PENDING,
@@ -119,11 +120,30 @@ def world(tmp_path):
     olap.close()
 
 
+def _valid_activity_report(candidate, now):
+    """Finding 269: default VALID activity evidence for saga tests —
+    the campaign record whose activity-eligible checkpoint IS the
+    candidate artifact."""
+    import json as _json
+    from pathlib import Path as _Path
+    path = _Path(candidate.artifact_file).parent / (
+        f"cell_record_{candidate.model_id}.json")
+    if not path.exists():
+        path.write_text(_json.dumps({
+            "schema": "agent_multi.p1_difficulty_lr_cell_record.v2",
+            "activity_status": "active",
+            "promotion_eligible": True,
+            "best_model_path": candidate.artifact_file,
+            "best_model_sha256": candidate.artifact_sha256}))
+    return candidate_activity_report(candidate, path, now=now)
+
+
 def promote(world, *, venue=None, boundary=None, **overrides):
     kwargs = dict(
         store=world["olap"], venue=venue or FakeVenue(),
         seat=world["seat"], candidate=world["candidate"],
         compatibility_report=world["compat"],
+        activity_report=_valid_activity_report(world["candidate"], NOW),
         shadow_report=world["shadow"],
         strategy_config=GOOD_STRATEGY,
         capability_store_dir=world["store_dir"],

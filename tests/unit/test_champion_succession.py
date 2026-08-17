@@ -53,6 +53,7 @@ from app.champion_succession import (
     SuccessionError,
     VenueFacts,
     assert_native_protection,
+    candidate_activity_report,
     candidate_shadow_replay,
     classify_promotion_store,
     drain_and_carry_session,
@@ -794,10 +795,35 @@ def test_outgoing_shadow_window_below_seven_days_refuses(olap, seat):
 # ── the full owner-gated promotion path ────────────────────────────────
 
 
+def make_activity_record(candidate, **overrides) -> Path:
+    """Write the candidate's terminal cell record next to its artifact:
+    the campaign's own activity-eligible checkpoint fact (finding 269).
+    Overrides build the adversarial variants."""
+    record = {
+        "schema": "agent_multi.p1_difficulty_lr_cell_record.v2",
+        "activity_status": "active",
+        "promotion_eligible": True,
+        "inactive_cause": None,
+        "best_model_path": candidate.artifact_file,
+        "best_model_sha256": candidate.artifact_sha256,
+    }
+    record.update(overrides)
+    path = Path(candidate.artifact_file).parent / (
+        f"cell_record_{candidate.model_id}.json")
+    path.write_text(json.dumps(record, indent=1))
+    return path
+
+
+def valid_activity_report(candidate) -> dict:
+    return candidate_activity_report(
+        candidate, make_activity_record(candidate), now=NOW)
+
+
 def promote(olap, seat, candidate, cap_store, signers, **overrides):
     defaults = dict(
         store=olap, venue=FakeVenue(), seat=seat,
         candidate=candidate,
+        activity_report=valid_activity_report(candidate),
         strategy_config=GOOD_STRATEGY,
         capability_store_dir=cap_store,
         new_manifest={"schema":

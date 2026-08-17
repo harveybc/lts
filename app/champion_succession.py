@@ -131,6 +131,39 @@ MISSING_NATIVE_PROTECTION = "MISSING_NATIVE_PROTECTION"
 VERDICT_COMPATIBLE = "COMPATIBLE"
 VERDICT_INCOMPATIBLE = "INCOMPATIBLE"
 
+# ── stage 1b: direct trading-activity evidence (finding 269) ───────────
+#
+# The defect: promotion DECLARED activity mandatory
+# (`activity_required_for_promotion: true` in the runtime authority
+# record) while no executable predicate existed anywhere in this
+# repository — mechanical viability could reach a seat without one
+# measured trade. The evidence demanded here is the campaign's own
+# terminal cell record, not an operator assertion: the record is read
+# from bytes, hashed, and its typed fields decide.
+ACTIVITY_EVIDENCE_SCHEMA = "lts.succession.activity_evidence.v1"
+VERDICT_ACTIVITY_EVIDENT = "ACTIVITY_EVIDENT"
+VERDICT_ACTIVITY_NOT_EVIDENT = "ACTIVITY_NOT_EVIDENT"
+
+#: terminal cell-record schemas this gate can read (agent-multi P1LR).
+ACCEPTED_TERMINAL_RECORD_SCHEMAS = (
+    "agent_multi.p1_difficulty_lr_cell_record.v1",
+    "agent_multi.p1_difficulty_lr_cell_record.v2",
+)
+#: a mechanics screen verdict is NEVER activity evidence, even when it
+#: says VIABLE everywhere (finding 263: viability is not activity).
+MECHANICS_SCREEN_MARKERS = ("screen_verdict", "mechanics")
+
+# Typed activity refusal codes. Every refusal is named.
+NO_ACTIVITY_EVIDENCE = "NO_ACTIVITY_EVIDENCE"
+ACTIVITY_RECORD_UNREADABLE = "ACTIVITY_RECORD_UNREADABLE"
+ACTIVITY_RECORD_SCHEMA_UNSUPPORTED = "ACTIVITY_RECORD_SCHEMA_UNSUPPORTED"
+ACTIVITY_EVIDENCE_FROM_MECHANICS_SCREEN = (
+    "ACTIVITY_EVIDENCE_FROM_MECHANICS_SCREEN")
+ACTIVITY_STATUS_NOT_ACTIVE = "ACTIVITY_STATUS_NOT_ACTIVE"
+ACTIVITY_RECORD_NOT_PROMOTION_ELIGIBLE = (
+    "ACTIVITY_RECORD_NOT_PROMOTION_ELIGIBLE")
+ACTIVITY_ARTIFACT_MISMATCH = "ACTIVITY_ARTIFACT_MISMATCH"
+
 # ── the promotion saga (finding 258) ───────────────────────────────────
 #
 # The defect: the ledger commit (capability burn + successor session) and
@@ -552,6 +585,155 @@ def require_compatible(report: Mapping[str, Any],
         raise SuccessionError(
             f"candidate is {report.get('verdict')}: {codes} — promotion"
             " requires a COMPATIBLE preflight")
+    return digest
+
+
+def candidate_activity_report(
+    candidate: CandidateContract,
+    terminal_record_file: Optional[Path | str],
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Typed trading-activity evidence report (finding 269).
+
+    Reads the candidate's terminal cell record — the campaign's own
+    immutable measurement — and decides whether a DIRECT
+    activity-eligible checkpoint exists whose bytes ARE the candidate
+    artifact. Like ``preflight_candidate``, a negative outcome is data,
+    not an exception; absence of the record is itself the typed
+    ``NO_ACTIVITY_EVIDENCE`` outcome (fail-closed, never a default
+    pass)."""
+    now = now or _utc_now()
+    problems: list[dict[str, Any]] = []
+    record: dict[str, Any] = {}
+    record_sha: Optional[str] = None
+    record_path: Optional[str] = None
+
+    if terminal_record_file is None:
+        problems.append(_incompatibility(
+            NO_ACTIVITY_EVIDENCE,
+            "no terminal cell record was presented — promotion demands"
+            " direct activity-eligible checkpoint evidence from the"
+            " candidate's own campaign record; its absence refuses"
+            " (finding 269)"))
+    else:
+        path = Path(os.path.expandvars(str(terminal_record_file))
+                    ).expanduser()
+        record_path = str(path)
+        if not path.is_file():
+            problems.append(_incompatibility(
+                NO_ACTIVITY_EVIDENCE,
+                f"terminal cell record {path} does not exist",
+                terminal_record_file=str(path)))
+        else:
+            raw = path.read_bytes()
+            record_sha = hashlib.sha256(raw).hexdigest()
+            try:
+                record = json.loads(raw)
+                if not isinstance(record, dict):
+                    raise ValueError("record is not an object")
+            except ValueError as error:
+                record = {}
+                problems.append(_incompatibility(
+                    ACTIVITY_RECORD_UNREADABLE,
+                    f"terminal cell record is not a JSON object:"
+                    f" {error}",
+                    terminal_record_file=str(path)))
+
+    if record:
+        schema = record.get("schema")
+        if schema not in ACCEPTED_TERMINAL_RECORD_SCHEMAS:
+            code = (ACTIVITY_EVIDENCE_FROM_MECHANICS_SCREEN
+                    if isinstance(schema, str)
+                    and any(marker in schema
+                            for marker in MECHANICS_SCREEN_MARKERS)
+                    else ACTIVITY_RECORD_SCHEMA_UNSUPPORTED)
+            problems.append(_incompatibility(
+                code,
+                f"presented evidence has schema {schema!r} — a"
+                " mechanics screen verdict measures viability, never"
+                " activity, and only a terminal cell record"
+                f" {list(ACCEPTED_TERMINAL_RECORD_SCHEMAS)} carries"
+                " the activity-eligible checkpoint fact",
+                schema=schema))
+        else:
+            if record.get("activity_status") != "active":
+                problems.append(_incompatibility(
+                    ACTIVITY_STATUS_NOT_ACTIVE,
+                    "the terminal record's activity_status is"
+                    f" {record.get('activity_status')!r} — the policy"
+                    " never produced an activity-eligible checkpoint"
+                    " (train-tail and validation trade gates both"
+                    " passing); a policy that never traded is never"
+                    " promoted",
+                    activity_status=record.get("activity_status"),
+                    inactive_cause=record.get("inactive_cause"),
+                    termination_cause=record.get("termination_cause")))
+            if record.get("promotion_eligible") is not True:
+                problems.append(_incompatibility(
+                    ACTIVITY_RECORD_NOT_PROMOTION_ELIGIBLE,
+                    "the terminal record does not carry"
+                    " promotion_eligible=true — the campaign itself"
+                    " typed this cell non-promotable",
+                    promotion_eligible=record.get("promotion_eligible")))
+            best_sha = record.get("best_model_sha256")
+            if best_sha != candidate.artifact_sha256:
+                problems.append(_incompatibility(
+                    ACTIVITY_ARTIFACT_MISMATCH,
+                    "the record's activity-eligible checkpoint"
+                    " (best_model_sha256) is not the candidate"
+                    " artifact — activity measured on OTHER bytes"
+                    " proves nothing about these bytes",
+                    record_best_model_sha256=best_sha,
+                    candidate_artifact_sha256=candidate.artifact_sha256))
+
+    report = {
+        "schema": ACTIVITY_EVIDENCE_SCHEMA,
+        "verdict": (VERDICT_ACTIVITY_EVIDENT if not problems
+                    else VERDICT_ACTIVITY_NOT_EVIDENT),
+        "problems": problems,
+        "candidate_model_id": candidate.model_id,
+        "candidate_artifact_sha256": candidate.artifact_sha256,
+        "terminal_record_file": record_path,
+        "terminal_record_sha256": record_sha,
+        "activity_status": record.get("activity_status"),
+        "checked_at": now.isoformat(),
+    }
+    report["report_sha256"] = _doc_sha256(report)
+    return report
+
+
+def require_activity_evidence(report: Any,
+                              candidate: CandidateContract) -> str:
+    """Re-verify activity evidence at consumption time (TOCTOU: the
+    digest is recomputed from the presented document, never trusted).
+    Absence of the report IS a refusal — there is no calling convention
+    that promotes without it (finding 269). Returns the verified
+    report digest."""
+    if not isinstance(report, Mapping) or not report:
+        raise SuccessionError(
+            f"{NO_ACTIVITY_EVIDENCE}: promotion requires the typed"
+            " activity-evidence report from candidate_activity_report;"
+            " none was presented (finding 269)")
+    if report.get("schema") != ACTIVITY_EVIDENCE_SCHEMA:
+        raise SuccessionError(
+            "activity evidence schema is unsupported")
+    digest = _doc_sha256(report)
+    if digest != report.get("report_sha256"):
+        raise SuccessionError(
+            "activity evidence digest mismatch — the document changed"
+            " after it was produced")
+    if report.get("candidate_artifact_sha256") != \
+            candidate.artifact_sha256:
+        raise SuccessionError(
+            "activity evidence binds a different candidate artifact")
+    if report.get("verdict") != VERDICT_ACTIVITY_EVIDENT:
+        codes = sorted({item.get("code")
+                        for item in report.get("problems", [])})
+        raise SuccessionError(
+            f"candidate is {report.get('verdict')}: {codes} —"
+            " promotion requires DIRECT activity-eligible checkpoint"
+            " evidence (finding 269)")
     return digest
 
 
@@ -2245,6 +2427,7 @@ def promote_paper_champion(
     seat: SeatContract,
     candidate: CandidateContract,
     compatibility_report: Mapping[str, Any],
+    activity_report: Mapping[str, Any],
     shadow_report: Mapping[str, Any],
     strategy_config: Mapping[str, Any],
     capability_store_dir: Path,
@@ -2269,6 +2452,10 @@ def promote_paper_champion(
 
     1. observe direct venue facts                  [facts_observed]
     2. re-verify the compatibility proof (verdict + recomputed digest);
+    2b. re-verify the DIRECT trading-activity evidence (finding 269):
+       a required argument with no default — a terminal candidate
+       without an activity-eligible checkpoint bound to these exact
+       artifact bytes refuses here, before anything is consumed;
     3. re-verify the shadow evidence (binding + recomputed digest);
     4. assert native SL/TP from the venue's OWN instrument capability;
     5. establish the ACTUAL incumbent session, refuse if a saga is open,
@@ -2310,6 +2497,7 @@ def promote_paper_champion(
     mark(BOUNDARY_FACTS_OBSERVED)
 
     compatibility_sha = require_compatible(compatibility_report, candidate)
+    activity_sha = require_activity_evidence(activity_report, candidate)
     shadow_sha = require_shadow_evidence(shadow_report, candidate)
     protection = assert_native_protection(
         strategy_config=strategy_config,
@@ -2397,6 +2585,7 @@ def promote_paper_champion(
         "timeframe": seat.timeframe,
         "capability_sha256": record.capability_sha256,
         "compatibility_report_sha256": compatibility_sha,
+        "activity_report_sha256": activity_sha,
         "shadow_report_sha256": shadow_sha,
         "outgoing": {
             "session_id": incumbent["session_id"],
