@@ -51,3 +51,19 @@ def test_model_close_consumes_only_the_exact_model_bar() -> None:
         [record], venue="mt5_demo", model_id="eth-policy", timeframe="4h",
         bar_close="2026-08-18T09:00:00Z",
     )
+
+
+def test_live_runners_apply_the_bar_gate_before_another_close_or_entry() -> None:
+    import inspect
+
+    from app import alpaca_model_runner, ibkr_model_runner, mt5_model_runner
+
+    for runner in (
+        alpaca_model_runner.AlpacaModelRunner,
+        ibkr_model_runner.IbkrModelRunner,
+        mt5_model_runner.Mt5ModelRunner,
+    ):
+        source = inspect.getsource(runner.tick)
+        gate = source.index("if close_consumed:")
+        close = source.index('if control.disposition == "close"')
+        assert gate < close

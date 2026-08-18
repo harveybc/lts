@@ -577,6 +577,27 @@ class Mt5ModelRunner:
             inference["action"], current_exposure=exposure,
             pending_entry=pending_entry,
         )
+        close_consumed = model_close_consumed_bar(
+            self.l0.due_bar_decisions(
+                venue="mt5_demo", since=bars[-1]["time"]
+            ),
+            venue="mt5_demo",
+            model_id=self.policy.model_id,
+            timeframe=self.config["model"]["expected_timeframe"],
+            bar_close=bars[-1]["time"],
+        )
+        if close_consumed:
+            return {
+                "state": (
+                    "model_close_pending_same_bar"
+                    if positions or orders
+                    else "model_close_bar_consumed"
+                ),
+                "inference": inference,
+                "positions": len(positions),
+                "orders": len(orders),
+                "orders_submitted": 0,
+            }
         if control.disposition == "close" and positions:
             command = self._queue_close(
                 snapshot=snapshot,
@@ -609,20 +630,6 @@ class Mt5ModelRunner:
             self._record_due_bar(inference, bars[-1]["time"],
                                  outcome="hold", reason=control.reason)
             return {"state": "hold", "inference": inference}
-        if model_close_consumed_bar(
-            self.l0.due_bar_decisions(
-                venue="mt5_demo", since=bars[-1]["time"]
-            ),
-            venue="mt5_demo",
-            model_id=self.policy.model_id,
-            timeframe=self.config["model"]["expected_timeframe"],
-            bar_close=bars[-1]["time"],
-        ):
-            return {
-                "state": "model_close_bar_consumed",
-                "inference": inference,
-                "orders_submitted": 0,
-            }
         bid, ask = float(symbol_fact["bid"]), float(symbol_fact["ask"])
         reference = (bid + ask) / 2.0
         side = 1.0 if inference["action"] == "long" else -1.0

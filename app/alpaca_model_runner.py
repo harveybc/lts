@@ -340,6 +340,27 @@ class AlpacaModelRunner:
             inference["action"], current_exposure=exposure,
             pending_entry=bool(open_orders and not positions),
         )
+        close_consumed = model_close_consumed_bar(
+            self.store.due_bar_decisions(
+                venue="alpaca_paper", since=inference["last_closed_bar"]
+            ),
+            venue="alpaca_paper",
+            model_id=self.policy.model_id,
+            timeframe=self.policy.timeframe,
+            bar_close=inference["last_closed_bar"],
+        )
+        if close_consumed:
+            return {
+                "state": (
+                    "model_close_pending_same_bar"
+                    if open_orders or positions
+                    else "model_close_bar_consumed"
+                ),
+                "inference": inference,
+                "orders": len(open_orders),
+                "positions": len(positions),
+                "orders_submitted": 0,
+            }
         if control.disposition == "close" and (open_orders or positions):
             clock = self.client.clock()
             if not equity_model_close_allowed(clock):
@@ -378,20 +399,6 @@ class AlpacaModelRunner:
             self._record_due_bar(inference, outcome="hold",
                                  reason=control.reason)
             return {"state": "hold", "inference": inference}
-        if model_close_consumed_bar(
-            self.store.due_bar_decisions(
-                venue="alpaca_paper", since=inference["last_closed_bar"]
-            ),
-            venue="alpaca_paper",
-            model_id=self.policy.model_id,
-            timeframe=self.policy.timeframe,
-            bar_close=inference["last_closed_bar"],
-        ):
-            return {
-                "state": "model_close_bar_consumed",
-                "inference": inference,
-                "orders_submitted": 0,
-            }
         quote = self.client.latest_stock_quote(self.profile.symbol)
         bid, ask = float(quote["bp"]), float(quote["ap"])
         reference = (bid + ask) / 2.0

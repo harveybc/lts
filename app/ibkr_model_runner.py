@@ -287,6 +287,28 @@ class IbkrModelRunner:
             inference["action"], current_exposure=position,
             pending_entry=bool(orders and not position),
         )
+        close_consumed = model_close_consumed_bar(
+            self.olap.due_bar_decisions(
+                venue="ibkr_paper", since=inference["last_closed_bar"]
+            ),
+            venue="ibkr_paper",
+            model_id=self.policy.model_id,
+            timeframe=self.config["model"]["expected_timeframe"],
+            bar_close=inference["last_closed_bar"],
+        )
+        if close_consumed:
+            return {
+                "state": (
+                    "model_close_pending_same_bar"
+                    if position or orders
+                    else "model_close_bar_consumed"
+                ),
+                "inference": inference,
+                "position": position,
+                "orders": len(orders),
+                "orders_submitted": 0,
+                "l1": monitoring,
+            }
         if control.disposition == "close" and position:
             emitted = self.service.request_model_signal_flatten(
                 trace_id=f"ibkr-model-signal-{inference['last_closed_bar']}",
@@ -324,21 +346,6 @@ class IbkrModelRunner:
             self._record_due_bar(inference, outcome="hold",
                                  reason=control.reason)
             return {"state": "hold", "inference": inference, "l1": monitoring}
-        if model_close_consumed_bar(
-            self.olap.due_bar_decisions(
-                venue="ibkr_paper", since=inference["last_closed_bar"]
-            ),
-            venue="ibkr_paper",
-            model_id=self.policy.model_id,
-            timeframe=self.config["model"]["expected_timeframe"],
-            bar_close=inference["last_closed_bar"],
-        ):
-            return {
-                "state": "model_close_bar_consumed",
-                "inference": inference,
-                "orders_submitted": 0,
-                "l1": monitoring,
-            }
         try:
             quote = self.client.current_quote(self.profile.instrument)
         except L1ExecutionError as exc:
