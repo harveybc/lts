@@ -21,6 +21,7 @@ from app.ibkr_l1_journal import L1ExecutionOlap
 from app.ibkr_l1_outbox import L1OutboxConsumer
 from app.ibkr_model_authority import ContinuousPaperGate, ContinuousPaperProfile
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
+from app.model_position_control import decide_position_control
 from app.model_runner_heartbeat import (
     linear_model_identity,
     write_runner_heartbeat,
@@ -267,11 +268,11 @@ class IbkrModelRunner:
                 config_sha256=self.manifest["config_sha256"],
                 balance=float(balance["cash"]), equity=float(balance["equity"]),
             )
-        if position or orders:
-            return {"state": "monitoring", "position": position,
-                    "orders": len(orders), "model_id": self.policy.model_id,
-                    "selection_error": selection_error, "l1": monitoring}
         if selection_error:
+            if position or orders:
+                return {"state": "monitoring", "position": position,
+                        "orders": len(orders), "model_id": self.policy.model_id,
+                        "selection_error": selection_error, "l1": monitoring}
             return {"state": "selection_refused", "reason": selection_error,
                     "orders_submitted": 0}
 
@@ -282,9 +283,46 @@ class IbkrModelRunner:
         observation = build_closed_bar_features(bars)
         inference = self.policy.predict(observation)
         self.sessions.record_inference(current["session_id"], inference)
-        if inference["action"] == "hold":
+        control = decide_position_control(
+            inference["action"], current_exposure=position,
+            pending_entry=bool(orders and not position),
+        )
+        if control.disposition == "close" and position:
+            emitted = self.service.request_model_signal_flatten(
+                trace_id=f"ibkr-model-signal-{inference['last_closed_bar']}",
+                current_session_id=current["session_id"],
+                model_artifact_sha256=self.policy.artifact_sha256,
+                input_sha256=inference["input_sha256"],
+                reason=control.reason,
+                now=now,
+            )
+            flattens = self.consumer.consume_flattens(now=now)
+            self._record_due_bar(
+                inference, outcome="model_close_requested",
+                reason=control.reason,
+                effect_id=(
+                    flattens[0].get("effect_id")
+                    if flattens and isinstance(flattens[0], dict) else None
+                ),
+                decided_at=now,
+            )
+            return {
+                "state": "closing_on_model_signal", "inference": inference,
+                "control": control.reason, "emitted": emitted,
+                "flattens": flattens, "position": position, "l1": monitoring,
+            }
+        if position or orders:
+            self._record_due_bar(
+                inference, outcome="monitoring_open_exposure",
+                reason=control.reason, decided_at=now,
+            )
+            return {"state": "monitoring", "position": position,
+                    "orders": len(orders), "model_id": self.policy.model_id,
+                    "inference": inference, "control": control.reason,
+                    "selection_error": selection_error, "l1": monitoring}
+        if control.disposition == "hold":
             self._record_due_bar(inference, outcome="hold",
-                                 reason="model_hold")
+                                 reason=control.reason)
             return {"state": "hold", "inference": inference, "l1": monitoring}
         try:
             quote = self.client.current_quote(self.profile.instrument)

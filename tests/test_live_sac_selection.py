@@ -115,6 +115,33 @@ def test_observation_shape_and_finiteness_guards(golden):
         policy.predict(bad)
 
 
+def test_v2_target_exposure_contract_emits_explicit_close(golden):
+    _fixture, policy = golden
+
+    class _Stub:
+        observation_space = policy.observation_space
+        value = 0.0
+
+        def predict(self, obs, deterministic):
+            return np.array([self.value], dtype=np.float32), None
+
+    stub = _Stub()
+    probe = LiveSacPolicy(
+        model=stub, model_id="v2-stub", asset_id="ETHUSD", timeframe="4h",
+        artifact_sha256="0" * 64, continuous_action_threshold=0.2,
+        continuous_action_contract="target_exposure_hysteresis_v2",
+        continuous_exit_threshold=0.05,
+    )
+    observation = np.zeros(policy.observation_space.shape, dtype=np.float32)
+
+    assert probe.predict(observation, current_exposure=1.0)["action"] == "close"
+    assert probe.predict(observation, current_exposure=-1.0)["action"] == "close"
+    assert probe.predict(observation, pending_entry=True)["action"] == "close"
+    assert probe.predict(observation)["action"] == "hold"
+    stub.value = 0.1
+    assert probe.predict(observation, current_exposure=1.0)["action"] == "hold"
+
+
 def _manifest(tmp_path, fixture, **overrides):
     config_file = tmp_path / "config.json"
     config_file.write_text("{}")

@@ -51,6 +51,8 @@ class LiveSacPolicy:
         timeframe: str,
         artifact_sha256: str,
         continuous_action_threshold: float,
+        continuous_action_contract: str = "legacy_directional_v1",
+        continuous_exit_threshold: float = 0.0,
     ) -> None:
         self._model = model
         self.model_id = model_id
@@ -58,9 +60,28 @@ class LiveSacPolicy:
         self.timeframe = timeframe
         self.artifact_sha256 = artifact_sha256
         self.continuous_action_threshold = float(continuous_action_threshold)
+        self.continuous_action_contract = str(continuous_action_contract)
+        self.continuous_exit_threshold = float(continuous_exit_threshold)
         if not 0.0 < self.continuous_action_threshold < 1.0:
             raise LiveSacSelectionError(
                 "continuous_action_threshold must be in (0, 1)")
+        if self.continuous_action_contract not in (
+            "legacy_directional_v1", "target_exposure_hysteresis_v2"
+        ):
+            raise LiveSacSelectionError("unknown continuous action contract")
+        if (
+            self.continuous_exit_threshold < 0.0
+            or (
+                self.continuous_action_contract
+                == "target_exposure_hysteresis_v2"
+                and self.continuous_exit_threshold
+                >= self.continuous_action_threshold
+            )
+        ):
+            raise LiveSacSelectionError(
+                "continuous_exit_threshold must be non-negative and below "
+                "continuous_action_threshold for the v2 contract"
+            )
 
     @classmethod
     def load(
@@ -72,6 +93,8 @@ class LiveSacPolicy:
         asset_id: str,
         timeframe: str,
         continuous_action_threshold: float,
+        continuous_action_contract: str = "legacy_directional_v1",
+        continuous_exit_threshold: float = 0.0,
     ) -> "LiveSacPolicy":
         actual = _sha256(artifact_path)
         if actual != expected_sha256:
@@ -87,13 +110,21 @@ class LiveSacPolicy:
             model=model, model_id=model_id, asset_id=asset_id,
             timeframe=timeframe, artifact_sha256=actual,
             continuous_action_threshold=continuous_action_threshold,
+            continuous_action_contract=continuous_action_contract,
+            continuous_exit_threshold=continuous_exit_threshold,
         )
 
     @property
     def observation_space(self) -> Any:
         return self._model.observation_space
 
-    def predict(self, observation: Any) -> dict[str, Any]:
+    def predict(
+        self,
+        observation: Any,
+        *,
+        current_exposure: float = 0.0,
+        pending_entry: bool = False,
+    ) -> dict[str, Any]:
         """Deterministic action for one observation, with input hashing."""
         import numpy as np
 
@@ -113,12 +144,21 @@ class LiveSacPolicy:
             action = "long"
         elif value <= -threshold:
             action = "short"
+        elif (
+            self.continuous_action_contract
+            == "target_exposure_hysteresis_v2"
+            and abs(value) <= self.continuous_exit_threshold
+            and (abs(float(current_exposure)) > 1e-12 or pending_entry)
+        ):
+            action = "close"
         else:
             action = "hold"
         return {
             "action": action,
             "raw_action": value,
             "continuous_action_threshold": threshold,
+            "continuous_exit_threshold": self.continuous_exit_threshold,
+            "continuous_action_contract": self.continuous_action_contract,
             "input_sha256": hashlib.sha256(array.tobytes()).hexdigest(),
         }
 
@@ -196,6 +236,14 @@ class SelectedSacPolicy:
             timeframe=self.expected_timeframe,
             continuous_action_threshold=float(
                 contract.get("continuous_action_threshold", 0.0) or 0.0),
+            continuous_action_contract=str(
+                contract.get(
+                    "continuous_action_contract", "legacy_directional_v1"
+                )
+            ),
+            continuous_exit_threshold=float(
+                contract.get("continuous_exit_threshold", 0.0) or 0.0
+            ),
         )
         if policy.model_id != manifest.get("model_id"):
             raise LiveSacSelectionError(

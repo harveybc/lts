@@ -19,6 +19,7 @@ from app.alpaca_l1 import AlpacaL1Executor, AlpacaL1Profile, AlpacaPaperTradingC
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
+from app.model_position_control import decide_position_control
 from app.model_runner_heartbeat import (
     linear_model_identity,
     write_runner_heartbeat,
@@ -146,11 +147,20 @@ class ModelSessionStore:
         self.connection.commit()
 
     def record_inference(self, session_id: str, inference: dict[str, Any]) -> None:
+        score = inference.get("probability_up", inference.get("raw_action"))
+        if score is None:
+            raise AlpacaModelRunnerError("model inference lacks a numeric score")
+        output_sha256 = inference.get("output_sha256")
+        if not output_sha256:
+            output_sha256 = hashlib.sha256(json.dumps(
+                {"action": inference.get("action"), "score": score},
+                sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest()
         self.connection.execute(
             "INSERT OR IGNORE INTO live_model_inferences VALUES (?,?,?,?,?,?,?,?)",
             (inference["input_sha256"], session_id, _utc_now().isoformat(),
              inference["last_closed_bar"], inference["action"],
-             inference["probability_up"], inference["output_sha256"],
+             float(score), output_sha256,
              json.dumps(inference, sort_keys=True)),
         )
         self.connection.commit()
@@ -293,11 +303,11 @@ class AlpacaModelRunner:
                 and effect["state"] in {"acknowledged", "recovering"}
             ):
                 self.executor.monitor(effect["effect_id"])
-        if open_orders or positions:
-            return {"state": "monitoring", "model_id": self.policy.model_id,
-                    "orders": len(open_orders), "positions": len(positions),
-                    "selection_error": selection_error}
         if selection_error:
+            if open_orders or positions:
+                return {"state": "monitoring", "model_id": self.policy.model_id,
+                        "orders": len(open_orders), "positions": len(positions),
+                        "selection_error": selection_error}
             return {"state": "selection_refused", "reason": selection_error,
                     "orders_submitted": 0}
 
@@ -310,9 +320,37 @@ class AlpacaModelRunner:
                                  reason="execution_disabled")
             return {"state": "inference_only", "inference": inference,
                     "orders_submitted": 0}
-        if inference["action"] == "hold":
+        exposure = sum(
+            float(position.get("qty", 0.0))
+            * (-1.0 if str(position.get("side", "long")).lower() == "short" else 1.0)
+            for position in positions
+        )
+        control = decide_position_control(
+            inference["action"], current_exposure=exposure,
+            pending_entry=bool(open_orders and not positions),
+        )
+        if control.disposition == "close" and (open_orders or positions):
+            drained = self.executor.drain_for_model_signal(control.reason)
+            self._record_due_bar(
+                inference, outcome="model_close_requested", reason=control.reason
+            )
+            return {
+                "state": "closing_on_model_signal", "inference": inference,
+                "control": control.reason, "drained": drained,
+                "orders": len(open_orders), "positions": len(positions),
+            }
+        if open_orders or positions:
+            self._record_due_bar(
+                inference, outcome="monitoring_open_exposure",
+                reason=control.reason,
+            )
+            return {"state": "monitoring", "model_id": self.policy.model_id,
+                    "orders": len(open_orders), "positions": len(positions),
+                    "inference": inference, "control": control.reason,
+                    "selection_error": selection_error}
+        if control.disposition == "hold":
             self._record_due_bar(inference, outcome="hold",
-                                 reason="model_hold")
+                                 reason=control.reason)
             return {"state": "hold", "inference": inference}
         quote = self.client.latest_stock_quote(self.profile.symbol)
         bid, ask = float(quote["bp"]), float(quote["ap"])

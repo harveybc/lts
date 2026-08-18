@@ -22,12 +22,19 @@ from trading_contracts import (
 from app.alpaca_model_runner import ModelSessionStore
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
+from app.live_sac_selection import LiveSacSelectionError, SelectedSacPolicy
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
+from app.model_position_control import decide_position_control
 from app.model_runner_heartbeat import (
-    linear_model_identity,
+    selected_model_identity,
     write_runner_heartbeat,
 )
 from app.mt5_execution_bridge import Mt5ExecutionConfig, Mt5ExecutionStore
+from app.project3_sac_observation import (
+    SacObservationError,
+    build_sac_observation,
+    load_live_observation_spec,
+)
 
 
 def _utc_now() -> datetime:
@@ -40,6 +47,15 @@ def _path(value: str | Path) -> Path:
 
 class Mt5ModelRunnerError(RuntimeError):
     pass
+
+
+def _mt5_utc(value: Any) -> datetime:
+    """Parse the Unix timestamp emitted directly by the MT5 bridge EA."""
+    try:
+        parsed = datetime.fromtimestamp(int(value), tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError) as exc:
+        raise Mt5ModelRunnerError("MT5 position time_open is invalid") from exc
+    return parsed
 
 
 def _ledger_time(value: Any, field: str) -> datetime:
@@ -300,7 +316,14 @@ class Mt5ModelRunner:
             ZeroNetworkSink(),
         )
         self.sessions = ModelSessionStore(self.l0._con)
-        self.selector = SelectedLinearPolicy(
+        self.policy_type = str(config["model"].get("policy_type", "linear"))
+        selector_type = {
+            "linear": SelectedLinearPolicy,
+            "sac": SelectedSacPolicy,
+        }.get(self.policy_type)
+        if selector_type is None:
+            raise Mt5ModelRunnerError("unsupported model policy_type")
+        self.selector = selector_type(
             manifest_file=config["model"]["manifest_file"],
             expected_asset_id=config["model"]["expected_asset_id"],
             expected_timeframe=config["model"]["expected_timeframe"],
@@ -308,6 +331,10 @@ class Mt5ModelRunner:
         )
         self.manifest = self.selector.manifest
         self.policy = self.selector.policy
+        self.sac_observation_spec = (
+            load_live_observation_spec(self.selector)
+            if self.policy_type == "sac" else None
+        )
 
     def _latest_snapshot(self) -> Optional[dict[str, Any]]:
         row = self.bridge_store.connection.execute(
@@ -398,7 +425,14 @@ class Mt5ModelRunner:
             if self.selector.refresh():
                 self.manifest = self.selector.manifest
                 self.policy = self.selector.policy
-        except LiveModelSelectionError as exc:
+                self.sac_observation_spec = (
+                    load_live_observation_spec(self.selector)
+                    if self.policy_type == "sac" else None
+                )
+        except (
+            LiveModelSelectionError, LiveSacSelectionError,
+            SacObservationError,
+        ) as exc:
             selection_error = str(exc)
         snapshot = self._latest_snapshot()
         if snapshot is None:
@@ -423,7 +457,8 @@ class Mt5ModelRunner:
                 "lifecycles_reconciled": lifecycles_reconciled,
             })
         bars = self._bars(snapshot)
-        if len(bars) < 51:
+        minimum_bars = 800 if self.policy_type == "sac" else 51
+        if len(bars) < minimum_bars:
             return {"state": "waiting_for_closed_bars", "bars": len(bars)}
         positions = [item for item in snapshot.get("positions", [])
                      if item.get("symbol") == symbol]
@@ -478,21 +513,101 @@ class Mt5ModelRunner:
                 )
                 return {"state": "closing_unprotected_position",
                         "command_id": command["command_id"]}
-            return {"state": "monitoring", "positions": len(positions),
-                    "orders": len(orders), "model_id": self.policy.model_id,
-                    "selection_error": selection_error}
-        if orders:
-            return {"state": "monitoring_pending_order", "orders": len(orders)}
         if selection_error:
+            if positions or orders:
+                return {"state": "monitoring", "positions": len(positions),
+                        "orders": len(orders), "model_id": self.policy.model_id,
+                        "selection_error": selection_error}
             return {"state": "selection_refused", "reason": selection_error,
                     "commands_queued": 0}
 
-        observation = build_closed_bar_features(bars[-60:])
-        inference = self.policy.predict(observation)
+        exposure = sum(
+            float(item.get("volume", 0.0))
+            * (-1.0 if str(item.get("side", "long")).lower() == "short" else 1.0)
+            for item in positions
+        )
+        pending_entry = bool(orders and not positions)
+        if self.policy_type == "sac":
+            if len(positions) > 1:
+                return {"state": "blocked_multiple_route_positions"}
+            entry_price = 0.0
+            holding_bars = 0
+            if positions:
+                entry_price = float(positions[0].get("price_open", 0.0))
+                if positions[0].get("time_open_unix") is None:
+                    return {"state": "waiting_for_position_open_time"}
+                opened = _mt5_utc(positions[0]["time_open_unix"])
+                bar_time = datetime.fromisoformat(
+                    bars[-1]["time"].replace("Z", "+00:00")
+                )
+                holding_bars = max(
+                    0, int((bar_time - opened).total_seconds() // (4 * 3600))
+                )
+            spec = self.sac_observation_spec or {}
+            built = build_sac_observation(
+                bars,
+                feature_columns=spec["feature_columns"],
+                binary_columns=spec["binary_columns"],
+                window_size=spec["window_size"],
+                scaling_window=spec["scaling_window"],
+                clip=spec["clip"],
+                initial_equity=float(current["starting_equity"]),
+                current_equity=float(snapshot["equity"]),
+                position_units=exposure,
+                entry_price=entry_price,
+                holding_bars=holding_bars,
+                holding_duration_scale_bars=spec[
+                    "holding_duration_scale_bars"
+                ],
+            )
+            inference = self.policy.predict(
+                built["observation"], current_exposure=exposure,
+                pending_entry=pending_entry,
+            )
+            inference.update({
+                "last_closed_bar": built["last_closed_bar"],
+                "feature_rows": built["feature_rows"],
+                "observation_dimension": built["observation_dimension"],
+            })
+        else:
+            observation = build_closed_bar_features(bars[-60:])
+            inference = self.policy.predict(observation)
         self.sessions.record_inference(current["session_id"], inference)
-        if inference["action"] == "hold":
+        control = decide_position_control(
+            inference["action"], current_exposure=exposure,
+            pending_entry=pending_entry,
+        )
+        if control.disposition == "close" and positions:
+            command = self._queue_close(
+                snapshot=snapshot,
+                current_session=current,
+                last_bar=bars[-1]["time"],
+                reason=control.reason,
+            )
+            self._record_due_bar(
+                inference, bars[-1]["time"],
+                outcome="model_close_requested", reason=control.reason,
+                command_id=command["command_id"],
+            )
+            return {
+                "state": "closing_on_model_signal",
+                "command_id": command["command_id"],
+                "inference": inference, "control": control.reason,
+            }
+        if positions or orders:
+            self._record_due_bar(
+                inference, bars[-1]["time"],
+                outcome="monitoring_open_exposure", reason=control.reason,
+            )
+            return {"state": (
+                        "monitoring" if positions else "monitoring_pending_order"
+                    ), "positions": len(positions), "orders": len(orders),
+                    "model_id": self.policy.model_id,
+                    "inference": inference, "control": control.reason,
+                    "selection_error": selection_error}
+        if control.disposition == "hold":
             self._record_due_bar(inference, bars[-1]["time"],
-                                 outcome="hold", reason="model_hold")
+                                 outcome="hold", reason=control.reason)
             return {"state": "hold", "inference": inference}
         bid, ask = float(symbol_fact["bid"]), float(symbol_fact["ask"])
         reference = (bid + ask) / 2.0
@@ -507,14 +622,17 @@ class Mt5ModelRunner:
             object_id=f"{self.policy.model_id}:{bars[-1]['time']}",
             as_of=last_bar + timedelta(hours=4),
             valid_until=last_bar + timedelta(hours=8),
-            producer={"name": "prediction_provider.live_linear_policy",
+            producer={"name": f"prediction_provider.live_{self.policy_type}_policy",
                       "version": "0.1.0"},
             trace_id=f"mt5-{inference['input_sha256'][:16]}",
             config_hash="sha256:" + self.manifest["config_sha256"],
             cell_id=f"crypto:ETHUSD@4h:{self.policy.model_id}",
             asset_id=self.policy.asset_id, action="target",
-            target_exposure=side, confidence=max(
-                inference["probability_up"], 1.0 - inference["probability_up"]
+            target_exposure=side, confidence=(
+                max(inference["probability_up"],
+                    1.0 - inference["probability_up"])
+                if "probability_up" in inference
+                else min(1.0, abs(float(inference["raw_action"])))
             ), strategy_rel_volume=1.0,
             risk_geometry={"mode": "fixed_price", "stop_price": stop,
                            "take_profit_price": take},
@@ -608,7 +726,9 @@ class Mt5ModelRunner:
                 "artifact_sha256": self.policy.artifact_sha256,
                 "manifest_sha256": self.manifest.get("manifest_sha256"),
                 "action": inference["action"],
-                "score": inference.get("probability_up"),
+                "score": inference.get(
+                    "probability_up", inference.get("raw_action")
+                ),
                 "outcome": outcome, "reason": reason,
                 "risk_envelope": risk, "quote": quote,
                 "decision_id": f"{self.policy.model_id}:{bar_close}",
@@ -625,7 +745,8 @@ class Mt5ModelRunner:
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
         runtime = {
             **payload,
-            **linear_model_identity(self.selector),
+            **selected_model_identity(self.selector),
+            "policy_type": self.policy_type,
             "venue": "mt5_demo",
             "environment": "demo",
             "read_only": False,

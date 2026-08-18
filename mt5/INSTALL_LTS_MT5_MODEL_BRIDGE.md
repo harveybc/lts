@@ -25,6 +25,7 @@ This EA is for the OANDA MT5 **Demo** account only. It replaces
 | `InpMaximumVolume` | `0.01` |
 | `InpMaximumDeviationPoints` | `20` |
 | `InpMagic` | `26080301` |
+| `InpClosedBarHistory` | `800` (minimum; required for causal SAC features) |
 | `InpTimerSeconds` | `15` |
 | `InpSnapshotEveryTimers` | `4` |
 
@@ -36,3 +37,8 @@ Every risk-increasing order is submitted as a market request containing both
 native stop-loss and take-profit prices. The EA rejects unsigned commands,
 wrong accounts, wrong symbols, oversized volume, missing model hashes,
 foreign positions, and Live accounts.
+
+The EA also publishes the position's Unix open time and at least 800 closed H4
+bars. This lets the selected SAC policy reconstruct the same 2,660-value
+observation used in training, including true holding duration and unrealized
+PnL. A shorter history is refused; it is never padded with invented values.

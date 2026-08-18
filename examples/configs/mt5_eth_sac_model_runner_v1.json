@@ -1,0 +1,33 @@
+{
+  "schema": "lts.mt5.model_runner.v1",
+  "$doc": "ETH SAC Paper/Demo route. This config remains inactive until the corrected P1LR decision publishes a research-validated, hash-bound manifest at the path below. Missing or ineligible artifacts fail closed.",
+  "bridge_config_file": "~/.config/lts/mt5_execution_bridge.json",
+  "model": {
+    "policy_type": "sac",
+    "manifest_file": "~/.local/share/prediction-provider/live/ethusdt_4h_sac_v2/manifest.json",
+    "expected_asset_id": "crypto:ETHUSD",
+    "expected_timeframe": "4h",
+    "execution_tier": "demo_research_canary"
+  },
+  "route": {"symbol": "ETHUSD", "timeframe": "4h"},
+  "strategy": {"stop_fraction": 0.01, "take_profit_fraction": 0.02},
+  "snapshot_max_age_seconds": 120,
+  "loop_seconds": 15,
+  "heartbeat_path": "~/.local/state/lts/mt5-sac-model-runner-heartbeat.json",
+  "service": {
+    "venue": "mt5_demo",
+    "account_fingerprint": "<configured-account-fingerprint>",
+    "environment": "demo",
+    "database_path": "~/.local/state/lts/mt5-bridge.sqlite",
+    "risk_fraction_at_stop": 0.00002,
+    "max_overshoot_ratio": 0.5,
+    "gross_notional_fraction_max": 0.003,
+    "margin_fraction_max": 0.003,
+    "daily_loss_budget_fraction": 0.00008,
+    "max_concurrent_positions": 1,
+    "signal_max_age_seconds": 28800,
+    "owner_issuer_allowlist": ["harvey-owner"],
+    "command_phrases": {},
+    "asset_instrument_bindings": {"crypto:ETHUSD": "ETHUSD"}
+  }
+}

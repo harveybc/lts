@@ -45,6 +45,38 @@ def linear_model_identity(selector: Any) -> dict[str, Any]:
     }
 
 
+def selected_model_identity(selector: Any) -> dict[str, Any]:
+    """Content identity for either a linear control or an SAC policy."""
+    policy = selector.policy
+    if hasattr(policy, "feature_names"):
+        return linear_model_identity(selector)
+    contract = selector.manifest.get("observation_contract") or {}
+
+    def digest(payload: Mapping[str, Any]) -> str:
+        body = json.dumps(
+            dict(payload), sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+        return hashlib.sha256(body).hexdigest()
+
+    return {
+        "model_id": policy.model_id,
+        "artifact_sha256": policy.artifact_sha256,
+        "config_sha256": str(selector.manifest["config_sha256"]),
+        "manifest_sha256": str(selector.manifest_sha256),
+        "input_feature_sha256": str(
+            contract.get("feature_columns_sha256") or ""
+        ),
+        "preprocessing_sha256": digest({
+            key: contract.get(key) for key in (
+                "preprocessor_plugin", "feature_scaling",
+                "feature_scaling_window", "feature_clip", "window_size",
+                "agent_state_contract", "holding_duration_scale_bars",
+            )
+        }),
+    }
+
+
 def write_runner_heartbeat(
     path: str | Path, *, schema: str, payload: Mapping[str, Any]
 ) -> dict[str, Any]:

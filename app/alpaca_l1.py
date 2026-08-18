@@ -557,6 +557,19 @@ class AlpacaL1Executor:
         duplicating a cancel or a close; no global hold is taken — the
         drain is an ordinary risk-reducing transition and the successor
         proceeds when the seat proves flat."""
+        return self._drain_owned_effects(reason=reason, fact_prefix="succession")
+
+    def drain_for_model_signal(self, reason: str) -> list[dict[str, Any]]:
+        if reason not in {
+            "explicit_model_close", "opposite_long_target",
+            "opposite_short_target",
+        }:
+            raise DemoExecutionError("unsupported model-signal close reason")
+        return self._drain_owned_effects(reason=reason, fact_prefix="model_signal")
+
+    def _drain_owned_effects(
+        self, *, reason: str, fact_prefix: str
+    ) -> list[dict[str, Any]]:
         drained: list[dict[str, Any]] = []
         for effect in self.store.nonterminal_effects():
             if effect["kind"] != "alpaca_bracket_entry":
@@ -569,25 +582,27 @@ class AlpacaL1Executor:
             kinds = {fact["fact_kind"]
                      for fact in self.store.broker_facts(effect_id)}
             actions: list[str] = []
-            if "succession_cancel" not in kinds:
+            cancel_fact = f"{fact_prefix}_cancel"
+            flatten_fact = f"{fact_prefix}_flatten"
+            if cancel_fact not in kinds:
                 try:
                     self.client.cancel_order(order_id)
                     self.store.record_broker_fact(
-                        effect_id, "succession_cancel",
+                        effect_id, cancel_fact,
                         {"order_id": order_id, "reason": reason})
                 except AlpacaPaperError as exc:
                     self.store.record_broker_fact(
-                        effect_id, "succession_cancel_refused",
+                        effect_id, f"{cancel_fact}_refused",
                         {"order_id": order_id, "error": str(exc)})
                 actions.append("cancel")
             open_position = [
                 p for p in self.client.positions()
                 if p.get("symbol") == contract["symbol"]]
-            if open_position and "succession_flatten" not in kinds:
+            if open_position and flatten_fact not in kinds:
                 closed = self.client.close_position(
                     str(contract["symbol"]))
                 self.store.record_broker_fact(
-                    effect_id, "succession_flatten",
+                    effect_id, flatten_fact,
                     {"reason": reason, "result": closed})
                 actions.append("flatten")
             if effect["state"] in ("submitted_pending_ack",

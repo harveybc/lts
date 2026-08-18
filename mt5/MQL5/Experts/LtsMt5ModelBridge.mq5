@@ -18,6 +18,7 @@ input string InpTradeSymbol = "ETHUSD";
 input double InpMaximumVolume = 0.01;
 input int InpMaximumDeviationPoints = 20;
 input long InpMagic = 26080301;
+input int InpClosedBarHistory = 800;
 
 string ADAPTER_VERSION = "lts.mt5.ea.execution.v2";
 string EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -614,6 +615,7 @@ string PositionJson(const int index)
       "\"price_open\":" + DoubleToString(
          PositionGetDouble(POSITION_PRICE_OPEN), 10
       ) + ","
+      "\"time_open_unix\":" + (string)PositionGetInteger(POSITION_TIME) + ","
       "\"stop_loss\":" + DoubleToString(PositionGetDouble(POSITION_SL), 10) + ","
       "\"take_profit\":" + DoubleToString(PositionGetDouble(POSITION_TP), 10) + ","
       "\"profit\":" + DoubleToString(PositionGetDouble(POSITION_PROFIT), 8)
@@ -720,7 +722,9 @@ bool PostSnapshot()
    string bars = "";
    first = true;
    MqlRates closed_bars[];
-   int copied = CopyRates(InpTradeSymbol, PERIOD_H4, 1, 60, closed_bars);
+   int copied = CopyRates(
+      InpTradeSymbol, PERIOD_H4, 1, InpClosedBarHistory, closed_bars
+   );
    if(copied > 0)
      {
       ArraySetAsSeries(closed_bars, false);
@@ -774,7 +778,8 @@ int OnInit()
    if(InpMaximumVolume <= 0 || InpMaximumVolume > 1.0
       || InpTradeSymbol == "")
       return INIT_PARAMETERS_INCORRECT;
-   if(InpTimerSeconds < 5 || InpSnapshotEveryTimers < 1)
+   if(InpTimerSeconds < 5 || InpSnapshotEveryTimers < 1
+      || InpClosedBarHistory < 800)
       return INIT_PARAMETERS_INCORRECT;
    if(!CryptoSelfTest())
      {

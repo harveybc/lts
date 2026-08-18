@@ -16,6 +16,7 @@ from app.mt5_execution_bridge import (
 from app.mt5_model_runner import (
     Mt5ModelRunner,
     Mt5ModelRunnerError,
+    _mt5_utc,
     close_idempotency_key,
     durable_command_heartbeat,
 )
@@ -56,6 +57,14 @@ def test_close_idempotency_is_snapshot_session_and_reason_bound():
         changed = dict(base)
         changed[name] = value
         assert close_idempotency_key(**changed) != first
+
+
+def test_mt5_position_time_uses_timezone_independent_unix_seconds():
+    observed = _mt5_utc(1787040000)
+    assert observed.tzinfo == timezone.utc
+    assert int(observed.timestamp()) == 1787040000
+    with pytest.raises(Mt5ModelRunnerError, match="time_open"):
+        _mt5_utc("broker-local-text")
 
 
 def test_closed_bars_drive_one_l0_checked_model_command(tmp_path):

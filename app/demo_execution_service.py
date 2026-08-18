@@ -955,6 +955,37 @@ class DemoExecutionService:
         )
         return self._emit_flatten_all(switch_trace, observed)
 
+    def request_model_signal_flatten(
+        self,
+        *,
+        trace_id: str,
+        current_session_id: str,
+        model_artifact_sha256: str,
+        input_sha256: str,
+        reason: str,
+        now: Optional[datetime] = None,
+    ) -> list[dict[str, Any]]:
+        """Emit journaled risk reduction for an open-position model signal."""
+        if not current_session_id:
+            raise DemoExecutionError("model-signal session evidence is missing")
+        for label, digest in (
+            ("model artifact", model_artifact_sha256),
+            ("model input", input_sha256),
+        ):
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise DemoExecutionError(f"{label} evidence is invalid")
+        if reason not in {
+            "explicit_model_close", "opposite_long_target",
+            "opposite_short_target",
+        }:
+            raise DemoExecutionError("unsupported model-signal close reason")
+        observed = now or _utc_now()
+        signal_trace = (
+            f"{trace_id}:session={current_session_id}:"
+            f"model={model_artifact_sha256}:input={input_sha256}:reason={reason}"
+        )
+        return self._emit_flatten_all(signal_trace, observed)
+
     def _emit_flatten_all(self, trace_id: str, now: datetime) -> list[dict[str, Any]]:
         """Findings 047/050/051: flatten is an emitted zero-network intent
         that names its target and moves signed exposure exactly to zero.
