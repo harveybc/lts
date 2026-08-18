@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Iterable, Literal, Mapping
 
 
 Signal = Literal["long", "short", "hold", "close"]
@@ -47,3 +47,22 @@ def decide_position_control(
     if signal == "short" and side > 0:
         return PositionControlDecision("close", "opposite_short_target")
     return PositionControlDecision("monitor", "target_preserves_open_exposure")
+
+
+def model_close_consumed_bar(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    venue: str,
+    model_id: str,
+    timeframe: str,
+    bar_close: str,
+) -> bool:
+    """Prove that this model already spent the bar on a close request."""
+    return any(
+        record.get("venue") == venue
+        and record.get("model_id") == model_id
+        and record.get("timeframe") == timeframe
+        and record.get("bar_close") == bar_close
+        and record.get("outcome") == "model_close_requested"
+        for record in records
+    )

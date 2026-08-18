@@ -21,7 +21,7 @@ from app.ibkr_l1_journal import L1ExecutionOlap
 from app.ibkr_l1_outbox import L1OutboxConsumer
 from app.ibkr_model_authority import ContinuousPaperGate, ContinuousPaperProfile
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
-from app.model_position_control import decide_position_control
+from app.model_position_control import decide_position_control, model_close_consumed_bar
 from app.model_runner_heartbeat import (
     linear_model_identity,
     write_runner_heartbeat,
@@ -324,6 +324,21 @@ class IbkrModelRunner:
             self._record_due_bar(inference, outcome="hold",
                                  reason=control.reason)
             return {"state": "hold", "inference": inference, "l1": monitoring}
+        if model_close_consumed_bar(
+            self.olap.due_bar_decisions(
+                venue="ibkr_paper", since=inference["last_closed_bar"]
+            ),
+            venue="ibkr_paper",
+            model_id=self.policy.model_id,
+            timeframe=self.config["model"]["expected_timeframe"],
+            bar_close=inference["last_closed_bar"],
+        ):
+            return {
+                "state": "model_close_bar_consumed",
+                "inference": inference,
+                "orders_submitted": 0,
+                "l1": monitoring,
+            }
         try:
             quote = self.client.current_quote(self.profile.instrument)
         except L1ExecutionError as exc:

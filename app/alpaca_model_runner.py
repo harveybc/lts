@@ -19,7 +19,7 @@ from app.alpaca_l1 import AlpacaL1Executor, AlpacaL1Profile, AlpacaPaperTradingC
 from app.demo_execution_service import DemoExecutionConfig, DemoExecutionService, ZeroNetworkSink
 from app.ibkr_l1_journal import L1ExecutionOlap
 from app.live_model_selection import LiveModelSelectionError, SelectedLinearPolicy
-from app.model_position_control import decide_position_control
+from app.model_position_control import decide_position_control, model_close_consumed_bar
 from app.model_runner_heartbeat import (
     linear_model_identity,
     write_runner_heartbeat,
@@ -378,6 +378,20 @@ class AlpacaModelRunner:
             self._record_due_bar(inference, outcome="hold",
                                  reason=control.reason)
             return {"state": "hold", "inference": inference}
+        if model_close_consumed_bar(
+            self.store.due_bar_decisions(
+                venue="alpaca_paper", since=inference["last_closed_bar"]
+            ),
+            venue="alpaca_paper",
+            model_id=self.policy.model_id,
+            timeframe=self.policy.timeframe,
+            bar_close=inference["last_closed_bar"],
+        ):
+            return {
+                "state": "model_close_bar_consumed",
+                "inference": inference,
+                "orders_submitted": 0,
+            }
         quote = self.client.latest_stock_quote(self.profile.symbol)
         bid, ask = float(quote["bp"]), float(quote["ap"])
         reference = (bid + ask) / 2.0

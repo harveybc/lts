@@ -1,6 +1,6 @@
 import pytest
 
-from app.model_position_control import decide_position_control
+from app.model_position_control import decide_position_control, model_close_consumed_bar
 
 
 @pytest.mark.parametrize(
@@ -33,3 +33,21 @@ def test_position_control_never_reverses_in_one_step(
 def test_unknown_signal_refuses() -> None:
     with pytest.raises(ValueError, match="unsupported"):
         decide_position_control("guess", current_exposure=0.0)
+
+
+def test_model_close_consumes_only_the_exact_model_bar() -> None:
+    record = {
+        "venue": "mt5_demo",
+        "model_id": "eth-policy",
+        "timeframe": "4h",
+        "bar_close": "2026-08-18T05:00:00Z",
+        "outcome": "model_close_requested",
+    }
+    assert model_close_consumed_bar(
+        [record], venue="mt5_demo", model_id="eth-policy", timeframe="4h",
+        bar_close="2026-08-18T05:00:00Z",
+    )
+    assert not model_close_consumed_bar(
+        [record], venue="mt5_demo", model_id="eth-policy", timeframe="4h",
+        bar_close="2026-08-18T09:00:00Z",
+    )
