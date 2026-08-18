@@ -27,6 +27,7 @@ class IbAsyncTwsClient(IbkrClientProtocol):
     ) -> None:
         if profile.host != "127.0.0.1" or profile.port != 7497:
             raise L1ExecutionError("IBKR L1 may connect only to local TWS Paper")
+        self.request_timeout_seconds = max(1.0, float(timeout_seconds))
         try:
             import ib_async
             from ib_async import IB, StartupFetch
@@ -415,11 +416,20 @@ class IbAsyncTwsClient(IbkrClientProtocol):
         if timeframe != "4h" or not 51 <= count <= 180:
             raise L1ExecutionError("continuous Paper runner supports 51-180 H4 bars")
         fact = self.qualified_forex_fact(instrument)
-        bars = self.ib.reqHistoricalData(
-            fact["contract"], endDateTime="", durationStr="30 D",
-            barSizeSetting="4 hours", whatToShow="MIDPOINT", useRTH=False,
-            formatDate=2, keepUpToDate=False,
-        )
+        previous_timeout = self.ib.RequestTimeout
+        self.ib.RequestTimeout = self.request_timeout_seconds
+        try:
+            bars = self.ib.reqHistoricalData(
+                fact["contract"], endDateTime="", durationStr="30 D",
+                barSizeSetting="4 hours", whatToShow="MIDPOINT", useRTH=False,
+                formatDate=2, keepUpToDate=False,
+            )
+        except TimeoutError as exc:
+            raise L1ExecutionError(
+                "TWS historical-data request timed out"
+            ) from exc
+        finally:
+            self.ib.RequestTimeout = previous_timeout
         now = datetime.now(timezone.utc)
         result = []
         for bar in bars:

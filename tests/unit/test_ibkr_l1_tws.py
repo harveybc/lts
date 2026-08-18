@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.ibkr_l1_adapter import BracketPlan
+from app.ibkr_l1_adapter import BracketPlan, L1ExecutionError
 from app.ibkr_l1_recovery import verify_bracket_exact
 from app.ibkr_l1_tws import IbAsyncTwsClient
 
@@ -46,6 +46,26 @@ def _fill(*, perm_id=1193220731, order_id=7, cumulative=20000.0):
             execId="0001.01",
         ),
     )
+
+
+def test_historical_bars_use_a_bounded_request_timeout_and_restore_it():
+    class TimeoutIb:
+        RequestTimeout = 0
+
+        def reqHistoricalData(self, *_args, **_kwargs):
+            assert self.RequestTimeout == 7.0
+            raise TimeoutError("market data session unavailable")
+
+    client = object.__new__(IbAsyncTwsClient)
+    client.ib = TimeoutIb()
+    client.request_timeout_seconds = 7.0
+    client.qualified_forex_fact = lambda _instrument: {
+        "contract": _contract()
+    }
+
+    with pytest.raises(L1ExecutionError, match="historical-data request timed out"):
+        client.historical_closed_bars("USD.CAD", timeframe="4h", count=60)
+    assert client.ib.RequestTimeout == 0
 
 
 def test_completed_parent_is_reconstructed_only_from_matching_execution():

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import socket
+import inspect
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -15,6 +16,13 @@ from app.ibkr_model_authority import ContinuousPaperProfile, MANDATE_SCHEMA
 
 ACCOUNT = "DU-MODEL-RUNNER"
 FINGERPRINT = hashlib.sha256(ACCOUNT.encode()).hexdigest()[:16]
+
+
+def test_runner_shutdown_does_not_close_a_missing_reconnect_result():
+    from app import ibkr_model_runner
+
+    source = inspect.getsource(ibkr_model_runner.main)
+    assert "if runner is not None:" in source
 
 
 @pytest.fixture(autouse=True)

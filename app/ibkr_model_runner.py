@@ -590,7 +590,8 @@ def main() -> int:
                 break
             stopped.wait(float(config["loop_seconds"]))
     finally:
-        runner.close()
+        if runner is not None:
+            runner.close()
     return 0
 
 
