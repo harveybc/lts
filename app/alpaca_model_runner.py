@@ -10,7 +10,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from prediction_provider_mechanics import build_closed_bar_features
 from trading_contracts import AssetIntent, BrokerCapabilitySnapshot, InstrumentCapability
@@ -37,6 +37,21 @@ def _path(value: str | Path) -> Path:
 
 class AlpacaModelRunnerError(RuntimeError):
     pass
+
+
+def signed_position_quantity(position: Mapping[str, Any]) -> float:
+    """Return one signed quantity from Alpaca's redundant qty/side facts."""
+    quantity = float(position.get("qty", 0.0))
+    if quantity < 0.0:
+        return quantity
+    if str(position.get("side", "long")).lower() == "short":
+        return -quantity
+    return quantity
+
+
+def equity_model_close_allowed(clock: Mapping[str, Any]) -> bool:
+    """Market closes are executable only while the regular session is open."""
+    return bool(clock.get("is_open"))
 
 
 def l0_retry_suffix(store, model_id: str, last_closed_bar: str,
@@ -320,16 +335,27 @@ class AlpacaModelRunner:
                                  reason="execution_disabled")
             return {"state": "inference_only", "inference": inference,
                     "orders_submitted": 0}
-        exposure = sum(
-            float(position.get("qty", 0.0))
-            * (-1.0 if str(position.get("side", "long")).lower() == "short" else 1.0)
-            for position in positions
-        )
+        exposure = sum(signed_position_quantity(position) for position in positions)
         control = decide_position_control(
             inference["action"], current_exposure=exposure,
             pending_entry=bool(open_orders and not positions),
         )
         if control.disposition == "close" and (open_orders or positions):
+            clock = self.client.clock()
+            if not equity_model_close_allowed(clock):
+                self._record_due_bar(
+                    inference,
+                    outcome="model_close_deferred",
+                    reason="equity_market_closed_protection_preserved",
+                )
+                return {
+                    "state": "model_close_deferred_market_closed",
+                    "inference": inference,
+                    "control": control.reason,
+                    "orders": len(open_orders),
+                    "positions": len(positions),
+                    "protection_preserved": True,
+                }
             drained = self.executor.drain_for_model_signal(control.reason)
             self._record_due_bar(
                 inference, outcome="model_close_requested", reason=control.reason

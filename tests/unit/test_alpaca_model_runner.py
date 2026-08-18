@@ -2,7 +2,30 @@ import sqlite3
 
 import pytest
 
-from app.alpaca_model_runner import AlpacaModelRunnerError, ModelSessionStore
+from app.alpaca_model_runner import (
+    AlpacaModelRunnerError,
+    ModelSessionStore,
+    equity_model_close_allowed,
+    signed_position_quantity,
+)
+
+
+@pytest.mark.parametrize(
+    ("position", "expected"),
+    [
+        ({"qty": "1", "side": "long"}, 1.0),
+        ({"qty": "1", "side": "short"}, -1.0),
+        ({"qty": "-1", "side": "short"}, -1.0),
+    ],
+)
+def test_alpaca_position_quantity_applies_the_short_sign_once(position, expected):
+    assert signed_position_quantity(position) == expected
+
+
+def test_equity_model_close_preserves_protection_while_market_is_closed():
+    assert not equity_model_close_allowed({"is_open": False})
+    assert not equity_model_close_allowed({})
+    assert equity_model_close_allowed({"is_open": True})
 
 
 def test_config_change_creates_a_distinct_model_session_with_new_balance():
