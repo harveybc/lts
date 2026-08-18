@@ -145,3 +145,40 @@ def test_portfolio_position_facts_are_a_separate_account_update_view():
         "secType": "CASH", "conId": 15016062, "units": -25000.0,
         "averageCost": 1.3921,
     }]
+
+
+def test_position_facts_use_fresh_snapshot_not_stale_local_cache():
+    client = object.__new__(IbAsyncTwsClient)
+    client._account = "DUR378700"
+    stale = SimpleNamespace(
+        account="DUR378700", contract=_contract(), position=-25000.0,
+        avgCost=1.3921,
+    )
+    calls = []
+    client.ib = SimpleNamespace(
+        reqPositions=lambda: calls.append("requested") or [],
+        positions=lambda _account: [stale],
+    )
+
+    assert client.position_facts() == []
+    assert calls == ["requested"]
+
+
+def test_position_facts_filter_fresh_snapshot_to_connected_account():
+    client = object.__new__(IbAsyncTwsClient)
+    client._account = "DUR378700"
+    own = SimpleNamespace(
+        account="DUR378700", contract=_contract(), position=-25000.0,
+        avgCost=1.3921,
+    )
+    foreign = SimpleNamespace(
+        account="DUOTHER", contract=_contract(), position=1000.0,
+        avgCost=1.4,
+    )
+    client.ib = SimpleNamespace(reqPositions=lambda: [foreign, own])
+
+    assert client.position_facts() == [{
+        "account": "DUR378700", "symbol": "USD", "currency": "CAD",
+        "secType": "CASH", "conId": 15016062, "units": -25000.0,
+        "averageCost": 1.3921,
+    }]

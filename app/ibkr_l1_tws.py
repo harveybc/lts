@@ -308,7 +308,12 @@ class IbAsyncTwsClient(IbkrClientProtocol):
         return list(facts.values())
 
     def position_facts(self) -> list[dict[str, Any]]:
-        self.ib.sleep(0)
+        # ``positions()`` only exposes ib_async's local cache.  A missed
+        # zero-position callback can therefore leave a closed position in
+        # that cache indefinitely.  The blocking request returns the fresh
+        # broker snapshot collected for this request, including an empty list
+        # when the account is flat.
+        positions = self.ib.reqPositions()
         return [
             {
                 "account": str(position.account),
@@ -319,7 +324,8 @@ class IbAsyncTwsClient(IbkrClientProtocol):
                 "units": float(position.position),
                 "averageCost": float(position.avgCost),
             }
-            for position in self.ib.positions(self._account)
+            for position in positions
+            if str(position.account) == self._account
         ]
 
     def portfolio_position_facts(self) -> list[dict[str, Any]]:
