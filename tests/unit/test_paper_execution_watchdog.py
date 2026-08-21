@@ -638,6 +638,20 @@ def test_ledger_severity_contract() -> None:
     assert ledger_severity("anything", "info") == "P3"
 
 
+def test_dynamic_rush_key_uses_stable_event_code_and_object() -> None:
+    from tools.paper_execution_watchdog import incident_identity
+
+    assert incident_identity("rush_1h:ADA/USD:496484") == (
+        "rush_1h", "ADA/USD:496484"
+    )
+    assert incident_identity("rush_4h:ETH/USD:123") == (
+        "rush_4h", "ETH/USD:123"
+    )
+    assert incident_identity("ibkr_observer_stale") == (
+        "ibkr_observer_stale", "-"
+    )
+
+
 def test_emit_to_incident_ledger_builds_cli_calls(tmp_path: Path) -> None:
     from tools.paper_execution_watchdog import emit_to_incident_ledger
 
@@ -681,6 +695,39 @@ def test_emit_to_incident_ledger_builds_cli_calls(tmp_path: Path) -> None:
     assert "observe" in observe_call
     assert observe_call[observe_call.index("--severity") + 1] == "P0"
     assert "recover" in calls[1]
+
+
+def test_emit_dynamic_rush_identity_is_ledger_safe(tmp_path: Path) -> None:
+    from tools.paper_execution_watchdog import emit_to_incident_ledger
+
+    calls: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+        stderr = ""
+
+    def fake_runner(command, **_kwargs):
+        calls.append(command)
+        return _Result()
+
+    failures = emit_to_incident_ledger(
+        [{
+            "kind": "observe",
+            "key": "rush_1h:ADA/USD:496484",
+            "title": "one-hour move",
+            "detail": "research discussion only",
+            "severity": "info",
+            "category": "research",
+        }],
+        repo=tmp_path,
+        config=tmp_path / "config.json",
+        machine="omega",
+        runner=fake_runner,
+    )
+    assert failures == 0
+    command = calls[0]
+    assert command[command.index("--event-code") + 1] == "rush_1h"
+    assert command[command.index("--object") + 1] == "ADA/USD:496484"
 
 
 def test_emit_failures_are_counted_not_raised(tmp_path: Path) -> None:

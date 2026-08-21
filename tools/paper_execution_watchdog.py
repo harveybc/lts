@@ -1348,6 +1348,21 @@ def ledger_severity(key: str, severity: str) -> str:
     return {"critical": "P1", "warning": "P2"}.get(severity, "P3")
 
 
+def incident_identity(key: str) -> tuple[str, str]:
+    """Map dynamic research keys onto a stable incident-ledger identity.
+
+    Rush keys include a symbol and time bucket (for example
+    ``rush_1h:ADA/USD:496484``).  The slash is not legal in an event code,
+    and making every bucket a distinct event code would create an unbounded
+    event taxonomy.  Keep the event class stable and put the dynamic identity
+    in the affected-object field instead.
+    """
+    parts = str(key).split(":", 1)
+    if len(parts) == 2 and parts[0] in {"rush_1h", "rush_4h"}:
+        return parts[0], parts[1]
+    return str(key), "-"
+
+
 def emit_to_incident_ledger(
     emissions: Sequence[Mapping[str, Any]],
     *,
@@ -1367,6 +1382,7 @@ def emit_to_incident_ledger(
         base = [sys.executable, script, "--config", str(config)]
         if db_override is not None:
             base += ["--db", str(db_override)]
+        event_code, affected_object = incident_identity(str(item["key"]))
         identity = [
             "--source",
             "lts_paper_watchdog",
@@ -1375,9 +1391,9 @@ def emit_to_incident_ledger(
             "--machine",
             machine,
             "--event-code",
-            str(item["key"]),
+            event_code,
             "--object",
-            "-",
+            affected_object,
         ]
         if item["kind"] == "observe":
             payload = {
