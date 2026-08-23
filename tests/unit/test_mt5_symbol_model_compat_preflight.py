@@ -135,11 +135,21 @@ class TestEndToEnd:
     def test_pass_requires_real_manifest_gate(self, tool, tmp_path,
                                               monkeypatch):
         profile = tmp_path / "profile.json"
-        profile.write_text(json.dumps(_profile()))
+        profile.write_text(json.dumps(dict(_profile(),
+                                           order_volume=0.01)))
+        bridge = tmp_path / "bridge.json"
+        bridge.write_text(json.dumps({
+            "allowed_symbols": ["ETHUSD", "USDCAD"],
+            "symbol_magics": {"ETHUSD": 26080301, "USDCAD": 26080302},
+            "max_volume": 0.01, "max_open_commands_per_day": 4}))
         bars = tmp_path / "bars.json"
-        bars.write_text(json.dumps({"bar_open_times_utc": [
-            f"2026-08-2{d}T{h:02d}:00:00+00:00"
-            for d in (0, 1) for h in (0, 4, 8, 12, 16, 20)]}))
+        bars.write_text(json.dumps({
+            "bar_open_times_utc": [
+                f"2026-08-2{d}T{h:02d}:00:00+00:00"
+                for d in (0, 1) for h in (0, 4, 8, 12, 16, 20)],
+            "symbol_facts": {"trade_mode": 4, "volume_min": 0.01,
+                             "volume_step": 0.01, "volume_max": 100.0,
+                             "digits": 5, "point": 1e-5}}))
         out = tmp_path / "out.json"
 
         class _Gate:
@@ -151,8 +161,103 @@ class TestEndToEnd:
                             lambda p: _Gate())
         rc = tool.main(["--profile", str(profile),
                         "--bars-evidence", str(bars),
+                        "--bridge-config", str(bridge),
                         "--out-json", str(out)])
         assert rc == 0
         doc = json.loads(out.read_text())
         assert doc["outcome"] == "PASS"
         assert doc["model_id"] == "usdcad-4h-linear-live-v1"
+
+
+class TestBridgeBinding:
+    """AUD-F2-20260823-303."""
+
+    def _bridge(self, tmp_path, **over):
+        doc = {"allowed_symbols": ["ETHUSD", "USDCAD"],
+               "symbol_magics": {"ETHUSD": 26080301,
+                                 "USDCAD": 26080302},
+               "max_volume": 0.01, "max_open_commands_per_day": 4}
+        doc.update(over)
+        path = tmp_path / "bridge.json"
+        path.write_text(json.dumps(doc))
+        return path
+
+    def _profile(self):
+        return dict(_profile(), order_volume=0.01)
+
+    def test_valid_binding_passes(self, tool, tmp_path):
+        out = tool.check_bridge_binding(
+            self._profile(), expected_symbols=["ETHUSD", "USDCAD"],
+            bridge_config_path=self._bridge(tmp_path))
+        assert out["declared_chart_magic"] == 26080302
+        assert len(out["bridge_config_sha256"]) == 64
+
+    def test_missing_mandate_symbol_refuses(self, tool, tmp_path):
+        with pytest.raises(tool.CompatRefused, match="lacks symbols"):
+            tool.check_bridge_binding(
+                self._profile(),
+                expected_symbols=["ETHUSD", "USDCAD"],
+                bridge_config_path=self._bridge(
+                    tmp_path, allowed_symbols=["ETHUSD"]))
+
+    def test_magic_mismatch_refuses(self, tool, tmp_path):
+        with pytest.raises(tool.CompatRefused, match="chart magic"):
+            tool.check_bridge_binding(
+                self._profile(),
+                expected_symbols=["USDCAD"],
+                bridge_config_path=self._bridge(
+                    tmp_path,
+                    symbol_magics={"ETHUSD": 26080301,
+                                   "USDCAD": 999}))
+
+    def test_volume_over_ceiling_refuses(self, tool, tmp_path):
+        profile = self._profile()
+        profile["order_volume"] = 0.05
+        with pytest.raises(tool.CompatRefused, match="ceiling"):
+            tool.check_bridge_binding(
+                profile, expected_symbols=["USDCAD"],
+                bridge_config_path=self._bridge(tmp_path))
+
+    def test_account_identifier_never_in_result(self, tool, tmp_path):
+        bridge = self._bridge(
+            tmp_path, account_fingerprint="c" * 24)
+        out = tool.check_bridge_binding(
+            self._profile(), expected_symbols=["USDCAD"],
+            bridge_config_path=bridge)
+        assert "c" * 24 not in json.dumps(out)
+
+
+class TestSymbolFacts:
+    """AUD-F2-20260823-303: executable symbol facts."""
+
+    def _facts(self, **over):
+        base = {"trade_mode": 4, "volume_min": 0.01,
+                "volume_step": 0.01, "volume_max": 100.0,
+                "digits": 5, "point": 1e-5}
+        base.update(over)
+        return {"symbol_facts": base}
+
+    def test_valid_facts_pass(self, tool):
+        out = tool.check_symbol_facts(self._facts(),
+                                      order_volume=0.01)
+        assert out["trade_mode"] == 4
+
+    def test_wrong_trade_mode_refuses(self, tool):
+        with pytest.raises(tool.CompatRefused, match="trade_mode"):
+            tool.check_symbol_facts(self._facts(trade_mode=2),
+                                    order_volume=0.01)
+
+    def test_step_misalignment_refuses(self, tool):
+        with pytest.raises(tool.CompatRefused, match="step"):
+            tool.check_symbol_facts(
+                self._facts(volume_step=0.02),
+                order_volume=0.02)  # min 0.01 + n*0.02 never hits 0.02
+
+    def test_missing_facts_refuse(self, tool):
+        with pytest.raises(tool.CompatRefused, match="symbol_facts"):
+            tool.check_symbol_facts({}, order_volume=0.01)
+
+    def test_below_min_refuses(self, tool):
+        with pytest.raises(tool.CompatRefused, match="bounds"):
+            tool.check_symbol_facts(self._facts(volume_min=0.1),
+                                    order_volume=0.01)
