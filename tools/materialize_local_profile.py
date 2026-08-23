@@ -50,11 +50,54 @@ def main(argv=None) -> int:
         print(f"REFUSED: unreplaced placeholders {sorted(set(leftovers))}")
         return 2
     json.loads(text)  # must stay valid JSON
+    # AUD-SEC-20260823-314: no-follow, atomic, fail-closed install.
+    # A pre-existing symlink (or any non-regular destination) refuses;
+    # the payload is written to an O_EXCL|O_NOFOLLOW 0600 temporary in
+    # the SAME 0700 directory, fsynced, then atomically renamed over a
+    # verified-regular destination; the directory is fsynced before
+    # success is acknowledged. Substituted values are never printed.
     dest_dir = Path.home() / ".config" / "lts"
     dest_dir.mkdir(parents=True, exist_ok=True)
+    if dest_dir.is_symlink():
+        print("REFUSED: ~/.config/lts is a symlink")
+        return 2
+    os.chmod(dest_dir, 0o700)
     dest = dest_dir / args.name
-    dest.write_text(text)
-    os.chmod(dest, 0o600)
+    if dest.is_symlink() or (dest.exists() and not dest.is_file()):
+        print("REFUSED: destination exists and is not a regular "
+              "local file (symlink or special); refusing to follow "
+              "or replace it")
+        return 2
+    tmp = dest_dir / (args.name + ".tmp")
+    try:
+        fd = os.open(str(tmp),
+                     os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                     | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        print("REFUSED: temporary file already exists (concurrent "
+              "materialization or stale race artifact); remove it "
+              "deliberately and retry")
+        return 2
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # re-verify the destination immediately before the atomic
+        # replace (rename replaces a symlink ENTRY, never follows it,
+        # but a race to a special file still refuses)
+        if dest.is_symlink() or (dest.exists() and not dest.is_file()):
+            print("REFUSED: destination changed during write")
+            return 2
+        os.replace(tmp, dest)
+        dfd = os.open(str(dest_dir), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     print(json.dumps({
         "written": str(dest),
         "sha256": hashlib.sha256(text.encode()).hexdigest(),

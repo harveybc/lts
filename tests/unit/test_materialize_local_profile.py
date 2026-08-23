@@ -59,3 +59,60 @@ def test_path_escape_refused(tool, tmp_path, capsys):
     t.write_text("{}")
     assert tool.main(["--template", str(t),
                       "--name", "../evil.json"]) == 2
+
+
+class TestNoFollowAtomicInstall:
+    """AUD-SEC-20260823-314 adversarial fixtures."""
+
+    def _env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LTS_MT5_ACCOUNT_FINGERPRINT", "a" * 24)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        t = tmp_path / "t.json"
+        t.write_text(
+            '{"account_fingerprint": "<ACCOUNT_FINGERPRINT_24HEX>"}')
+        cfg = tmp_path / ".config" / "lts"
+        cfg.mkdir(parents=True)
+        return t, cfg
+
+    def test_symlink_destination_refuses_and_never_leaks(
+            self, tool, tmp_path, monkeypatch, capsys):
+        t, cfg = self._env(tmp_path, monkeypatch)
+        outside = tmp_path / "outside_leak.json"
+        (cfg / "p.json").symlink_to(outside)
+        rc = tool.main(["--template", str(t), "--name", "p.json"])
+        assert rc == 2
+        assert "REFUSED" in capsys.readouterr().out
+        assert not outside.exists()
+
+    def test_symlinked_config_dir_refuses(self, tool, tmp_path,
+                                          monkeypatch, capsys):
+        monkeypatch.setenv("LTS_MT5_ACCOUNT_FINGERPRINT", "a" * 24)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        t = tmp_path / "t.json"
+        t.write_text(
+            '{"account_fingerprint": "<ACCOUNT_FINGERPRINT_24HEX>"}')
+        real = tmp_path / "elsewhere"; real.mkdir()
+        (tmp_path / ".config").mkdir()
+        (tmp_path / ".config" / "lts").symlink_to(real)
+        rc = tool.main(["--template", str(t), "--name", "p.json"])
+        assert rc == 2
+        assert "symlink" in capsys.readouterr().out
+
+    def test_stale_tmp_race_artifact_refuses(self, tool, tmp_path,
+                                             monkeypatch, capsys):
+        t, cfg = self._env(tmp_path, monkeypatch)
+        (cfg / "p.json.tmp").write_text("stale")
+        rc = tool.main(["--template", str(t), "--name", "p.json"])
+        assert rc == 2
+        assert "temporary file" in capsys.readouterr().out
+
+    def test_success_enforces_0700_dir_and_0600_file(
+            self, tool, tmp_path, monkeypatch):
+        import stat
+        t, cfg = self._env(tmp_path, monkeypatch)
+        cfg.chmod(0o755)  # loose perms get tightened
+        rc = tool.main(["--template", str(t), "--name", "p.json"])
+        assert rc == 0
+        assert stat.S_IMODE(cfg.stat().st_mode) == 0o700
+        assert stat.S_IMODE((cfg / "p.json").stat().st_mode) == 0o600
+        assert not (cfg / "p.json.tmp").exists()
