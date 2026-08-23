@@ -33,6 +33,7 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -198,6 +199,78 @@ def check_symbol_facts(evidence: dict, *, order_volume: float) -> dict:
             "point": facts["point"]}
 
 
+def load_attested_evidence(bridge_db: Path, *, symbol: str,
+                           account_fingerprint: str,
+                           max_age_hours: float) -> dict:
+    """AUD-F2-20260823-302: the preflight consumes ONLY the signed
+    evidence envelope stored by the bridge — a hand-written file has
+    no attestation and REFUSES. Freshness, route identity, monotonic
+    4h spacing, duplicates/gaps and OHLC geometry are verified here;
+    the storage row's digest binds the exact payload."""
+    from app.mt5_execution_bridge import Mt5ExecutionStore
+    store = Mt5ExecutionStore(bridge_db)
+    row = store.latest_bars_evidence(symbol)
+    if row is None:
+        raise CompatRefused(
+            f"no attested bars evidence for {symbol} in the bridge "
+            "store; capture it via the EA before preflight")
+    import hashlib
+    payload = row["payload_json"].encode("utf-8")
+    if hashlib.sha256(payload).hexdigest() != row["digest"]:
+        raise CompatRefused("stored evidence digest mismatch")
+    doc = json.loads(payload)
+    if doc.get("schema") != "lts.mt5.bars_evidence.v1":
+        raise CompatRefused("evidence schema unsupported")
+    if str(doc.get("account_fingerprint", "")).lower() != (
+            account_fingerprint.lower()):
+        raise CompatRefused("evidence account mismatch")
+    if str(doc.get("symbol", "")).upper() != symbol.upper():
+        raise CompatRefused("evidence symbol mismatch")
+    if str(doc.get("timeframe", "")).upper() != "H4":
+        raise CompatRefused("evidence timeframe is not H4")
+    captured = doc.get("captured_at_utc")
+    try:
+        stamp = datetime.fromisoformat(str(captured))
+    except ValueError:
+        raise CompatRefused(f"evidence captured_at_utc invalid: "
+                            f"{captured!r}")
+    if stamp.tzinfo is None:
+        raise CompatRefused("evidence capture time lacks timezone")
+    age = datetime.now(timezone.utc) - stamp.astimezone(timezone.utc)
+    if age > timedelta(hours=max_age_hours) or age < timedelta(0):
+        raise CompatRefused(
+            f"evidence is stale or future-dated (age {age}); a fresh "
+            "capture is required")
+    bars = doc.get("bars") or []
+    if len(bars) < 12:
+        raise CompatRefused("evidence carries fewer than 12 bars")
+    opens = []
+    for i, bar in enumerate(bars):
+        t = datetime.fromisoformat(str(bar.get("t")))
+        if t.tzinfo is None:
+            raise CompatRefused(f"bar {i} time lacks timezone")
+        opens.append(t.astimezone(timezone.utc))
+        o, h, l, c = (bar.get(k) for k in ("o", "h", "l", "c"))
+        vals = [o, h, l, c]
+        if any(not isinstance(v, (int, float)) or isinstance(v, bool)
+               or v != v or v <= 0 for v in vals):
+            raise CompatRefused(f"bar {i} has non-finite/non-positive "
+                                "OHLC")
+        if not (l <= min(o, c) and h >= max(o, c) and l <= h):
+            raise CompatRefused(f"bar {i} violates OHLC geometry")
+    for a, b in zip(opens, opens[1:]):
+        delta = (b - a).total_seconds()
+        if delta == 0:
+            raise CompatRefused("duplicate bar timestamps in evidence")
+        if delta != 4 * 3600:
+            raise CompatRefused(
+                f"bar spacing {delta}s is not exactly 4h (gap or "
+                "disorder); refusing")
+    doc["bar_open_times_utc"] = [t.isoformat() for t in opens]
+    doc["_storage_digest"] = row["digest"]
+    return doc
+
+
 def check_manifest_gate(profile: dict):
     from app.live_sac_selection import SelectedSacPolicy
     model = profile["model"]
@@ -215,7 +288,11 @@ def main(argv=None) -> int:
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--other-profile", type=Path, action="append",
                         default=[])
-    parser.add_argument("--bars-evidence", type=Path, required=True)
+    parser.add_argument("--bridge-db", type=Path, required=True,
+                        help="302: bars evidence comes ONLY from the "
+                             "bridge's attested envelope store")
+    parser.add_argument("--max-evidence-age-hours", type=float,
+                        default=48.0)
     parser.add_argument("--bridge-config", type=Path, default=None)
     parser.add_argument("--expected-symbols",
                         default="ETHUSD,USDCAD")
@@ -226,16 +303,22 @@ def main(argv=None) -> int:
     try:
         facts = check_profile(profile)
         check_magic_unique(profile, others)
-        evidence = json.loads(args.bars_evidence.read_text())
-        timing = check_bar_timing(
-            evidence,
-            timeframe=profile["model"]["expected_timeframe"])
         bridge = check_bridge_binding(
             profile,
             expected_symbols=[v.strip().upper() for v in
                               args.expected_symbols.split(",")
                               if v.strip()],
             bridge_config_path=args.bridge_config)
+        evidence = load_attested_evidence(
+            args.bridge_db, symbol=facts["symbol"],
+            account_fingerprint=str(json.loads(Path(
+                args.bridge_config
+                or _expand(str(profile["bridge_config_file"]))
+            ).read_text()).get("account_fingerprint", "")),
+            max_age_hours=args.max_evidence_age_hours)
+        timing = check_bar_timing(
+            evidence,
+            timeframe=profile["model"]["expected_timeframe"])
         symbol_facts = check_symbol_facts(
             evidence, order_volume=float(profile["order_volume"]))
         policy = check_manifest_gate(profile)
@@ -246,6 +329,8 @@ def main(argv=None) -> int:
             "bar_timing": timing,
             "bridge_binding": bridge,
             "symbol_facts": symbol_facts,
+            "evidence_storage_digest": evidence["_storage_digest"],
+            "evidence_captured_at": evidence.get("captured_at_utc"),
             "manifest_sha256": policy.manifest_sha256,
             "model_id": policy.manifest.get("model_id"),
             "artifact_sha256": policy.manifest.get("artifact_sha256"),

@@ -716,3 +716,42 @@ def test_legacy_hmac_retirement_switch(tmp_path):
             SECRET, "GET", path, nonce="retire-nonce-0002",
             route_identity=_route("USDCAD")))
     assert bound.status_code == 204
+
+
+def test_bars_evidence_endpoint_requires_identity_and_binds_symbol(
+        tmp_path):
+    """AUD-F2-20260823-302: the storage endpoint refuses unbound or
+    mismatched envelopes and stores byte-exact payloads."""
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    path = "/v2/evidence/bars"
+    doc = {"schema": "lts.mt5.bars_evidence.v1",
+           "account_fingerprint": ACCOUNT, "symbol": "USDCAD",
+           "timeframe": "H4", "captured_at_utc": "2026-08-23T12:00:00+00:00",
+           "bars": []}
+    body = json.dumps(doc, separators=(",", ":")).encode()
+    # no identity -> 401
+    resp = client.post(path, content=body, headers={
+        "Content-Type": "application/json",
+        **create_signed_headers(SECRET, "POST", path, body,
+                                nonce="ev-nonce-0001")})
+    assert resp.status_code == 401
+    # identity symbol mismatch -> 403
+    resp = client.post(path, content=body, headers={
+        "Content-Type": "application/json",
+        **create_signed_headers(SECRET, "POST", path, body,
+                                nonce="ev-nonce-0002",
+                                route_identity=_route("ETHUSD"))})
+    assert resp.status_code == 403
+    # bound -> stored with the exact digest
+    resp = client.post(path, content=body, headers={
+        "Content-Type": "application/json",
+        **create_signed_headers(SECRET, "POST", path, body,
+                                nonce="ev-nonce-0003",
+                                route_identity=_route("USDCAD"))})
+    assert resp.status_code == 200
+    import hashlib
+    assert resp.json()["digest"] == hashlib.sha256(body).hexdigest()
+    stored = store.latest_bars_evidence("USDCAD")
+    assert stored["payload_json"].encode() == body

@@ -204,7 +204,34 @@ class Mt5ExecutionStore(Mt5BridgeStore):
             );
             CREATE INDEX IF NOT EXISTS idx_mt5_commands_route_state
                 ON execution_commands(account_fingerprint,symbol,state,created_at);
+            CREATE TABLE IF NOT EXISTS bars_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                digest TEXT NOT NULL
+            );
             """)
+
+    def record_bars_evidence(self, *, symbol: str, payload: str,
+                             digest: str) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                "INSERT INTO bars_evidence(symbol,received_at,"
+                "payload_json,digest) VALUES (?,?,?,?)",
+                (symbol.upper(), _utc_now(), payload, digest))
+
+    def latest_bars_evidence(self, symbol: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT received_at,payload_json,digest FROM "
+                "bars_evidence WHERE symbol=? ORDER BY id DESC LIMIT 1",
+                (symbol.upper(),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"received_at": row[0], "payload_json": row[1],
+                "digest": row[2]}
 
     @staticmethod
     def _command_id(idempotency_key: str) -> str:
@@ -646,6 +673,45 @@ def create_mt5_execution_app(
         return PlainTextResponse(
             body, status_code=204 if command is None else 200, headers=headers
         )
+
+    @app.post("/v2/evidence/bars")
+    async def bars_evidence(request: Request):
+        """AUD-F2-20260823-302: signed CopyRates evidence envelope.
+
+        The request HMAC (with the route identity bound into the
+        canonical) is the attestation that this capture came from the
+        EA holding the secret, on the declared account, chart symbol
+        and magic. The envelope is stored verbatim; the preflight
+        consumes ONLY stored envelopes."""
+        _nonce, route_identity = await authenticate(request)
+        identity = parse_route_identity(route_identity)
+        if not identity:
+            raise HTTPException(
+                status_code=401,
+                detail="bars evidence requires a signed route identity")
+        body = await request.body()
+        try:
+            doc = json.loads(body)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=422,
+                                detail="malformed evidence body")
+        if doc.get("schema") != "lts.mt5.bars_evidence.v1":
+            raise HTTPException(status_code=422,
+                                detail="unsupported evidence schema")
+        if str(doc.get("account_fingerprint", "")).lower() != (
+                config.account_fingerprint):
+            raise HTTPException(status_code=403,
+                                detail="evidence account mismatch")
+        if str(doc.get("symbol", "")).upper() != identity["symbol"]:
+            raise HTTPException(
+                status_code=403,
+                detail="evidence symbol does not match the signed "
+                       "route identity")
+        digest = hashlib.sha256(body).hexdigest()
+        store.record_bars_evidence(
+            symbol=identity["symbol"],
+            payload=body.decode("utf-8"), digest=digest)
+        return {"stored": True, "digest": digest}
 
     @app.post("/v2/commands/result")
     async def command_result(payload: ExecutionResultPayload, request: Request):

@@ -7,7 +7,7 @@
 #property strict
 #property description "Model-controlled authenticated MT5 Demo execution bridge"
 
-input string InpBridgeUrl = "http://192.168.122.1:8766";
+input string InpBridgeUrl = "http://<bridge-host>:8766";
 input string InpBridgeSecret = "";
 input string InpObservedSymbols = "SOLUSD,ETHUSD,BTCUSD,ADAUSD,DOGEUSD,XRPUSD,USDCAD,EURJPY,EURUSD,AUDUSD,GBPJPY,USDJPY,NZDUSD";
 input int InpTimerSeconds = 15;
@@ -18,6 +18,7 @@ input string InpTradeSymbol = "ETHUSD";
 input double InpMaximumVolume = 0.01;
 input int InpMaximumDeviationPoints = 20;
 input long InpMagic = 26080301;
+input bool InpPostBarsEvidence = false; // capture sessions only (302)
 input int InpClosedBarHistory = 800;
 
 string ADAPTER_VERSION = "lts.mt5.ea.execution.v2";
@@ -529,6 +530,66 @@ bool ExecuteClose(
    return accepted;
   }
 
+bool PostBarsEvidence()
+  {
+   // AUD-F2-20260823-302: signed CopyRates evidence envelope. The
+   // SignedPost HMAC with the bound route identity attests that this
+   // capture came from THIS EA, account, chart and magic; the bridge
+   // stores it verbatim and the preflight consumes only stored
+   // envelopes.
+   MqlRates rates[];
+   int copied = CopyRates(Symbol(), PERIOD_H4, 1, 64, rates);
+   if(copied < 12)
+     {
+      Print("bars evidence refused: CopyRates returned ", copied);
+      return false;
+     }
+   string bars = "";
+   for(int i = 0; i < copied; i++)
+     {
+      if(i > 0)
+         bars += ",";
+      bars += "{"
+              "\"t\":" + JsonString(TimeToString(rates[i].time,
+                 TIME_DATE | TIME_MINUTES | TIME_SECONDS) + "+00:00") + ","
+              "\"o\":" + DoubleToString(rates[i].open, 8) + ","
+              "\"h\":" + DoubleToString(rates[i].high, 8) + ","
+              "\"l\":" + DoubleToString(rates[i].low, 8) + ","
+              "\"c\":" + DoubleToString(rates[i].close, 8) + ","
+              "\"v\":" + DoubleToString((double)rates[i].tick_volume, 0)
+              + "}";
+     }
+   string body =
+      "{"
+      "\"schema\":\"lts.mt5.bars_evidence.v1\","
+      "\"adapter_version\":" + JsonString(ADAPTER_VERSION) + ","
+      "\"account_fingerprint\":" + JsonString(account_fingerprint) + ","
+      "\"server_fingerprint\":" + JsonString(server_fingerprint) + ","
+      "\"symbol\":" + JsonString(Symbol()) + ","
+      "\"timeframe\":\"H4\","
+      "\"terminal_build\":" + IntegerToString(
+         TerminalInfoInteger(TERMINAL_BUILD)) + ","
+      "\"captured_at_utc\":" + JsonString(TimeToString(TimeGMT(),
+         TIME_DATE | TIME_MINUTES | TIME_SECONDS) + "+00:00") + ","
+      "\"symbol_facts\":{"
+      "\"trade_mode\":" + IntegerToString(
+         SymbolInfoInteger(Symbol(), SYMBOL_TRADE_MODE)) + ","
+      "\"volume_min\":" + DoubleToString(
+         SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN), 8) + ","
+      "\"volume_step\":" + DoubleToString(
+         SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP), 8) + ","
+      "\"volume_max\":" + DoubleToString(
+         SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX), 8) + ","
+      "\"digits\":" + IntegerToString(
+         SymbolInfoInteger(Symbol(), SYMBOL_DIGITS)) + ","
+      "\"point\":" + DoubleToString(
+         SymbolInfoDouble(Symbol(), SYMBOL_POINT), 10) +
+      "},"
+      "\"bars\":[" + bars + "]"
+      "}";
+   return SignedPost("/v2/evidence/bars", body);
+  }
+
 void PollExecutionCommand()
   {
    string body = "";
@@ -819,6 +880,8 @@ int OnInit()
       "LTS MT5 Demo execution bridge initialized; account fingerprint=%s",
       account_fingerprint
    );
+   if(InpPostBarsEvidence)
+      PostBarsEvidence();
    return INIT_SUCCEEDED;
   }
 
