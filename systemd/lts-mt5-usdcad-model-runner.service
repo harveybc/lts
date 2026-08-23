@@ -1,0 +1,15 @@
+# NOT INSTALLED — activation only after the §2.9 preflight packet is
+# independently verified. Never touches the ETHUSD runner or its unit.
+[Unit]
+Description=LTS MT5 Demo USDCAD model execution runner
+After=network-online.target lts-mt5-execution-bridge.service
+
+[Service]
+WorkingDirectory=/home/harveybc/Documents/GitHub/lts
+EnvironmentFile=%h/.config/lts/mt5-bridge.env
+ExecStart=/home/harveybc/anaconda3/envs/trading-stack/bin/python -m app.mt5_model_runner --config examples/configs/mt5_usdcad_model_runner_v1.json
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
