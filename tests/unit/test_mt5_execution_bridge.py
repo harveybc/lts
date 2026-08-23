@@ -272,3 +272,175 @@ def test_open_budget_counts_only_new_commands(tmp_path):
         store.complete(ExecutionResultPayload.model_validate(payload))
     with pytest.raises(Mt5BridgeError, match="daily Demo entry budget"):
         _enqueue(store, config, idempotency_key="third")
+
+
+# --- Dual-symbol routing (order 2026-08-23: ETHUSD + USDCAD) ---------
+
+
+def _dual_config(tmp_path):
+    return Mt5ExecutionConfig(
+        database_path=tmp_path / "mt5.sqlite", secret_env="SECRET",
+        bind_host="127.0.0.1", port=8766, max_clock_skew_seconds=90,
+        nonce_retention_seconds=900, stale_heartbeat_seconds=180,
+        account_fingerprint=ACCOUNT,
+        allowed_symbols=("ETHUSD", "USDCAD"),
+        max_volume=0.01, max_open_commands_per_day=4,
+        delivery_retry_seconds=30,
+    )
+
+
+def test_cross_symbol_command_theft_is_impossible(tmp_path):
+    """A USDCAD command must never be delivered to the ETHUSD chart EA."""
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    command = _enqueue(store, config, symbol="USDCAD")
+    assert store.next_command(
+        ACCOUNT, retry_seconds=30, symbol="ETHUSD") is None
+    delivered = store.next_command(
+        ACCOUNT, retry_seconds=30, symbol="USDCAD")
+    assert delivered["command_id"] == command["command_id"]
+    # and not deliverable twice inside the retry window
+    assert store.next_command(
+        ACCOUNT, retry_seconds=30, symbol="USDCAD") is None
+
+
+def test_multi_symbol_poll_requires_chart_symbol(tmp_path):
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    path = "/v2/commands/next"
+    resp = client.get(
+        path, params={"account_fingerprint": ACCOUNT},
+        headers=create_signed_headers(SECRET, "GET", path,
+                                      nonce="dual-nonce-0001"))
+    assert resp.status_code == 400
+    resp = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "EURUSD"},
+        headers=create_signed_headers(SECRET, "GET", path,
+                                      nonce="dual-nonce-0002"))
+    assert resp.status_code == 403
+    resp = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "USDCAD"},
+        headers=create_signed_headers(SECRET, "GET", path,
+                                      nonce="dual-nonce-0003"))
+    assert resp.status_code == 204  # empty queue, correctly scoped
+
+
+def test_single_symbol_mandate_resolves_absent_symbol(tmp_path):
+    config = _config(tmp_path)  # ("USDCAD",)
+    store = Mt5ExecutionStore(config.database_path)
+    command = _enqueue(store, config)
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    path = "/v2/commands/next"
+    resp = client.get(
+        path, params={"account_fingerprint": ACCOUNT},
+        headers=create_signed_headers(SECRET, "GET", path,
+                                      nonce="single-nonce-0001"))
+    assert resp.status_code == 200
+    assert resp.text.split("|")[1] == command["command_id"]
+
+
+def test_unresolved_route_is_per_symbol_not_per_account(tmp_path):
+    """An unresolved ETHUSD command must not block USDCAD enqueue."""
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    _enqueue(store, config, idempotency_key="eth:open",
+             symbol="ETHUSD", model_id="eth-model-v1")
+    other = _enqueue(store, config, idempotency_key="cad:open",
+                     symbol="USDCAD", model_id="usdcad-model-v1")
+    assert other["symbol"] == "USDCAD"
+    with pytest.raises(Mt5BridgeError, match="unresolved"):
+        _enqueue(store, config, idempotency_key="cad:open2",
+                 symbol="USDCAD")
+
+
+def test_nonce_replay_across_ea_clients_is_refused(tmp_path):
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    path = "/v2/commands/next"
+    headers = create_signed_headers(SECRET, "GET", path,
+                                    nonce="replayed-nonce-0001")
+    first = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "ETHUSD"}, headers=headers)
+    assert first.status_code in (200, 204)
+    # the second client replays the SAME nonce (cross-client replay)
+    second = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "USDCAD"}, headers=headers)
+    assert second.status_code == 401
+
+
+def test_duplicate_fill_and_altered_result_identity(tmp_path):
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    command = _enqueue(store, config, symbol="USDCAD")
+    store.next_command(ACCOUNT, retry_seconds=30, symbol="USDCAD")
+
+    observed = datetime.now(timezone.utc).isoformat()
+
+    def _result(**over):
+        values = dict(
+            schema="lts.mt5.execution_result.v1",
+            command_id=command["command_id"],
+            account_fingerprint=ACCOUNT, success=True,
+            result_code=10009, order_ticket="100", deal_ticket="101",
+            message="done",
+            observed_at=observed,
+        )
+        values.update(over)
+        return ExecutionResultPayload.model_validate(values)
+
+    assert store.complete(_result())["duplicate"] is False
+    assert store.complete(_result())["duplicate"] is True
+    with pytest.raises(Mt5BridgeError, match="identity collision"):
+        store.complete(_result(deal_ticket="999"))
+
+
+def test_restart_idempotency_preserves_route_state(tmp_path):
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    command = _enqueue(store, config, symbol="USDCAD")
+    del store
+    reopened = Mt5ExecutionStore(config.database_path)
+    replay = _enqueue(reopened, config, symbol="USDCAD")
+    assert replay["command_id"] == command["command_id"]
+    assert replay["replayed"] is True
+    delivered = reopened.next_command(
+        ACCOUNT, retry_seconds=30, symbol="USDCAD")
+    assert delivered["command_id"] == command["command_id"]
+
+
+def test_one_symbol_failure_leaves_the_other_healthy(tmp_path):
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    cad = _enqueue(store, config, idempotency_key="cad:open",
+                   symbol="USDCAD")
+    store.next_command(ACCOUNT, retry_seconds=30, symbol="USDCAD")
+    failed = ExecutionResultPayload.model_validate(dict(
+        schema="lts.mt5.execution_result.v1",
+        command_id=cad["command_id"], account_fingerprint=ACCOUNT,
+        success=False, result_code=10013, order_ticket="",
+        deal_ticket="", message="rejected",
+        observed_at=datetime.now(timezone.utc).isoformat(),
+    ))
+    assert store.complete(failed)["state"] == "failed"
+    eth = _enqueue(store, config, idempotency_key="eth:open",
+                   symbol="ETHUSD", model_id="eth-model-v1")
+    delivered = store.next_command(
+        ACCOUNT, retry_seconds=30, symbol="ETHUSD")
+    assert delivered["command_id"] == eth["command_id"]
+
+
+def test_ea_source_declares_symbol_and_refuses_wrong_chart():
+    """Mixed-magic / wrong-symbol defense in depth, pinned in source:
+    each EA instance polls with its own chart symbol, fails a
+    mis-delivered command VISIBLY, and only ever manages positions
+    carrying its own magic."""
+    source = EA_PATH.read_text(encoding="utf-8")
+    assert '+ "&symbol=" + Symbol();' in source
+    assert "wrong_symbol_for_this_chart" in source
+    assert "PositionGetInteger(POSITION_MAGIC) == InpMagic" in source

@@ -233,15 +233,36 @@ class Mt5ExecutionStore(Mt5BridgeStore):
             ).fetchone())
 
     def next_command(
-        self, account_fingerprint: str, *, retry_seconds: int
+        self, account_fingerprint: str, *, retry_seconds: int,
+        symbol: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
+        """Deliver the oldest deliverable command for the route.
+
+        Dual-symbol order 2026-08-23: with two EA instances polling the
+        same account, delivery MUST be symbol-scoped — an EA may only
+        ever receive commands for its own chart symbol, or a USDCAD
+        command would be "stolen" by the ETHUSD chart EA and executed
+        there. ``symbol=None`` remains valid only for single-symbol
+        mandates (resolved by the endpoint, never guessed here).
+        """
         cutoff = time.time() - retry_seconds
         with self._lock, self.connection:
-            rows = self.connection.execute(
-                "SELECT * FROM execution_commands WHERE account_fingerprint=? "
-                "AND state IN ('pending','delivered') ORDER BY created_at",
-                (account_fingerprint,),
-            ).fetchall()
+            if symbol is not None:
+                rows = self.connection.execute(
+                    "SELECT * FROM execution_commands WHERE "
+                    "account_fingerprint=? AND symbol=? "
+                    "AND state IN ('pending','delivered') "
+                    "ORDER BY created_at",
+                    (account_fingerprint, symbol.upper()),
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    "SELECT * FROM execution_commands WHERE "
+                    "account_fingerprint=? "
+                    "AND state IN ('pending','delivered') "
+                    "ORDER BY created_at",
+                    (account_fingerprint,),
+                ).fetchall()
             selected = None
             for row in rows:
                 delivered = row[14]
@@ -470,11 +491,32 @@ def create_mt5_execution_app(
         return {"accepted": True, "duplicate": not inserted, "read_only": False}
 
     @app.get("/v2/commands/next")
-    async def next_command(request: Request, account_fingerprint: str):
+    async def next_command(
+        request: Request, account_fingerprint: str, symbol: str = ""
+    ):
         nonce = await authenticate(request)
         account_allowed(account_fingerprint)
+        # Dual-symbol order 2026-08-23: delivery is symbol-scoped. A
+        # multi-symbol mandate REQUIRES the polling EA to declare its
+        # chart symbol; a single-symbol mandate resolves an absent
+        # declaration to that one symbol (deterministic, not a guess).
+        requested = symbol.strip().upper()
+        if requested:
+            if requested not in config.allowed_symbols:
+                raise HTTPException(
+                    status_code=403,
+                    detail="symbol outside the mandate")
+        elif len(config.allowed_symbols) == 1:
+            requested = config.allowed_symbols[0]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="multi-symbol mandate requires the polling "
+                       "EA to declare its chart symbol")
         command = store.next_command(
-            config.account_fingerprint, retry_seconds=config.delivery_retry_seconds
+            config.account_fingerprint,
+            retry_seconds=config.delivery_retry_seconds,
+            symbol=requested,
         )
         body = b"" if command is None else _command_line(command).encode()
         headers = {

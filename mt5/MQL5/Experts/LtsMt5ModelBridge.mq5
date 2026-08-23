@@ -521,7 +521,12 @@ bool ExecuteClose(
 void PollExecutionCommand()
   {
    string body = "";
-   string query = "?account_fingerprint=" + account_fingerprint;
+   // Dual-symbol order 2026-08-23: this EA instance declares its own
+   // chart symbol so the bridge only ever delivers commands scoped to
+   // it. Two charts (ETHUSD, USDCAD) poll the same account without
+   // cross-symbol command theft.
+   string query = "?account_fingerprint=" + account_fingerprint
+                  + "&symbol=" + Symbol();
    if(!SignedGet("/v2/commands/next", query, body) || body == "")
       return;
    string fields[];
@@ -545,6 +550,15 @@ void PollExecutionCommand()
    MqlTradeResult result = {};
    string message = "unsupported_action";
    bool success = false;
+   // Defense in depth: even a mis-delivered command must fail VISIBLY
+   // rather than execute on the wrong chart or linger undelivered.
+   if(symbol != Symbol())
+     {
+      message = "wrong_symbol_for_this_chart";
+      PostCommandResult(command_id, false, result, message);
+      last_command_id = command_id;
+      return;
+     }
    if(action == "open_long" || action == "open_short")
       success = ExecuteOpen(
          command_id, action, symbol, volume, stop_loss, take_profit,
