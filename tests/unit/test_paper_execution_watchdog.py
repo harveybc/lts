@@ -253,6 +253,22 @@ def test_evaluate_reports_missing_alpaca_and_offline_ibkr() -> None:
     assert discussions == []
 
 
+def test_evaluate_omits_ibkr_alerts_when_owner_suspended() -> None:
+    events, discussions = evaluate(
+        _healthy_alpaca(1785384300.0),
+        {
+            "available": False,
+            "suspended": True,
+            "reason": "suspended_by_owner",
+        },
+        now=1785384300.0,
+        stale_seconds=900,
+    )
+
+    assert events == []
+    assert discussions == []
+
+
 def test_evaluate_reports_unconfigured_oanda() -> None:
     events, discussions = evaluate(
         _healthy_alpaca(1785384300.0),

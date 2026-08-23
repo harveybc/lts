@@ -853,8 +853,9 @@ def evaluate(
                     )
                 )
 
+    ibkr_suspended = bool(ibkr.get("suspended"))
     ibkr_socket = ibkr.get("socket") or {}
-    if not ibkr_socket.get("available"):
+    if not ibkr_suspended and not ibkr_socket.get("available"):
         events.append(
             _event(
                 "ibkr_paper_offline",
@@ -868,7 +869,9 @@ def evaluate(
                 category="operations",
             )
         )
-    if not ibkr.get("available"):
+    if ibkr_suspended:
+        pass
+    elif not ibkr.get("available"):
         events.append(
             _event(
                 "ibkr_observer_missing",
@@ -1123,15 +1126,18 @@ def format_summary(
         )
     ibkr_socket = ibkr.get("socket") or {}
     latest_ibkr = ibkr.get("latest_complete") or {}
-    ibkr_text = (
-        f"IBKR Paper observer: {'healthy' if ibkr.get('available') else 'unavailable'}\n"
-        f"authenticated observations: {ibkr.get('complete_sessions', 0)}\n"
-        f"last successful snapshot: {latest_ibkr.get('ended_at', 'none')}\n"
-        f"TWS socket: {'online' if ibkr_socket.get('available') else 'offline'} "
-        f"at {ibkr_socket.get('host')}:{ibkr_socket.get('port')}\n"
-        f"positions/orders: {latest_ibkr.get('open_positions', 0)}/"
-        f"{latest_ibkr.get('open_orders', 0)}"
-    )
+    if ibkr.get("suspended"):
+        ibkr_text = "IBKR Paper: suspended by owner (not monitored)"
+    else:
+        ibkr_text = (
+            f"IBKR Paper observer: {'healthy' if ibkr.get('available') else 'unavailable'}\n"
+            f"authenticated observations: {ibkr.get('complete_sessions', 0)}\n"
+            f"last successful snapshot: {latest_ibkr.get('ended_at', 'none')}\n"
+            f"TWS socket: {'online' if ibkr_socket.get('available') else 'offline'} "
+            f"at {ibkr_socket.get('host')}:{ibkr_socket.get('port')}\n"
+            f"positions/orders: {latest_ibkr.get('open_positions', 0)}/"
+            f"{latest_ibkr.get('open_orders', 0)}"
+        )
     if oanda is None:
         oanda_text = "OANDA Practice: not monitored"
     elif not oanda.get("configured"):
@@ -1464,6 +1470,13 @@ def main() -> int:
     parser.add_argument("--ibkr-host", default="127.0.0.1")
     parser.add_argument("--ibkr-port", type=int, default=7497)
     parser.add_argument(
+        "--suspend-ibkr",
+        action="store_true",
+        default=os.environ.get("LTS_SUSPEND_IBKR", "").lower()
+        in {"1", "true", "yes"},
+        help="Record IBKR as owner-suspended without probing or alerting it.",
+    )
+    parser.add_argument(
         "--require-oanda-rest",
         action="store_true",
         help=(
@@ -1515,17 +1528,24 @@ def main() -> int:
                 now=now,
                 stale_seconds=args.stale_minutes * 60.0,
             )
-            ibkr = read_ibkr_snapshot(
-                args.ibkr_db,
-                args.ibkr_host,
-                args.ibkr_port,
-            )
-            ibkr["execution_runtime"] = read_execution_runtime(
-                args.ibkr_runtime,
-                "lts.ibkr.model_runner.heartbeat.v1",
-                now=now,
-                stale_seconds=args.stale_minutes * 60.0,
-            )
+            if args.suspend_ibkr:
+                ibkr = {
+                    "available": False,
+                    "suspended": True,
+                    "reason": "suspended_by_owner",
+                }
+            else:
+                ibkr = read_ibkr_snapshot(
+                    args.ibkr_db,
+                    args.ibkr_host,
+                    args.ibkr_port,
+                )
+                ibkr["execution_runtime"] = read_execution_runtime(
+                    args.ibkr_runtime,
+                    "lts.ibkr.model_runner.heartbeat.v1",
+                    now=now,
+                    stale_seconds=args.stale_minutes * 60.0,
+                )
             oanda = read_oanda_snapshot(args.oanda_db, args.oanda_env)
             shadow = read_shadow_snapshot(args.shadow_db)
             capital = read_capital_snapshot(args.capital_db, args.capital_env)

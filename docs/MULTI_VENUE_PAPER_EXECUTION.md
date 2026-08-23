@@ -1,9 +1,13 @@
 # Multi-Venue Paper Execution
 
-Status: Alpaca, IBKR and OANDA MT5 paper/demo execution active; shadow
-observation active; Capital.com Demo adapter ready; social-trading accounting
-lab implemented
-Date: 2026-08-13
+Status: Alpaca and OANDA MT5 paper/demo execution active; IBKR Paper
+owner-suspended; shadow observation active; Capital.com Demo adapter ready;
+social-trading accounting lab implemented
+Date: 2026-08-23
+
+IBKR Paper is not an active unattended venue. See
+[IBKR Paper suspension](IBKR_PAPER_SUSPENSION_2026_08_23.md) for preserved
+evidence and the explicit reactivation procedure.
 
 ## Account State
 
