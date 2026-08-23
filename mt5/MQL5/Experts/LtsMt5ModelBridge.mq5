@@ -206,8 +206,10 @@ bool SignedPost(const string path, const string body)
       return false;
    string timestamp = (string)(long)TimeGMT();
    string nonce = RequestNonce();
+   string route_identity = "v2|" + account_fingerprint + "|" + Symbol()
+                           + "|" + IntegerToString(InpMagic);
    string canonical = "POST\n" + path + "\n" + timestamp + "\n"
-                      + nonce + "\n" + body_hash;
+                      + nonce + "\n" + body_hash + "\n" + route_identity;
    string signature = "";
    if(!HmacSha256(InpBridgeSecret, canonical, signature))
       return false;
@@ -217,6 +219,7 @@ bool SignedPost(const string path, const string body)
       "Accept: application/json\r\n"
       "X-LTS-Timestamp: " + timestamp + "\r\n"
       "X-LTS-Nonce: " + nonce + "\r\n"
+      "X-LTS-Route-Identity: " + route_identity + "\r\n"
       "X-LTS-Signature: " + signature + "\r\n";
    char response[];
    string response_headers = "";
@@ -270,8 +273,15 @@ bool SignedGet(const string path, const string query, string &body)
       return false;
    string timestamp = (string)(long)TimeGMT();
    string nonce = RequestNonce();
+   // AUD-F2-20260823-301: the route identity (account, chart symbol,
+   // this EA instance magic, protocol version) binds INTO the request
+   // signature as the sixth canonical line; the server compares it to
+   // the actual route before reading the queue.
+   string route_identity = "v2|" + account_fingerprint + "|" + Symbol()
+                           + "|" + IntegerToString(InpMagic);
    string canonical = "GET\n" + path + "\n" + timestamp + "\n"
-                      + nonce + "\n" + body_hash;
+                      + nonce + "\n" + body_hash + "\n"
+                      + route_identity;
    string signature = "";
    if(!HmacSha256(InpBridgeSecret, canonical, signature))
       return false;
@@ -279,6 +289,7 @@ bool SignedGet(const string path, const string query, string &body)
       "Accept: text/plain\r\n"
       "X-LTS-Timestamp: " + timestamp + "\r\n"
       "X-LTS-Nonce: " + nonce + "\r\n"
+      "X-LTS-Route-Identity: " + route_identity + "\r\n"
       "X-LTS-Signature: " + signature + "\r\n";
    char request_body[];
    ArrayResize(request_body, 0);

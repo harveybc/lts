@@ -61,6 +61,7 @@ class Mt5ExecutionConfig:
     stale_heartbeat_seconds: int
     account_fingerprint: str
     allowed_symbols: tuple[str, ...]
+    symbol_magics: dict[str, int]
     max_volume: float
     max_open_commands_per_day: int
     delivery_retry_seconds: int
@@ -81,6 +82,29 @@ class Mt5ExecutionConfig:
         symbols = tuple(sorted({str(v).upper() for v in data.get("allowed_symbols", [])}))
         if not symbols or any(not _SYMBOL_RE.fullmatch(value) for value in symbols):
             raise Mt5BridgeError("allowed_symbols must contain strict MT5 symbols")
+        # AUD-F2-20260823-301/304: a multi-symbol mandate DECLARES each
+        # chart EA's magic; missing or duplicate values refuse — magic
+        # is never guessed or defaulted in validation.
+        raw_magics = data.get("symbol_magics") or {}
+        magics = {}
+        for key, value in raw_magics.items():
+            symbol = str(key).upper()
+            if symbol not in symbols:
+                raise Mt5BridgeError(
+                    f"symbol_magics declares unknown symbol {symbol}")
+            if isinstance(value, bool) or not isinstance(value, int)                     or value <= 0:
+                raise Mt5BridgeError(
+                    f"symbol_magics[{symbol}] must be a positive int")
+            magics[symbol] = value
+        if len(symbols) > 1:
+            missing = [s_ for s_ in symbols if s_ not in magics]
+            if missing:
+                raise Mt5BridgeError(
+                    f"multi-symbol mandate requires symbol_magics for "
+                    f"{missing}")
+            if len(set(magics.values())) != len(magics):
+                raise Mt5BridgeError(
+                    "symbol_magics values must be unique per chart")
         max_volume = float(data.get("max_volume", 0))
         budget = int(data.get("max_open_commands_per_day", 0))
         if not 0 < max_volume <= 1.0 or not 1 <= budget <= 24:
@@ -103,6 +127,7 @@ class Mt5ExecutionConfig:
             stale_heartbeat_seconds=max(30, int(data.get("stale_heartbeat_seconds", 180))),
             account_fingerprint=fingerprint,
             allowed_symbols=symbols,
+            symbol_magics=magics,
             max_volume=max_volume,
             max_open_commands_per_day=budget,
             delivery_retry_seconds=max(5, int(data.get("delivery_retry_seconds", 30))),
@@ -428,18 +453,64 @@ def create_mt5_execution_app(
         nonce_retention_seconds=config.nonce_retention_seconds,
     )
 
-    async def authenticate(request: Request) -> str:
+    async def authenticate(request: Request) -> tuple[str, str]:
         body = await request.body()
         nonce = request.headers.get("X-LTS-Nonce", "")
+        route_identity = request.headers.get("X-LTS-Route-Identity", "")
         try:
             authenticator.verify(
                 request.method, request.url.path,
                 request.headers.get("X-LTS-Timestamp", ""), nonce,
                 request.headers.get("X-LTS-Signature", ""), body,
+                route_identity=route_identity,
             )
         except Mt5BridgeError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
-        return nonce
+        return nonce, route_identity
+
+    def parse_route_identity(route_identity: str) -> dict[str, Any]:
+        """AUD-F2-20260823-301: 'v2|<account>|<symbol>|<magic>'. The
+        signature already covers this string; parsing binds it to the
+        actual route. A multi-symbol mandate REQUIRES it."""
+        if not route_identity:
+            if len(config.allowed_symbols) > 1:
+                raise HTTPException(
+                    status_code=401,
+                    detail="multi-symbol mandate requires a signed "
+                           "route identity")
+            return {}
+        parts = route_identity.split("|")
+        if len(parts) != 4 or parts[0] != "v2":
+            raise HTTPException(status_code=401,
+                                detail="malformed route identity")
+        account, symbol, magic_raw = (parts[1].lower(),
+                                      parts[2].upper(), parts[3])
+        if account != config.account_fingerprint:
+            raise HTTPException(status_code=403,
+                                detail="route identity account mismatch")
+        if symbol not in config.allowed_symbols:
+            raise HTTPException(status_code=403,
+                                detail="route identity symbol outside "
+                                       "the mandate")
+        try:
+            magic = int(magic_raw)
+        except ValueError:
+            raise HTTPException(status_code=401,
+                                detail="malformed route identity magic")
+        expected = config.symbol_magics.get(symbol)
+        if expected is not None and magic != expected:
+            raise HTTPException(
+                status_code=403,
+                detail="route identity magic does not match the "
+                       "declared chart magic")
+        return {"account": account, "symbol": symbol, "magic": magic}
+
+    def refuse_duplicate_query_keys(request: Request) -> None:
+        raw = request.url.query or ""
+        keys = [pair.split("=", 1)[0] for pair in raw.split("&") if pair]
+        if len(keys) != len(set(keys)):
+            raise HTTPException(status_code=400,
+                                detail="duplicate query keys refused")
 
     def account_allowed(fingerprint: str) -> None:
         if fingerprint.lower() != config.account_fingerprint:
@@ -494,8 +565,21 @@ def create_mt5_execution_app(
     async def next_command(
         request: Request, account_fingerprint: str, symbol: str = ""
     ):
-        nonce = await authenticate(request)
+        nonce, route_identity = await authenticate(request)
+        refuse_duplicate_query_keys(request)
+        identity = parse_route_identity(route_identity)
         account_allowed(account_fingerprint)
+        if identity:
+            if identity["account"] != account_fingerprint.lower():
+                raise HTTPException(
+                    status_code=403,
+                    detail="signed route identity does not match the "
+                           "query account (post-signing mutation)")
+            if symbol and identity["symbol"] != symbol.strip().upper():
+                raise HTTPException(
+                    status_code=403,
+                    detail="signed route identity does not match the "
+                           "query symbol (post-signing mutation)")
         # Dual-symbol order 2026-08-23: delivery is symbol-scoped. A
         # multi-symbol mandate REQUIRES the polling EA to declare its
         # chart symbol; a single-symbol mandate resolves an absent
@@ -529,7 +613,20 @@ def create_mt5_execution_app(
 
     @app.post("/v2/commands/result")
     async def command_result(payload: ExecutionResultPayload, request: Request):
-        await authenticate(request)
+        _nonce, route_identity = await authenticate(request)
+        identity = parse_route_identity(route_identity)
+        if identity:
+            with store._lock:
+                row = store.connection.execute(
+                    "SELECT symbol FROM execution_commands WHERE "
+                    "command_id=?", (payload.command_id,),
+                ).fetchone()
+            if row is not None and str(row[0]).upper() != (
+                    identity["symbol"]):
+                raise HTTPException(
+                    status_code=403,
+                    detail="an EA may only acknowledge or fail "
+                           "commands for its own signed route symbol")
         account_allowed(payload.account_fingerprint)
         if payload.schema_name != RESULT_SCHEMA:
             raise HTTPException(status_code=422, detail="Invalid result schema")

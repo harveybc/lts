@@ -66,15 +66,21 @@ def check_profile(profile: dict) -> dict:
 
 
 def check_magic_unique(profile: dict, others: list[dict]) -> None:
+    """AUD-F2-20260823-304: every compared profile DECLARES its
+    positive magic; a missing value REFUSES — validation never
+    supplies a default that could conceal drift in the installed EA."""
     mine = profile.get("ea_magic")
     for other in others:
-        theirs = other.get("ea_magic", 26080301 if (
-            (other.get("route") or {}).get("symbol") == "ETHUSD")
-            else None)
-        if theirs is not None and theirs == mine:
+        symbol = (other.get("route") or {}).get("symbol")
+        theirs = other.get("ea_magic")
+        if not isinstance(theirs, int) or isinstance(theirs, bool)                 or theirs <= 0:
             raise CompatRefused(
-                f"ea_magic {mine} collides with the "
-                f"{(other.get('route') or {}).get('symbol')} profile; "
+                f"profile for {symbol!r} does not declare a positive "
+                "ea_magic; uniqueness cannot be proven — refused "
+                "(no defaults in validation)")
+        if theirs == mine:
+            raise CompatRefused(
+                f"ea_magic {mine} collides with the {symbol} profile; "
                 "mixed magic numbers refuse")
 
 

@@ -62,8 +62,15 @@ class TestProfileChecks:
         with pytest.raises(tool.CompatRefused, match="ea_magic"):
             tool.check_profile(_profile(ea_magic=None))
 
-    def test_magic_collision_with_ethusd_default_refuses(self, tool):
-        eth = {"route": {"symbol": "ETHUSD"}}  # EA default 26080301
+    def test_missing_magic_in_compared_profile_refuses(self, tool):
+        """304: no defaults in validation — an undeclared magic
+        REFUSES instead of being guessed."""
+        eth = {"route": {"symbol": "ETHUSD"}}
+        with pytest.raises(tool.CompatRefused, match="declare"):
+            tool.check_magic_unique(_profile(), [eth])
+
+    def test_magic_collision_refuses(self, tool):
+        eth = {"route": {"symbol": "ETHUSD"}, "ea_magic": 26080301}
         tool.check_magic_unique(_profile(), [eth])
         with pytest.raises(tool.CompatRefused, match="collides"):
             tool.check_magic_unique(

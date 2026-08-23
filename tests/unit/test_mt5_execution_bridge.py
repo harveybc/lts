@@ -70,6 +70,7 @@ def _config(tmp_path):
         bind_host="127.0.0.1", port=8766, max_clock_skew_seconds=90,
         nonce_retention_seconds=900, stale_heartbeat_seconds=180,
         account_fingerprint=ACCOUNT, allowed_symbols=("USDCAD",),
+        symbol_magics={"USDCAD": 26080302},
         max_volume=0.01, max_open_commands_per_day=2,
         delivery_retry_seconds=30,
     )
@@ -284,6 +285,7 @@ def _dual_config(tmp_path):
         nonce_retention_seconds=900, stale_heartbeat_seconds=180,
         account_fingerprint=ACCOUNT,
         allowed_symbols=("ETHUSD", "USDCAD"),
+        symbol_magics={"ETHUSD": 26080301, "USDCAD": 26080302},
         max_volume=0.01, max_open_commands_per_day=4,
         delivery_retry_seconds=30,
     )
@@ -304,28 +306,47 @@ def test_cross_symbol_command_theft_is_impossible(tmp_path):
         ACCOUNT, retry_seconds=30, symbol="USDCAD") is None
 
 
+def _route(symbol, magic=None):
+    magics = {"ETHUSD": 26080301, "USDCAD": 26080302}
+    return f"v2|{ACCOUNT}|{symbol}|{magic or magics[symbol]}"
+
+
 def test_multi_symbol_poll_requires_chart_symbol(tmp_path):
     config = _dual_config(tmp_path)
     store = Mt5ExecutionStore(config.database_path)
     client = TestClient(create_mt5_execution_app(config, store, SECRET))
     path = "/v2/commands/next"
-    resp = client.get(
-        path, params={"account_fingerprint": ACCOUNT},
-        headers=create_signed_headers(SECRET, "GET", path,
-                                      nonce="dual-nonce-0001"))
-    assert resp.status_code == 400
-    resp = client.get(
-        path, params={"account_fingerprint": ACCOUNT,
-                      "symbol": "EURUSD"},
-        headers=create_signed_headers(SECRET, "GET", path,
-                                      nonce="dual-nonce-0002"))
-    assert resp.status_code == 403
+    # 301: no signed route identity at all -> 401 for a multi-symbol
+    # mandate, before any queue read
     resp = client.get(
         path, params={"account_fingerprint": ACCOUNT,
                       "symbol": "USDCAD"},
         headers=create_signed_headers(SECRET, "GET", path,
-                                      nonce="dual-nonce-0003"))
-    assert resp.status_code == 204  # empty queue, correctly scoped
+                                      nonce="dual-nonce-0001"))
+    assert resp.status_code == 401
+    # identity present but query symbol missing -> 400
+    resp = client.get(
+        path, params={"account_fingerprint": ACCOUNT},
+        headers=create_signed_headers(
+            SECRET, "GET", path, nonce="dual-nonce-0002",
+            route_identity=_route("USDCAD")))
+    assert resp.status_code == 400
+    # identity/query symbol mismatch (post-signing mutation) -> 403
+    resp = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "ETHUSD"},
+        headers=create_signed_headers(
+            SECRET, "GET", path, nonce="dual-nonce-0003",
+            route_identity=_route("USDCAD")))
+    assert resp.status_code == 403
+    # correct binding -> scoped empty queue
+    resp = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "USDCAD"},
+        headers=create_signed_headers(
+            SECRET, "GET", path, nonce="dual-nonce-0004",
+            route_identity=_route("USDCAD")))
+    assert resp.status_code == 204
 
 
 def test_single_symbol_mandate_resolves_absent_symbol(tmp_path):
@@ -361,8 +382,9 @@ def test_nonce_replay_across_ea_clients_is_refused(tmp_path):
     store = Mt5ExecutionStore(config.database_path)
     client = TestClient(create_mt5_execution_app(config, store, SECRET))
     path = "/v2/commands/next"
-    headers = create_signed_headers(SECRET, "GET", path,
-                                    nonce="replayed-nonce-0001")
+    headers = create_signed_headers(
+        SECRET, "GET", path, nonce="replayed-nonce-0001",
+        route_identity=_route("ETHUSD"))
     first = client.get(
         path, params={"account_fingerprint": ACCOUNT,
                       "symbol": "ETHUSD"}, headers=headers)
@@ -444,3 +466,125 @@ def test_ea_source_declares_symbol_and_refuses_wrong_chart():
     assert '+ "&symbol=" + Symbol();' in source
     assert "wrong_symbol_for_this_chart" in source
     assert "PositionGetInteger(POSITION_MAGIC) == InpMagic" in source
+
+
+
+# --- AUD-F2-20260823-301/304: authenticated route identity ----------
+
+
+def test_query_mutation_after_signing_is_refused(tmp_path):
+    """The exact counterexample: a request signed for an ETH poll,
+    query rewritten to USDCAD after signing."""
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    _enqueue(store, config, symbol="USDCAD")
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    path = "/v2/commands/next"
+    headers = create_signed_headers(
+        SECRET, "GET", path, nonce="mutate-nonce-0001",
+        route_identity=_route("ETHUSD"))
+    resp = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "USDCAD"},   # mutated after signing
+        headers=headers)
+    assert resp.status_code == 403
+    assert store.command_counts().get("pending") == 1  # untouched
+
+
+def test_tampered_route_identity_invalidates_signature(tmp_path):
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    path = "/v2/commands/next"
+    headers = create_signed_headers(
+        SECRET, "GET", path, nonce="tamper-nonce-0001",
+        route_identity=_route("ETHUSD"))
+    headers["X-LTS-Route-Identity"] = _route("USDCAD")
+    resp = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "USDCAD"}, headers=headers)
+    assert resp.status_code == 401  # signature no longer matches
+
+
+def test_wrong_magic_is_refused(tmp_path):
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    path = "/v2/commands/next"
+    resp = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "USDCAD"},
+        headers=create_signed_headers(
+            SECRET, "GET", path, nonce="magic-nonce-0001",
+            route_identity=_route("USDCAD", magic=99999)))
+    assert resp.status_code == 403
+
+
+def test_duplicate_query_keys_refused(tmp_path):
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    path = "/v2/commands/next"
+    headers = create_signed_headers(
+        SECRET, "GET", path, nonce="dup-nonce-0001",
+        route_identity=_route("USDCAD"))
+    resp = client.get(
+        path + f"?account_fingerprint={ACCOUNT}&symbol=USDCAD"
+        "&symbol=ETHUSD", headers=headers)
+    assert resp.status_code == 400
+
+
+def test_cross_client_ack_is_refused(tmp_path):
+    """An ETH chart EA cannot acknowledge or fail a USDCAD command."""
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    command = _enqueue(store, config, symbol="USDCAD")
+    store.next_command(ACCOUNT, retry_seconds=30, symbol="USDCAD")
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    payload = {
+        "schema": "lts.mt5.execution_result.v1",
+        "command_id": command["command_id"],
+        "account_fingerprint": ACCOUNT, "success": False,
+        "result_code": 10013, "order_ticket": "", "deal_ticket": "",
+        "message": "stolen-ack",
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    resp = client.post(
+        "/v2/commands/result", content=body,
+        headers={"Content-Type": "application/json",
+                 **create_signed_headers(
+                     SECRET, "POST", "/v2/commands/result", body,
+                     nonce="ack-nonce-0001",
+                     route_identity=_route("ETHUSD"))})
+    assert resp.status_code == 403
+    assert store.command_counts().get("delivered") == 1  # not failed
+
+
+def test_missing_symbol_magics_for_multi_symbol_refuses(tmp_path):
+    import dataclasses
+    with pytest.raises(Mt5BridgeError, match="symbol_magics"):
+        Mt5ExecutionConfig.load(_write_config(
+            tmp_path, allowed_symbols=["ETHUSD", "USDCAD"],
+            symbol_magics={"ETHUSD": 26080301}))
+
+
+def test_duplicate_magic_values_refuse(tmp_path):
+    with pytest.raises(Mt5BridgeError, match="unique"):
+        Mt5ExecutionConfig.load(_write_config(
+            tmp_path, allowed_symbols=["ETHUSD", "USDCAD"],
+            symbol_magics={"ETHUSD": 26080301, "USDCAD": 26080301}))
+
+
+def _write_config(tmp_path, **over):
+    doc = {"schema": "lts.mt5.execution_bridge_config.v2",
+           "environment": "demo", "execution_enabled": True,
+           "account_fingerprint": ACCOUNT,
+           "allowed_symbols": ["USDCAD"],
+           "max_volume": 0.01, "max_open_commands_per_day": 2,
+           "secret_env": "SECRET",
+           "database_path": str(tmp_path / "db.sqlite")}
+    doc.update(over)
+    path = tmp_path / "bridge.json"
+    path.write_text(json.dumps(doc))
+    return path

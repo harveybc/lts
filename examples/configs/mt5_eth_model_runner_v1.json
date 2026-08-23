@@ -7,8 +7,14 @@
     "expected_timeframe": "4h",
     "execution_tier": "demo_research_canary"
   },
-  "route": {"symbol": "ETHUSD", "timeframe": "4h"},
-  "strategy": {"stop_fraction": 0.01, "take_profit_fraction": 0.02},
+  "route": {
+    "symbol": "ETHUSD",
+    "timeframe": "4h"
+  },
+  "strategy": {
+    "stop_fraction": 0.01,
+    "take_profit_fraction": 0.02
+  },
   "snapshot_max_age_seconds": 120,
   "loop_seconds": 15,
   "heartbeat_path": "~/.local/state/lts/mt5-model-runner-heartbeat.json",
@@ -17,15 +23,20 @@
     "account_fingerprint": "c88e492afa0f8d66a3643373",
     "environment": "demo",
     "database_path": "~/.local/state/lts/mt5-bridge.sqlite",
-    "risk_fraction_at_stop": 0.00002,
+    "risk_fraction_at_stop": 2e-05,
     "max_overshoot_ratio": 0.5,
     "gross_notional_fraction_max": 0.003,
     "margin_fraction_max": 0.003,
-    "daily_loss_budget_fraction": 0.00008,
+    "daily_loss_budget_fraction": 8e-05,
     "max_concurrent_positions": 1,
     "signal_max_age_seconds": 28800,
-    "owner_issuer_allowlist": ["harvey-owner"],
+    "owner_issuer_allowlist": [
+      "harvey-owner"
+    ],
     "command_phrases": {},
-    "asset_instrument_bindings": {"crypto:ETHUSD": "ETHUSD"}
-  }
+    "asset_instrument_bindings": {
+      "crypto:ETHUSD": "ETHUSD"
+    }
+  },
+  "ea_magic": 26080301
 }

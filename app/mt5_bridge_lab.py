@@ -673,11 +673,18 @@ class Mt5RequestAuthenticator:
         timestamp: str,
         nonce: str,
         body: bytes,
+        route_identity: str = "",
     ) -> bytes:
+        """AUD-F2-20260823-301: an authenticated route identity
+        (account, symbol, EA magic, protocol version) binds into the
+        signature as a sixth canonical line when present. The empty
+        default preserves the legacy five-line framing byte-for-byte
+        for single-symbol deployments until their coordinated update."""
         body_hash = hashlib.sha256(body).hexdigest()
-        return "\n".join(
-            (method.upper(), path, timestamp, nonce, body_hash)
-        ).encode("utf-8")
+        parts = [method.upper(), path, timestamp, nonce, body_hash]
+        if route_identity:
+            parts.append(route_identity)
+        return "\n".join(parts).encode("utf-8")
 
     def signature(
         self,
@@ -686,8 +693,10 @@ class Mt5RequestAuthenticator:
         timestamp: str,
         nonce: str,
         body: bytes,
+        route_identity: str = "",
     ) -> str:
-        canonical = self.canonical_request(method, path, timestamp, nonce, body)
+        canonical = self.canonical_request(
+            method, path, timestamp, nonce, body, route_identity)
         return hmac.new(self.secret, canonical, hashlib.sha256).hexdigest()
 
     def verify(
@@ -699,6 +708,7 @@ class Mt5RequestAuthenticator:
         signature: str,
         body: bytes,
         *,
+        route_identity: str = "",
         now: Optional[int] = None,
     ) -> None:
         if not timestamp or not nonce or not signature:
@@ -712,7 +722,8 @@ class Mt5RequestAuthenticator:
         current = int(time.time()) if now is None else int(now)
         if abs(current - request_time) > self.max_clock_skew_seconds:
             raise Mt5BridgeError("Bridge request timestamp is outside the allowed skew")
-        expected = self.signature(method, path, timestamp, nonce, body)
+        expected = self.signature(method, path, timestamp, nonce, body,
+                                  route_identity)
         if not hmac.compare_digest(expected, signature.lower()):
             raise Mt5BridgeError("Invalid bridge request signature")
         if not self.store.accept_nonce(
@@ -859,17 +870,22 @@ def create_signed_headers(
     *,
     timestamp: Optional[int] = None,
     nonce: Optional[str] = None,
+    route_identity: str = "",
 ) -> dict[str, str]:
     """Create test/client headers using the bridge's canonical signature."""
     stamp = str(int(time.time()) if timestamp is None else int(timestamp))
     request_nonce = nonce or secrets.token_hex(16)
     body_hash = hashlib.sha256(body).hexdigest()
-    canonical = "\n".join(
-        (method.upper(), path, stamp, request_nonce, body_hash)
-    ).encode("utf-8")
+    parts = [method.upper(), path, stamp, request_nonce, body_hash]
+    if route_identity:
+        parts.append(route_identity)
+    canonical = "\n".join(parts).encode("utf-8")
     signature = hmac.new(secret, canonical, hashlib.sha256).hexdigest()
-    return {
+    headers = {
         "X-LTS-Timestamp": stamp,
         "X-LTS-Nonce": request_nonce,
         "X-LTS-Signature": signature,
     }
+    if route_identity:
+        headers["X-LTS-Route-Identity"] = route_identity
+    return headers
