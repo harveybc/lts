@@ -10,7 +10,7 @@
   "nonce_retention_seconds": 900,
   "stale_heartbeat_seconds": 180,
   "delivery_retry_seconds": 30,
-  "account_fingerprint": "c88e492afa0f8d66a3643373",
+  "account_fingerprint": "<ACCOUNT_FINGERPRINT_24HEX>",
   "allowed_symbols": ["ETHUSD"],
   "max_volume": 0.01,
   "max_open_commands_per_day": 4

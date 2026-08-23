@@ -41,6 +41,26 @@ from app.mt5_bridge_lab import (
 
 
 EXECUTION_BRIDGE_VERSION = "lts.mt5.bridge.execution.v2"
+
+# AUD-F2-20260823-306: DECLARED concurrent-position semantics for
+# dual-symbol Demo operation. This is intentional per-route
+# concurrency, not account-wide serialization:
+# - per symbol: at most ONE unresolved queue command and at most one
+#   open model position (each runner enforces max_concurrent_positions
+#   on its own route);
+# - account-wide: at most len(allowed_symbols) concurrent positions
+#   (one per route), bounded Demo volume each;
+# - the daily open-command budget is ACCOUNT-WIDE at this bridge and
+#   is shared by both symbols by design (a busy ETH day reduces the
+#   USDCAD entry budget — conservative and intentional);
+# - one route's failures never block the other's queue.
+DECLARED_CONCURRENCY = {
+    "per_symbol_unresolved_commands": 1,
+    "per_symbol_open_positions": 1,
+    "account_wide_positions": "one_per_allowed_symbol",
+    "daily_open_budget_scope": "account_wide_shared",
+    "failure_isolation": "per_symbol",
+}
 COMMAND_SCHEMA = "lts.mt5.execution_command.v1"
 RESULT_SCHEMA = "lts.mt5.execution_result.v1"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -62,6 +82,7 @@ class Mt5ExecutionConfig:
     account_fingerprint: str
     allowed_symbols: tuple[str, ...]
     symbol_magics: dict[str, int]
+    require_route_identity: bool
     max_volume: float
     max_open_commands_per_day: int
     delivery_retry_seconds: int
@@ -115,6 +136,7 @@ class Mt5ExecutionConfig:
         port = int(data.get("port", 8766))
         if not 1024 <= port <= 65535:
             raise Mt5BridgeError("MT5 bridge port must be between 1024 and 65535")
+        require_route = bool(data.get("require_route_identity", False))
         return cls(
             database_path=_expand_path(str(data.get(
                 "database_path", "~/.local/state/lts/mt5-bridge.sqlite"
@@ -128,6 +150,7 @@ class Mt5ExecutionConfig:
             account_fingerprint=fingerprint,
             allowed_symbols=symbols,
             symbol_magics=magics,
+            require_route_identity=require_route,
             max_volume=max_volume,
             max_open_commands_per_day=budget,
             delivery_retry_seconds=max(5, int(data.get("delivery_retry_seconds", 30))),
@@ -457,6 +480,18 @@ def create_mt5_execution_app(
         body = await request.body()
         nonce = request.headers.get("X-LTS-Nonce", "")
         route_identity = request.headers.get("X-LTS-Route-Identity", "")
+        # Practical order item 5 (2026-08-23): the EXPLICIT retirement
+        # switch for the legacy five-line HMAC. Once both chart EAs
+        # sign the route identity, the operator sets
+        # require_route_identity=true and the legacy framing is dead
+        # on EVERY signed endpoint — permanently; a later release
+        # deletes the optional path outright.
+        if config.require_route_identity and not route_identity:
+            raise HTTPException(
+                status_code=401,
+                detail="legacy unbound-route signatures are retired "
+                       "on this bridge; a signed route identity is "
+                       "required")
         try:
             authenticator.verify(
                 request.method, request.url.path,
@@ -532,6 +567,7 @@ def create_mt5_execution_app(
         result["execution_enabled"] = True
         result["command_counts"] = store.command_counts()
         result["exposure_reconciliation"] = store.exposure_reconciliation()
+        result["declared_concurrency"] = DECLARED_CONCURRENCY
         return result
 
     @app.post("/v1/heartbeat")

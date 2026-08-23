@@ -1,0 +1,690 @@
+{
+ "schema": "lts.public_tree_identifier_scan.v1",
+ "scope": "current tips only; history rewriting requires a separate owner decision",
+ "values_redacted": true,
+ "findings": {
+  "lts": [
+   {
+    "file": "app/init_db.py",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "docs/MULTI_VENUE_PAPER_EXECUTION.md",
+    "category": "private_ip",
+    "count": 4
+   },
+   {
+    "file": "examples/configs/demo_execution_l0_v1.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/scripts/configure_mt5_bridge.sh",
+    "category": "private_ip",
+    "count": 1
+   },
+   {
+    "file": "examples/scripts/enable_dragon_remote_login.sh",
+    "category": "private_ip",
+    "count": 2
+   },
+   {
+    "file": "examples/scripts/enable_mt5_bridge_host_firewall.sh",
+    "category": "private_ip",
+    "count": 1
+   },
+   {
+    "file": "mt5/INSTALL_LTS_MT5_MODEL_BRIDGE.md",
+    "category": "private_ip",
+    "count": 2
+   },
+   {
+    "file": "mt5/MQL5/Experts/LtsMt5ModelBridge.mq5",
+    "category": "private_ip",
+    "count": 1
+   },
+   {
+    "file": "mt5/MQL5/Experts/LtsMt5ModelBridge.mq5",
+    "category": "hex64_token_like",
+    "count": 2
+   },
+   {
+    "file": "mt5/MQL5/Experts/LtsMt5ReadOnlyBridge.mq5",
+    "category": "private_ip",
+    "count": 1
+   },
+   {
+    "file": "mt5/MQL5/Experts/LtsMt5ReadOnlyBridge.mq5",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "requirements-ci.txt",
+    "category": "hex64_token_like",
+    "count": 151
+   },
+   {
+    "file": "setup.py",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "tests/acceptance/test_acceptance.py",
+    "category": "email",
+    "count": 7
+   },
+   {
+    "file": "tests/conftest.py",
+    "category": "email",
+    "count": 3
+   },
+   {
+    "file": "tests/integration/test_integration.py",
+    "category": "email",
+    "count": 2
+   },
+   {
+    "file": "tests/security/test_authentication.py",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "tests/security/test_input_validation.py",
+    "category": "email",
+    "count": 5
+   },
+   {
+    "file": "tests/security/test_rate_limiting.py",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "tests/test_web_ui.py",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "tests/unit/test_ibkr_paper_lab.py",
+    "category": "private_ip",
+    "count": 2
+   },
+   {
+    "file": "tests/unit/test_mt5_execution_bridge.py",
+    "category": "hex24_account_like",
+    "count": 1
+   },
+   {
+    "file": "tests/unit/test_mt5_lifecycle_reconcile.py",
+    "category": "hex24_account_like",
+    "count": 1
+   },
+   {
+    "file": "tests/unit/test_mt5_model_runner.py",
+    "category": "hex24_account_like",
+    "count": 2
+   },
+   {
+    "file": "tests/unit/test_unit_database.py",
+    "category": "email",
+    "count": 1
+   }
+  ],
+  "agent-multi": [
+   {
+    "file": "configs/manifests/project3_doin_shortlist_2026_07_10.json",
+    "category": "hex64_token_like",
+    "count": 3
+   },
+   {
+    "file": "docs/audits/evidence/MULTIFRONT_F1_L1_SAMPLE_2026_08_10.json",
+    "category": "email",
+    "count": 8
+   },
+   {
+    "file": "docs/audits/evidence/repro_runs/MUSASHI_L1_ROUND2_ACCEPTANCE_REPRO_2026_08_09.py",
+    "category": "email",
+    "count": 2
+   },
+   {
+    "file": "docs/environment/trading-stack-pip-lock-2026-07-11.txt",
+    "category": "private_ip",
+    "count": 2
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v2/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v3/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 6
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v3/dragon_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v3/gamma_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v3/omega_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v4/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v4/dragon_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v4/gamma_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v4/omega_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v5/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v5/dragon_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v5/gamma_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_asset_policy_fleet_v5/omega_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_full_genome_fleet_v1/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_full_genome_fleet_v1/dragon_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_full_genome_fleet_v1/gamma_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_full_genome_fleet_v1/omega_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_full_genome_to_curriculum_fleet_v1/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_full_genome_to_curriculum_fleet_v1/dragon_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_full_genome_to_curriculum_fleet_v1/gamma_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_full_genome_to_curriculum_fleet_v1/omega_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_protected_execution_fleet_v2/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_protected_execution_fleet_v2/dragon_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_protected_execution_fleet_v2/gamma_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_1_protected_execution_fleet_v2/omega_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_anchored_fleet_v1/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 2
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_anchored_fleet_v1/dragon_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_anchored_fleet_v1/gamma_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_anchored_fleet_v1/omega_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_anchored_full_fleet_v2/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_anchored_full_fleet_v2/dragon_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_anchored_full_fleet_v2/gamma_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_anchored_full_fleet_v2/omega_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_curriculum_fleet_v1/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 3
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_curriculum_fleet_v1/dragon_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_curriculum_fleet_v1/gamma_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_curriculum_fleet_v1/omega_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_smoke_v1/campaign_plan.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_smoke_v1/dragon_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_smoke_v1/gamma_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/phase_2_eth_smoke_v1/omega_profile.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/campaigns/rt1a_grid_plan.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/config/phase_1_asset_policy/optimization/phase_1_asset_policy_usdcad_4h_execution_curriculum_template_v1.json",
+    "category": "hex64_token_like",
+    "count": 3
+   },
+   {
+    "file": "examples/config/phase_1_asset_policy/optimization/phase_1_asset_policy_usdcad_4h_full_genome_smoke_v1.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/config/phase_1_asset_policy/optimization/phase_1_asset_policy_usdcad_4h_full_genome_v1.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/config/phase_1_asset_policy/optimization/phase_1_asset_policy_usdcad_4h_protected_curriculum_template_v2.json",
+    "category": "hex64_token_like",
+    "count": 3
+   },
+   {
+    "file": "examples/config/phase_1_asset_policy/optimization/phase_1_asset_policy_usdcad_4h_protected_easy_v2.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/config/phase_2_eth_anchored/optimization/phase_2_eth_anchored_full_v1.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/config/phase_2_eth_anchored/optimization/phase_2_eth_anchored_full_v2.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/config/phase_2_eth_anchored/optimization/phase_2_eth_anchored_smoke_v1.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/config/phase_2_eth_curriculum/optimization/phase_2_eth_en_smoke_v1.json",
+    "category": "hex64_token_like",
+    "count": 2
+   },
+   {
+    "file": "examples/config/phase_2_eth_curriculum/optimization/phase_2_eth_en_v1.json",
+    "category": "hex64_token_like",
+    "count": 2
+   },
+   {
+    "file": "examples/config/phase_2_eth_curriculum/optimization/phase_2_eth_en_v2.json",
+    "category": "hex64_token_like",
+    "count": 2
+   },
+   {
+    "file": "examples/config/phase_2_eth_curriculum/optimization/phase_2_eth_n_v1.json",
+    "category": "hex64_token_like",
+    "count": 2
+   },
+   {
+    "file": "examples/config/phase_2_eth_curriculum/optimization/phase_2_eth_n_v2.json",
+    "category": "hex64_token_like",
+    "count": 2
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/l1_factorial_contract_v3.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/l2_curriculum_arms_v1.json",
+    "category": "hex64_token_like",
+    "count": 7
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/m0_contract.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/m0_l1_mechanism_ladder_v1.json",
+    "category": "hex64_token_like",
+    "count": 11
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/m0x_usdcad_contract_M01.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/m0x_usdcad_contract_M03.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/m1_factorial_contract_M01.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/m1_factorial_contract_M03.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/p1_difficulty_lr_factorial_v1.json",
+    "category": "hex64_token_like",
+    "count": 9
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/p1_difficulty_lr_factorial_v2.json",
+    "category": "hex64_token_like",
+    "count": 14
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/splits/eth_nested_split_contract_v1.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/systems/ethusdt_4h_l1_system_v1.json",
+    "category": "hex64_token_like",
+    "count": 17
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/systems/ethusdt_4h_l1_system_v2.json",
+    "category": "hex64_token_like",
+    "count": 12
+   },
+   {
+    "file": "examples/config/phase_3_eth_sac_dynamics/systems/ethusdt_4h_l1_system_v3.json",
+    "category": "hex64_token_like",
+    "count": 12
+   },
+   {
+    "file": "examples/config/project3_phase4_ethusdt_4h_sac_arms/arm_a_real_only_standard.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/config/project3_phase4_ethusdt_4h_sac_arms/arm_b_real_only_compute_matched.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/config/project3_phase4_ethusdt_4h_sac_arms/arm_c_synthetic_only_diagnostic.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/config/project3_phase4_ethusdt_4h_sac_arms/arm_d_synthetic_pretrain_then_real_finetune.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/config/project3_phase4_ethusdt_4h_sac_arms/phase4_compare_manifest.json",
+    "category": "hex64_token_like",
+    "count": 2
+   },
+   {
+    "file": "examples/config/project3_phase4_ethusdt_4h_sac_arms/phase4_compare_manifest.md",
+    "category": "hex64_token_like",
+    "count": 2
+   },
+   {
+    "file": "examples/data/phase_1_asset_policy/adausdt_1h_kitchen_sink_guarded_dataset_manifest.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/data/phase_1_asset_policy/btcusdt_1h_kitchen_sink_guarded_dataset_manifest.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/data/phase_1_asset_policy/dogeusdt_4h_kitchen_sink_guarded_dataset_manifest.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/data/phase_1_asset_policy/eurusd_4h_fx_full_dataset_manifest.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/data/phase_1_asset_policy/solusdt_1h_tech_stat_decomp_dataset_manifest.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/data/phase_1_asset_policy/solusdt_4h_dataset_manifest.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/models/eth_4h_sac_current_stack_anchor_v1.manifest.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/models/eth_4h_sac_current_stack_anchor_v1.zip",
+    "category": "email",
+    "count": 22
+   },
+   {
+    "file": "examples/results/eth_curriculum_fixture_v2/README.md",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "examples/results/eth_curriculum_fixture_v2/fixture_manifest.json",
+    "category": "hex64_token_like",
+    "count": 5
+   },
+   {
+    "file": "examples/results/eth_curriculum_fixture_v2/fixture_report.json",
+    "category": "hex64_token_like",
+    "count": 4
+   },
+   {
+    "file": "examples/results/phase_1_asset_policy/solusdt_4h_promotion_candidates.json",
+    "category": "hex64_token_like",
+    "count": 13
+   },
+   {
+    "file": "examples/results/phase_1_asset_policy/solusdt_4h_shared_v2_promotion_candidates.json",
+    "category": "hex64_token_like",
+    "count": 5
+   },
+   {
+    "file": "examples/systemd/l1-factorial@.service",
+    "category": "email",
+    "count": 2
+   },
+   {
+    "file": "examples/systemd/p1lr-decision@.service",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "examples/systemd/p1lr-screen@.service",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "knowledge/okf/MANIFEST.sha256",
+    "category": "hex64_token_like",
+    "count": 9
+   },
+   {
+    "file": "records/project3_terminal_record.json",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "requirements-ci.txt",
+    "category": "hex64_token_like",
+    "count": 69
+   },
+   {
+    "file": "setup.py",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "tests/test_l1_launcher_exit_contract.py",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "tests/test_p1lr_idle_guard.py",
+    "category": "email",
+    "count": 11
+   },
+   {
+    "file": "tests/unit/test_audit_snapshot_collector.py",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "tests/unit/test_multifront_l1_factorial.py",
+    "category": "email",
+    "count": 4
+   },
+   {
+    "file": "tests/unit/test_prepush_sensitivity_gate.py",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "tests/unit/test_prepush_sensitivity_gate.py",
+    "category": "private_ip",
+    "count": 2
+   },
+   {
+    "file": "tests/unit/test_runtime_overlay.py",
+    "category": "email",
+    "count": 1
+   },
+   {
+    "file": "tooling/requirements-tooling.lock",
+    "category": "hex64_token_like",
+    "count": 1
+   },
+   {
+    "file": "tools/ENGINEERING_SURFACE_INDEX.json",
+    "category": "hex64_token_like",
+    "count": 98
+   },
+   {
+    "file": "tools/eth_sac_training_diagnostics.py",
+    "category": "hex64_token_like",
+    "count": 2
+   },
+   {
+    "file": "tools/m0_l1_boundary_action_replay.py",
+    "category": "hex64_token_like",
+    "count": 1
+   }
+  ]
+ },
+ "totals": {
+  "lts": 25,
+  "agent-multi": 110
+ }
+}

@@ -20,7 +20,7 @@
   "heartbeat_path": "~/.local/state/lts/mt5-model-runner-heartbeat.json",
   "service": {
     "venue": "mt5_demo",
-    "account_fingerprint": "c88e492afa0f8d66a3643373",
+    "account_fingerprint": "<ACCOUNT_FINGERPRINT_24HEX>",
     "environment": "demo",
     "database_path": "~/.local/state/lts/mt5-bridge.sqlite",
     "risk_fraction_at_stop": 2e-05,

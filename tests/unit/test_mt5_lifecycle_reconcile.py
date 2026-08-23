@@ -13,7 +13,7 @@ from app.ibkr_l1_journal import L1ExecutionOlap
 from app.mt5_model_runner import reconcile_completed_lifecycles
 
 NOW = datetime(2026, 8, 5, 3, 0, 0, tzinfo=timezone.utc)
-FP = "c88e492afa0f8d66a3643373"
+FP = "feedfacefeedfacefeedface"
 KEY = "ethusdt-4h-linear-live-v1:2026-08-03T17:00:00Z:2026-08-03T21:00:00+00:00"
 PRODUCER = {"name": "lts.mt5_model_runner", "version": "0.1.0"}
 

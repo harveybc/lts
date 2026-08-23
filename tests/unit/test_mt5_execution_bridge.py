@@ -71,6 +71,7 @@ def _config(tmp_path):
         nonce_retention_seconds=900, stale_heartbeat_seconds=180,
         account_fingerprint=ACCOUNT, allowed_symbols=("USDCAD",),
         symbol_magics={"USDCAD": 26080302},
+        require_route_identity=False,
         max_volume=0.01, max_open_commands_per_day=2,
         delivery_retry_seconds=30,
     )
@@ -286,6 +287,7 @@ def _dual_config(tmp_path):
         account_fingerprint=ACCOUNT,
         allowed_symbols=("ETHUSD", "USDCAD"),
         symbol_magics={"ETHUSD": 26080301, "USDCAD": 26080302},
+        require_route_identity=False,
         max_volume=0.01, max_open_commands_per_day=4,
         delivery_retry_seconds=30,
     )
@@ -588,3 +590,129 @@ def _write_config(tmp_path, **over):
     path = tmp_path / "bridge.json"
     path.write_text(json.dumps(doc))
     return path
+
+
+# --- AUD-F2-20260823-306: declared simultaneous-route semantics ------
+
+
+def test_simultaneous_open_both_symbols_is_per_route_concurrency(
+        tmp_path):
+    """The declared policy is intentional per-route concurrency: both
+    symbols can hold one unresolved/open each, at the same time."""
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    eth = _enqueue(store, config, idempotency_key="eth:o",
+                   symbol="ETHUSD", model_id="eth-model-v1")
+    cad = _enqueue(store, config, idempotency_key="cad:o",
+                   symbol="USDCAD", model_id="usdcad-model-v1")
+    d_eth = store.next_command(ACCOUNT, retry_seconds=30,
+                               symbol="ETHUSD")
+    d_cad = store.next_command(ACCOUNT, retry_seconds=30,
+                               symbol="USDCAD")
+    assert d_eth["command_id"] == eth["command_id"]
+    assert d_cad["command_id"] == cad["command_id"]
+
+
+def test_one_route_held_while_other_signals(tmp_path):
+    """An unresolved USDCAD command blocks ONLY USDCAD; a fresh ETH
+    signal still enqueues and delivers."""
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    _enqueue(store, config, idempotency_key="cad:o", symbol="USDCAD")
+    with pytest.raises(Mt5BridgeError, match="unresolved"):
+        _enqueue(store, config, idempotency_key="cad:o2",
+                 symbol="USDCAD")
+    eth = _enqueue(store, config, idempotency_key="eth:o",
+                   symbol="ETHUSD", model_id="eth-model-v1")
+    assert store.next_command(
+        ACCOUNT, retry_seconds=30,
+        symbol="ETHUSD")["command_id"] == eth["command_id"]
+
+
+def test_daily_open_budget_is_account_wide_shared(tmp_path):
+    """DECLARED: the daily entry budget is shared across symbols — a
+    busy ETH day reduces the USDCAD budget, intentionally."""
+    config = Mt5ExecutionConfig(
+        database_path=tmp_path / "mt5.sqlite", secret_env="SECRET",
+        bind_host="127.0.0.1", port=8766, max_clock_skew_seconds=90,
+        nonce_retention_seconds=900, stale_heartbeat_seconds=180,
+        account_fingerprint=ACCOUNT,
+        allowed_symbols=("ETHUSD", "USDCAD"),
+        symbol_magics={"ETHUSD": 26080301, "USDCAD": 26080302},
+        require_route_identity=False,
+        max_volume=0.01, max_open_commands_per_day=2,
+        delivery_retry_seconds=30,
+    )
+    store = Mt5ExecutionStore(config.database_path)
+
+    def _resolve(cmd):
+        store.next_command(ACCOUNT, retry_seconds=30,
+                           symbol=cmd["symbol"])
+        observed = datetime.now(timezone.utc).isoformat()
+        store.complete(ExecutionResultPayload.model_validate(dict(
+            schema="lts.mt5.execution_result.v1",
+            command_id=cmd["command_id"],
+            account_fingerprint=ACCOUNT, success=True,
+            result_code=10009, order_ticket="1", deal_ticket="2",
+            message="ok", observed_at=observed)))
+
+    _resolve(_enqueue(store, config, idempotency_key="eth:1",
+                      symbol="ETHUSD", model_id="eth-model-v1"))
+    _resolve(_enqueue(store, config, idempotency_key="cad:1",
+                      symbol="USDCAD"))
+    with pytest.raises(Mt5BridgeError, match="budget"):
+        _enqueue(store, config, idempotency_key="cad:2",
+                 symbol="USDCAD")
+
+
+def test_simultaneous_close_both_symbols(tmp_path):
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    for symbol, model in (("ETHUSD", "eth-model-v1"),
+                          ("USDCAD", "usdcad-model-v1")):
+        close = _enqueue(store, config,
+                         idempotency_key=f"{symbol}:close",
+                         symbol=symbol, model_id=model,
+                         action="close", volume=0, stop_loss=0,
+                         take_profit=0)
+        delivered = store.next_command(ACCOUNT, retry_seconds=30,
+                                       symbol=symbol)
+        assert delivered["command_id"] == close["command_id"]
+
+
+def test_status_reports_declared_concurrency(tmp_path):
+    from app.mt5_execution_bridge import DECLARED_CONCURRENCY
+    config = _dual_config(tmp_path)
+    store = Mt5ExecutionStore(config.database_path)
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    body = client.get("/v1/status").json()
+    assert body["declared_concurrency"] == DECLARED_CONCURRENCY
+    assert body["declared_concurrency"][
+        "daily_open_budget_scope"] == "account_wide_shared"
+
+
+
+def test_legacy_hmac_retirement_switch(tmp_path):
+    """Item 5 (2026-08-23): with require_route_identity=true the
+    legacy five-line framing is permanently refused on every signed
+    endpoint; identity-bound requests keep working."""
+    import dataclasses
+    config = dataclasses.replace(_dual_config(tmp_path),
+                                 require_route_identity=True)
+    store = Mt5ExecutionStore(config.database_path)
+    client = TestClient(create_mt5_execution_app(config, store, SECRET))
+    path = "/v2/commands/next"
+    legacy = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "USDCAD"},
+        headers=create_signed_headers(SECRET, "GET", path,
+                                      nonce="retire-nonce-0001"))
+    assert legacy.status_code == 401
+    assert "retired" in legacy.json()["detail"]
+    bound = client.get(
+        path, params={"account_fingerprint": ACCOUNT,
+                      "symbol": "USDCAD"},
+        headers=create_signed_headers(
+            SECRET, "GET", path, nonce="retire-nonce-0002",
+            route_identity=_route("USDCAD")))
+    assert bound.status_code == 204
