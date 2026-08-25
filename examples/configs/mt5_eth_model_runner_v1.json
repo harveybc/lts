@@ -27,7 +27,7 @@
     "max_overshoot_ratio": 0.5,
     "gross_notional_fraction_max": 0.003,
     "margin_fraction_max": 0.003,
-    "daily_loss_budget_fraction": 8e-05,
+    "daily_loss_budget_fraction": 0.0002,
     "max_concurrent_positions": 1,
     "signal_max_age_seconds": 28800,
     "owner_issuer_allowlist": [
