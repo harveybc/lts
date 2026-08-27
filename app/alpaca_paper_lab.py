@@ -471,6 +471,26 @@ class AlpacaPaperOlap:
                 PRIMARY KEY (session_id, symbol, broker_time),
                 FOREIGN KEY (session_id) REFERENCES lab_sessions(session_id)
             );
+            CREATE TABLE IF NOT EXISTS quote_canonical (
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                broker_time TEXT NOT NULL,
+                bid REAL, ask REAL, mid REAL,
+                spread REAL, spread_bps REAL,
+                bid_size REAL, ask_size REAL,
+                first_observed_at TEXT NOT NULL,
+                quote_json TEXT NOT NULL,
+                PRIMARY KEY (venue, symbol, broker_time)
+            );
+            CREATE TABLE IF NOT EXISTS quote_session_membership (
+                session_id TEXT NOT NULL,
+                venue TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                broker_time TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, venue, symbol, broker_time),
+                FOREIGN KEY (session_id) REFERENCES lab_sessions(session_id)
+            );
             CREATE TABLE IF NOT EXISTS reconciliation_snapshots (
                 session_id TEXT PRIMARY KEY,
                 observed_at TEXT NOT NULL,
@@ -663,6 +683,44 @@ class AlpacaPaperOlap:
             ),
         )
         self.connection.commit()
+
+    def record_quote_canonical(
+        self,
+        session_id: str,
+        venue: str,
+        symbol: str,
+        quote: Mapping[str, Any],
+    ) -> bool:
+        """Globally idempotent quote storage (finding DATA-SOTA-351):
+        canonical identity is (venue, symbol, broker_time) — a retry or
+        a restarted session never duplicates the observation, while the
+        session-membership ledger preserves per-run provenance.
+        Returns True when the canonical row is new."""
+        bid = _as_float(quote.get("bp"))
+        ask = _as_float(quote.get("ap"))
+        mid = (bid + ask) / 2.0 if bid is not None and ask is not None else None
+        spread = ask - bid if bid is not None and ask is not None else None
+        spread_bps = spread / mid * 10000.0 if spread is not None and mid else None
+        broker_time = str(quote.get("t") or _utc_now())
+        now = _utc_now()
+        cursor = self.connection.execute(
+            """
+            INSERT OR IGNORE INTO quote_canonical VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (venue, symbol, broker_time, bid, ask, mid, spread,
+             spread_bps, _as_float(quote.get("bs")),
+             _as_float(quote.get("as")), now, _canonical_json(quote)),
+        )
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO quote_session_membership VALUES
+            (?, ?, ?, ?, ?)
+            """,
+            (session_id, venue, symbol, broker_time, now),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
 
     def record_quote(
         self,
