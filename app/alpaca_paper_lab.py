@@ -59,6 +59,12 @@ def _redact_account(value: Any) -> Any:
     return value
 
 
+class QuoteConflictError(RuntimeError):
+    """DATA-SOTA-354: a quote with an existing canonical identity
+    (venue, symbol, broker_time) arrived with a DIFFERENT payload.
+    Never ignored — a source revision or corruption must surface."""
+
+
 class AlpacaPaperError(RuntimeError):
     """Raised when the Paper API contract or a read-only gate fails."""
 
@@ -528,7 +534,20 @@ class AlpacaPaperOlap:
                 MAX(observed_at) AS last_observed_at
             FROM instrument_capabilities
             GROUP BY cell_id, canonical_asset, symbol, asset_class, role, timeframe;
-            CREATE VIEW IF NOT EXISTS alpaca_quote_summary_olap AS
+            DROP VIEW IF EXISTS alpaca_quote_summary_olap;
+            CREATE VIEW alpaca_quote_summary_olap AS
+            SELECT
+                venue,
+                symbol,
+                COUNT(*) AS observations,
+                MIN(broker_time) AS first_broker_time,
+                MAX(broker_time) AS last_broker_time,
+                AVG(spread_bps) AS mean_spread_bps,
+                MIN(spread_bps) AS min_spread_bps,
+                MAX(spread_bps) AS max_spread_bps
+            FROM quote_canonical
+            GROUP BY venue, symbol;
+            CREATE VIEW IF NOT EXISTS alpaca_quote_summary_legacy_olap AS
             SELECT
                 symbol,
                 COUNT(*) AS observations,
@@ -691,11 +710,14 @@ class AlpacaPaperOlap:
         symbol: str,
         quote: Mapping[str, Any],
     ) -> bool:
-        """Globally idempotent quote storage (finding DATA-SOTA-351):
-        canonical identity is (venue, symbol, broker_time) — a retry or
-        a restarted session never duplicates the observation, while the
-        session-membership ledger preserves per-run provenance.
-        Returns True when the canonical row is new."""
+        """Globally idempotent quote storage (DATA-SOTA-351/354):
+        canonical identity is (venue, symbol, broker_time). An EXACT
+        payload replay is idempotent (membership ledger still records
+        the session); a DIFFERENT payload on an existing identity is a
+        typed QuoteConflictError, never ignored. Canonical insert and
+        session membership land in ONE SQLite transaction — a failure
+        between them rolls both back. Returns True when the canonical
+        row is new."""
         bid = _as_float(quote.get("bp"))
         ask = _as_float(quote.get("ap"))
         mid = (bid + ask) / 2.0 if bid is not None and ask is not None else None
@@ -703,24 +725,45 @@ class AlpacaPaperOlap:
         spread_bps = spread / mid * 10000.0 if spread is not None and mid else None
         broker_time = str(quote.get("t") or _utc_now())
         now = _utc_now()
-        cursor = self.connection.execute(
-            """
-            INSERT OR IGNORE INTO quote_canonical VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (venue, symbol, broker_time, bid, ask, mid, spread,
-             spread_bps, _as_float(quote.get("bs")),
-             _as_float(quote.get("as")), now, _canonical_json(quote)),
-        )
-        self.connection.execute(
-            """
-            INSERT OR IGNORE INTO quote_session_membership VALUES
-            (?, ?, ?, ?, ?)
-            """,
-            (session_id, venue, symbol, broker_time, now),
-        )
-        self.connection.commit()
-        return cursor.rowcount > 0
+        payload = _canonical_json(quote)
+        try:
+            existing = self.connection.execute(
+                """
+                SELECT quote_json FROM quote_canonical
+                WHERE venue=? AND symbol=? AND broker_time=?
+                """,
+                (venue, symbol, broker_time),
+            ).fetchone()
+            if existing is not None and existing[0] != payload:
+                raise QuoteConflictError(
+                    f"canonical quote conflict for ({venue}, {symbol}, "
+                    f"{broker_time}): stored payload differs from the "
+                    f"replayed one (source revision or corruption; "
+                    f"DATA-SOTA-354)"
+                )
+            is_new = existing is None
+            if is_new:
+                self.connection.execute(
+                    """
+                    INSERT INTO quote_canonical VALUES
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (venue, symbol, broker_time, bid, ask, mid, spread,
+                     spread_bps, _as_float(quote.get("bs")),
+                     _as_float(quote.get("as")), now, payload),
+                )
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO quote_session_membership VALUES
+                (?, ?, ?, ?, ?)
+                """,
+                (session_id, venue, symbol, broker_time, now),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return is_new
 
     def record_quote(
         self,

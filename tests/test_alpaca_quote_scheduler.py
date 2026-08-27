@@ -246,3 +246,100 @@ def test_clean_continuation_after_interrupted_run(tmp_path):
     statuses = [r[0] for r in store.connection.execute(
         "SELECT status FROM lab_sessions ORDER BY started_at").fetchall()]
     assert "interrupted" in statuses and "completed" in statuses
+
+
+# ---------------------------- 354: conflicts, transaction, OLAP surface
+
+from app.alpaca_paper_lab import QuoteConflictError  # noqa: E402
+
+
+class TestDataSota354CanonicalConflictsAndOlap:
+    def test_same_session_exact_replay_is_idempotent(self, tmp_path):
+        store = AlpacaPaperOlap(tmp_path / "lab.sqlite")
+        s1 = store.start_session("quote_scheduler", "fp", {})
+        assert store.record_quote_canonical(s1, "alpaca", "ETH/USD",
+                                            QUOTE) is True
+        assert store.record_quote_canonical(s1, "alpaca", "ETH/USD",
+                                            QUOTE) is False
+        rows = store.connection.execute(
+            "SELECT COUNT(*) FROM quote_canonical").fetchone()[0]
+        assert rows == 1
+
+    def test_cross_session_exact_replay_is_idempotent(self, tmp_path):
+        store = AlpacaPaperOlap(tmp_path / "lab.sqlite")
+        s1 = store.start_session("quote_scheduler", "fp", {})
+        s2 = store.start_session("quote_scheduler", "fp", {})
+        store.record_quote_canonical(s1, "alpaca", "ETH/USD", QUOTE)
+        assert store.record_quote_canonical(s2, "alpaca", "ETH/USD",
+                                            QUOTE) is False
+        members = store.connection.execute(
+            "SELECT COUNT(*) FROM quote_session_membership").fetchone()[0]
+        assert members == 2  # provenance for both sessions
+
+    def test_conflicting_payload_is_a_typed_refusal(self, tmp_path):
+        """The PRE counterexample: a different payload on the same
+        identity was silently ignored (stored bid stayed 100)."""
+        store = AlpacaPaperOlap(tmp_path / "lab.sqlite")
+        s1 = store.start_session("quote_scheduler", "fp", {})
+        store.record_quote_canonical(s1, "alpaca", "ETH/USD", QUOTE)
+        revised = dict(QUOTE, bp=999.0)
+        with pytest.raises(QuoteConflictError, match="conflict"):
+            store.record_quote_canonical(s1, "alpaca", "ETH/USD",
+                                         revised)
+        bid = store.connection.execute(
+            "SELECT bid FROM quote_canonical").fetchone()[0]
+        assert bid == QUOTE["bp"]  # original payload intact
+
+    def test_membership_failure_rolls_back_canonical_insert(
+            self, tmp_path, monkeypatch):
+        store = AlpacaPaperOlap(tmp_path / "lab.sqlite")
+        s1 = store.start_session("quote_scheduler", "fp", {})
+        real_connection = store.connection
+
+        class FailingProxy:
+            def execute(self, sql, *args):
+                if ("quote_session_membership" in sql
+                        and "INSERT" in sql):
+                    raise RuntimeError("injected membership failure")
+                return real_connection.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(real_connection, name)
+        store.connection = FailingProxy()
+        with pytest.raises(RuntimeError, match="membership failure"):
+            store.record_quote_canonical(s1, "alpaca", "ETH/USD", QUOTE)
+        store.connection = real_connection
+        rows = store.connection.execute(
+            "SELECT COUNT(*) FROM quote_canonical").fetchone()[0]
+        assert rows == 0, "canonical insert survived the rollback"
+
+    def test_olap_view_reads_canonical_and_survives_restart(
+            self, tmp_path):
+        """The PRE counterexample: the summary view read only the legacy
+        table, so collected canonical data was invisible."""
+        db = tmp_path / "lab.sqlite"
+        store = AlpacaPaperOlap(db)
+        s1 = store.start_session("quote_scheduler", "fp", {})
+        store.record_quote_canonical(s1, "alpaca", "ETH/USD", QUOTE)
+        row = tuple(store.connection.execute(
+            "SELECT venue, symbol, observations FROM "
+            "alpaca_quote_summary_olap").fetchone())
+        assert row == ("alpaca", "ETH/USD", 1)
+        reopened = AlpacaPaperOlap(db)  # restart: migration idempotent
+        row = tuple(reopened.connection.execute(
+            "SELECT venue, symbol, observations FROM "
+            "alpaca_quote_summary_olap").fetchone())
+        assert row == ("alpaca", "ETH/USD", 1)
+
+    def test_legacy_view_is_separate_and_reads_legacy_rows(
+            self, tmp_path):
+        store = AlpacaPaperOlap(tmp_path / "lab.sqlite")
+        s1 = store.start_session("quote_scheduler", "fp", {})
+        store.record_quote(s1, "ETH/USD", QUOTE)  # legacy path
+        legacy = tuple(store.connection.execute(
+            "SELECT symbol, observations FROM "
+            "alpaca_quote_summary_legacy_olap").fetchone())
+        assert legacy == ("ETH/USD", 1)
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM alpaca_quote_summary_olap"
+        ).fetchone()[0] == 0  # identities never unioned
