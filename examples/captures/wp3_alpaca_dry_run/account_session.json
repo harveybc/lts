@@ -1,0 +1,10 @@
+{
+ "venue": "alpaca_paper",
+ "account_fingerprint": "7853afed1025c1ba",
+ "symbol": "SPY",
+ "schema_version": "v1",
+ "source": "alpaca_paper_rest_v2",
+ "evidence_type": "account_session",
+ "evidence_id": "ev-account_session",
+ "payload": "{\"account\": {\"id\": \"sanitized-account-uuid\", \"account_number\": \"SANITIZED0001\", \"status\": \"ACTIVE\", \"trading_blocked\": false, \"cash\": \"10000.00\", \"equity\": \"10250.00\"}, \"clock\": {\"timestamp\": \"2026-08-28T14:59:55+00:00\", \"is_open\": true, \"next_open\": \"2026-08-28T14:59:55+00:00\", \"next_close\": \"2026-08-28T14:59:55+00:00\"}}"
+}

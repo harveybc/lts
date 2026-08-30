@@ -145,6 +145,15 @@ class PositionSnapshot(StrictModel):
     side: str
     volume: float = Field(gt=0)
     price_open: float
+    # WP3 C6: the EA has always emitted POSITION_TIME as
+    # ``time_open_unix`` and app/mt5_model_runner.py has always read
+    # it, but this strict model did not declare it. With
+    # extra="forbid" the endpoint answered 422 and the WHOLE snapshot
+    # was rejected, so no MT5 snapshot carrying a position was ever
+    # stored and the runner's holding-bars feature could never
+    # resolve. Declared here with the range POSITION_TIME actually
+    # has: a positive epoch second.
+    time_open_unix: int = Field(gt=0, strict=True)
     stop_loss: float
     take_profit: float
     profit: float

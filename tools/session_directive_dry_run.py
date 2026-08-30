@@ -95,7 +95,7 @@ def load_capture(directory: Path, name: str) -> dict:
     envelope = json.loads(path.read_text())
     for field in ("venue", "account_fingerprint", "symbol",
                   "evidence_type", "schema_version", "source",
-                  "evidence_id", "observed_at", "payload"):
+                  "evidence_id", "payload"):
         if field not in envelope:
             raise VenueEvidenceError(
                 f"capture {path.name}: missing field {field!r}")
@@ -119,11 +119,12 @@ def evidence_from(envelope: Mapping[str, Any]) -> VenueDirectEvidence:
         schema_version=envelope["schema_version"],
         source=envelope["source"],
         evidence_id=envelope["evidence_id"],
-        observed_at=envelope["observed_at"],
-        raw_bytes=payload.encode("utf-8"))
+        raw_bytes=payload.encode("utf-8"),
+        transport_observed_at=envelope.get("transport_observed_at"))
 
 
-def run(captures: Path, *, authority_root: Path, now: Any,
+def run(captures: Path, *, authority_root: Path,
+        expected_code_identity: str, now: Any,
         raw_model_output: float, mapped_command: int,
         state_block: Mapping[str, Any], policy: Mapping[str, Any],
         evidence_policy: VenueEvidencePolicy,
@@ -131,17 +132,31 @@ def run(captures: Path, *, authority_root: Path, now: Any,
     interface = NoWriteVenueInterface()
     assert interface.client is None and interface.credentials is None
 
-    authority = load_authority(authority_root)
+    # C4: the reviewed digest is re-computed from the files on disk
+    # immediately before the run, so a checkout that drifted since
+    # review refuses here rather than producing a plausible report.
+    authority = load_authority(
+        authority_root,
+        expected_code_identity=expected_code_identity)
     moment = require_utc("now", now)
 
     facts = {}
     provenance = {}
+    seen_identity = set()
     for name in ("account_session", "positions", "open_orders"):
         envelope = load_capture(captures, name)
         evidence = evidence_from(envelope).verify(evidence_policy,
                                                   now=moment)
+        seen_identity.add((evidence.venue, evidence.symbol,
+                           evidence.account_fingerprint))
         facts[name] = evidence.facts
         provenance[name] = evidence.provenance()
+
+    # C2: cross-envelope coherence. Every envelope used in ONE
+    # decision must name the same venue, symbol and account.
+    if len(seen_identity) != 1:
+        raise VenueEvidenceError(
+            f"the envelopes disagree on identity: {sorted(seen_identity)}")
 
     clock_path = captures / CAPTURE_FILES["market_clock"]
     if clock_path.is_file():
@@ -209,8 +224,15 @@ def main(argv=None) -> int:
     evidence_policy = VenueEvidencePolicy.build(
         **config["evidence_policy"])
     try:
+        if "authority_code_identity" not in config:
+            raise AuthorityUnavailable(
+                "the dry-run config must pin "
+                "authority_code_identity; an unpinned authority is "
+                "refused")
         report = run(args.captures,
                      authority_root=args.authority_root,
+                     expected_code_identity=config[
+                         "authority_code_identity"],
                      now=config["now"],
                      raw_model_output=config["raw_model_output"],
                      mapped_command=config["mapped_command"],

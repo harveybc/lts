@@ -24,9 +24,27 @@ from app.venue_direct_evidence import (
     VenueDirectEvidence, VenueEvidenceError, VenueEvidencePolicy)
 
 from tests.unit.test_wp3_venue_direct_evidence import (  # noqa: E402
-    ALPACA_ACCOUNT, ALPACA_ORDERS, ALPACA_POSITIONS, MT5_ACCOUNT,
-    MT5_CLOCK, MT5_ORDERS, MT5_POSITIONS, NOW, OBSERVED, evidence,
-    mt5_evidence, mt5_policy, policy)
+    ALPACA_ACCOUNT, ALPACA_FP, ALPACA_ORDERS, ALPACA_POSITIONS,
+    MT5_ACCOUNT, MT5_CLOCK, MT5_ORDERS, MT5_POSITIONS, NOW, OBSERVED,
+    evidence, mt5_evidence, mt5_policy, policy)
+
+
+def reviewed_identity():
+    """The digest of the authority checkout as it stands right now.
+    C4 makes pinning MANDATORY, so every load in these tests states
+    which authority it accepts."""
+    import hashlib
+    import importlib.util
+    import sys as _sys
+    material = []
+    for dotted in ("app.session_exposure", "app.flatten_custody"):
+        path = AUTHORITY_ROOT / Path(*dotted.split(".")).with_suffix(
+            ".py")
+        material.append(
+            f"_lts_authority_{dotted.replace('.', '_')}="
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}")
+    return hashlib.sha256(
+        "|".join(sorted(material)).encode()).hexdigest()
 
 AUTHORITY_ROOT = Path(__file__).resolve().parents[3] / "gym-fx"
 pytestmark = pytest.mark.skipif(
@@ -47,7 +65,8 @@ def _no_network(monkeypatch):
 
 @pytest.fixture(scope="module")
 def authority():
-    return load_authority(AUTHORITY_ROOT)
+    return load_authority(AUTHORITY_ROOT,
+                          expected_code_identity=reviewed_identity())
 
 
 def session_policy():
@@ -147,11 +166,47 @@ class TestAuthorityBinding:
             load_authority(AUTHORITY_ROOT,
                            expected_code_identity="0" * 64)
 
+    @pytest.mark.parametrize("digest", [
+        None, "", "not-hex", "abc", "A" * 64, 123, "0" * 63])
+    def test_an_unpinned_or_malformed_identity_refuses(self, digest):
+        """C4: the digest was optional and defaulted to None, so ANY
+        checkout loaded and the claim that a different authority is
+        refused was simply untrue."""
+        with pytest.raises(AuthorityUnavailable,
+                           match="unpinned authority is refused"):
+            load_authority(AUTHORITY_ROOT,
+                           expected_code_identity=digest)
+
+    def test_the_digest_cannot_be_omitted_at_all(self):
+        with pytest.raises(TypeError):
+            load_authority(AUTHORITY_ROOT)
+
     def test_a_missing_authority_refuses_with_no_fallback(self,
                                                           tmp_path):
         with pytest.raises(AuthorityUnavailable,
                            match="no local reimplementation"):
-            load_authority(tmp_path / "absent")
+            load_authority(tmp_path / "absent",
+                           expected_code_identity="0" * 64)
+
+    def test_the_digest_is_recomputed_from_disk_each_load(self,
+                                                          tmp_path):
+        """A checkout that drifted since review refuses, because the
+        files are re-hashed at load rather than trusted."""
+        import shutil
+        copy = tmp_path / "authority"
+        (copy / "app").mkdir(parents=True)
+        for name in ("session_exposure.py", "flatten_custody.py",
+                     "migration_custody.py", "direct_evidence.py"):
+            shutil.copy(AUTHORITY_ROOT / "app" / name,
+                        copy / "app" / name)
+        pinned = load_authority(
+            copy, expected_code_identity=reviewed_identity()
+        ).code_identity
+        target = copy / "app" / "session_exposure.py"
+        target.write_text(target.read_text() + "\n# drift\n")
+        with pytest.raises(AuthorityUnavailable,
+                           match="does not match the reviewed"):
+            load_authority(copy, expected_code_identity=pinned)
 
     def test_this_repository_does_not_reimplement_the_states(self):
         """The adapter must translate, never re-derive. A local copy
@@ -530,7 +585,7 @@ class TestDryRunIsStructurallyEffectFree:
                 "venue": venue, "account_fingerprint": account,
                 "symbol": symbol, "evidence_type": kind,
                 "schema_version": "v1", "source": source,
-                "evidence_id": f"ev-{kind}", "observed_at": OBSERVED,
+                "evidence_id": f"ev-{kind}",
                 "payload": json.dumps(payload)}))
 
         for name, kind, payload in (
@@ -542,6 +597,7 @@ class TestDryRunIsStructurallyEffectFree:
                   "sanitizedfp01", "USDCAD", "mt5_demo")
 
         report = run(captures, authority_root=AUTHORITY_ROOT,
+                     expected_code_identity=reviewed_identity(),
                      now=NOW, raw_model_output=1.0, mapped_command=1,
                      state_block=block("FORCED_FLATTEN"),
                      policy=session_policy(),

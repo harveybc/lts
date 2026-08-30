@@ -4,7 +4,6 @@
  "symbol": "USDCAD",
  "schema_version": "v1",
  "source": "mt5_bridge_snapshot_v1",
- "observed_at": "2026-08-28T14:59:55+00:00",
  "evidence_type": "account_session",
  "evidence_id": "ev-account_session",
  "payload": "{\"schema\": \"lts.mt5.heartbeat.v1\", \"adapter_version\": \"2.0.0\", \"account_fingerprint\": \"sanitizedfp01\", \"server_fingerprint\": \"sanitizedsrv1\", \"environment\": \"demo\", \"connected\": true, \"trade_allowed\": true, \"terminal_build\": 4260, \"terminal_ping_ms\": 12, \"observed_at\": \"2026-08-28T14:59:55+00:00\"}"

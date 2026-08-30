@@ -99,15 +99,23 @@ def _module_identity(modules) -> str:
 
 
 def load_authority(root: Any, *,
-                   expected_code_identity: Optional[str] = None
-                   ) -> AuthorityBinding:
+                   expected_code_identity: str) -> AuthorityBinding:
     """Load the accepted authority from an EXPLICIT checkout root.
 
-    ``expected_code_identity`` is the digest of the exact authority
-    source this deployment was reviewed against. When it is supplied
-    and does not match, the load refuses: running a venue adapter
-    against an unreviewed copy of the state machine is precisely the
-    drift this binding exists to prevent."""
+    C4: ``expected_code_identity`` is MANDATORY. It was optional and
+    defaulted to None, which meant any checkout loaded and the claim
+    that a different authority is refused was simply untrue. The
+    digest is the one recorded in the reviewed manifest, it is
+    re-computed from the files on disk at every load, and an absent,
+    malformed or stale digest refuses."""
+    if not isinstance(expected_code_identity, str) or \
+            len(expected_code_identity) != 64 or \
+            any(c not in "0123456789abcdef"
+                for c in expected_code_identity):
+        raise AuthorityUnavailable(
+            "expected_code_identity must be the reviewed 64-character "
+            f"hex digest, got {expected_code_identity!r} — an "
+            "unpinned authority is refused")
     base = Path(root)
     if not base.is_dir():
         raise AuthorityUnavailable(
@@ -149,8 +157,7 @@ def load_authority(root: Any, *,
         loaded.append(module)
 
     identity = _module_identity(loaded)
-    if expected_code_identity is not None and \
-            identity != expected_code_identity:
+    if identity != expected_code_identity:
         raise AuthorityUnavailable(
             f"authority code identity {identity[:16]}… does not match "
             f"the reviewed {expected_code_identity[:16]}… — refusing "

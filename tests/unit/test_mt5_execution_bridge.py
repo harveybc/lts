@@ -192,6 +192,7 @@ def test_execution_status_reconciles_protected_model_position(tmp_path):
         "positions": [{
             "ticket": "100", "symbol": "USDCAD", "side": "long",
             "volume": 0.01, "price_open": 1.35,
+            "time_open_unix": 1756400000,
             "stop_loss": 1.34, "take_profit": 1.36, "profit": 0,
         }],
     }))
@@ -232,6 +233,7 @@ def test_execution_status_refuses_altered_or_foreign_position(tmp_path):
         "positions": [{
             "ticket": "foreign", "symbol": "USDCAD", "side": "long",
             "volume": 0.01, "price_open": 1.35,
+            "time_open_unix": 1756400000,
             "stop_loss": 0, "take_profit": 1.36, "profit": 0,
         }],
     }))

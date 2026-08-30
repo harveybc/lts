@@ -90,7 +90,8 @@ MT5_CLOCK = {
 
 
 def policy(venue="alpaca_paper", symbol="SPY",
-           account="0c7d3b4e5f6a7b8c", **kw):
+           account=None, **kw):
+    account = ALPACA_FP if account is None else account
     base = dict(venue=venue, account_fingerprint=account,
                 symbol=symbol,
                 allowed_sources=("alpaca_paper_rest_v2",),
@@ -100,16 +101,19 @@ def policy(venue="alpaca_paper", symbol="SPY",
     return VenueEvidencePolicy.build(**base)
 
 
+ALPACA_FP = "7853afed1025c1ba"
+
+
 def evidence(venue, kind, payload, *, symbol="SPY",
-             account="0c7d3b4e5f6a7b8c",
-             source="alpaca_paper_rest_v2", observed=OBSERVED,
-             raw=None):
+             account=ALPACA_FP, source="alpaca_paper_rest_v2",
+             raw=None, transport=None):
     return VenueDirectEvidence.parse(
         venue=venue, account_fingerprint=account, symbol=symbol,
         evidence_type=kind, schema_version="v1", source=source,
-        evidence_id=f"ev-{kind}", observed_at=observed,
+        evidence_id=f"ev-{kind}",
         raw_bytes=raw if raw is not None
-        else json.dumps(payload).encode())
+        else json.dumps(payload).encode(),
+        transport_observed_at=transport)
 
 
 MT5_SOURCE = "mt5_bridge_snapshot_v1"
@@ -194,10 +198,10 @@ class TestRefusals:
                            match="original payload bytes"):
             VenueDirectEvidence.parse(
                 venue="alpaca_paper",
-                account_fingerprint="0c7d3b4e5f6a7b8c", symbol="SPY",
+                account_fingerprint=ALPACA_FP, symbol="SPY",
                 evidence_type="positions", schema_version="v1",
                 source="alpaca_paper_rest_v2", evidence_id="e",
-                observed_at=OBSERVED, raw_bytes=ALPACA_POSITIONS)
+                raw_bytes=ALPACA_POSITIONS)
 
     def test_duplicate_keys_refuse(self):
         raw = (b'{"observed_at":"' + OBSERVED.encode() +
@@ -206,7 +210,8 @@ class TestRefusals:
             evidence("alpaca_paper", "positions", None, raw=raw)
 
     @pytest.mark.parametrize("raw,match", [
-        (b'{"observed_at":"x","positions":NaN}', "non-finite"),
+        (b'{"observed_at":"x","positions":[],"x":NaN}',
+         "non-finite"),
         (b'{"observed_at":', "invalid JSON"),
         (b'\xff\xfe{"a":1}', "invalid encoding"),
     ])
@@ -278,18 +283,18 @@ class TestRefusals:
 class TestPolicyOwnsAdmission:
 
     def test_stale_evidence_refuses(self):
-        old = (NOW - timedelta(seconds=600)).isoformat()
         stale = json.loads(json.dumps(ALPACA_POSITIONS))
-        stale["observed_at"] = old
-        item = evidence("alpaca_paper", "positions", stale,
-                        observed=old)
+        stale["observed_at"] = (
+            NOW - timedelta(seconds=600)).isoformat()
+        item = evidence("alpaca_paper", "positions", stale)
         with pytest.raises(VenueEvidenceError, match="stale evidence"):
             item.verify(policy(), now=NOW)
 
     def test_future_evidence_refuses(self):
-        ahead = (NOW + timedelta(seconds=30)).isoformat()
-        item = evidence("alpaca_paper", "positions", ALPACA_POSITIONS,
-                        observed=ahead)
+        ahead = json.loads(json.dumps(ALPACA_POSITIONS))
+        ahead["observed_at"] = (
+            NOW + timedelta(seconds=30)).isoformat()
+        item = evidence("alpaca_paper", "positions", ahead)
         with pytest.raises(VenueEvidenceError, match="in the future"):
             item.verify(policy(), now=NOW)
 
@@ -403,8 +408,205 @@ class TestSealedParserIdentity:
                            match="no allowlisted parser"):
             VenueDirectEvidence.parse(
                 venue="alpaca_paper",
-                account_fingerprint="0c7d3b4e5f6a7b8c", symbol="SPY",
+                account_fingerprint=ALPACA_FP, symbol="SPY",
                 evidence_type="positions", schema_version="v99",
                 source="alpaca_paper_rest_v2", evidence_id="e",
-                observed_at=OBSERVED,
                 raw_bytes=json.dumps(ALPACA_POSITIONS).encode())
+
+
+# =================================================================== #
+# C1: freshness comes from the BYTES                                  #
+# =================================================================== #
+
+class TestC1FreshnessIsBoundToThePayload:
+
+    def test_a_stale_payload_cannot_be_rewrapped_as_fresh(self):
+        """FROZEN COUNTEREXAMPLE. A 2020 payload inside a 2026
+        envelope was accepted under a 120-second policy, because the
+        age was computed from an envelope timestamp supplied outside
+        the bytes and never bound to the signed internal one."""
+        stale = json.loads(json.dumps(MT5_POSITIONS))
+        stale["observed_at"] = "2020-01-01T00:00:00+00:00"
+        item = mt5_evidence("positions", stale)
+        assert item.observed_at.year == 2020, (
+            "the envelope no longer supplies a timestamp at all")
+        with pytest.raises(VenueEvidenceError, match="stale evidence"):
+            item.verify(mt5_policy(), now=NOW)
+
+    def test_a_future_payload_refuses(self):
+        ahead = json.loads(json.dumps(MT5_POSITIONS))
+        ahead["observed_at"] = "2030-01-01T00:00:00+00:00"
+        with pytest.raises(VenueEvidenceError, match="in the future"):
+            mt5_evidence("positions", ahead).verify(mt5_policy(),
+                                                    now=NOW)
+
+    def test_the_envelope_has_no_observed_at_parameter(self):
+        import inspect
+        signature = inspect.signature(VenueDirectEvidence.parse)
+        assert "observed_at" not in signature.parameters
+        assert "transport_observed_at" in signature.parameters
+
+    def test_a_transport_stamp_is_a_check_not_a_substitute(self):
+        item = mt5_evidence("positions", MT5_POSITIONS,
+                            transport=OBSERVED)
+        assert item.observed_at.isoformat() == \
+            item.facts["observed_at"]
+        with pytest.raises(VenueEvidenceError,
+                           match="does not match the payload"):
+            mt5_evidence("positions", MT5_POSITIONS,
+                         transport="2026-08-28T14:00:00+00:00")
+
+
+# =================================================================== #
+# C2: identity is bound to the FACTS                                  #
+# =================================================================== #
+
+class TestC2IdentityIsBoundToTheFacts:
+
+    def test_a_foreign_symbol_position_refuses(self):
+        """FROZEN COUNTEREXAMPLE. A BTCUSD position was accepted as
+        USDCAD exposure because verify only compared the ENVELOPE
+        against the policy."""
+        foreign = json.loads(json.dumps(MT5_POSITIONS))
+        foreign["positions"][0]["symbol"] = "BTCUSD"
+        item = mt5_evidence("positions", foreign)
+        with pytest.raises(VenueEvidenceError,
+                           match="foreign or mixed-symbol"):
+            item.verify(mt5_policy(), now=NOW)
+
+    def test_a_mixed_symbol_payload_is_refused_not_filtered(self):
+        mixed = json.loads(json.dumps(MT5_POSITIONS))
+        mixed["positions"].append(
+            {**mixed["positions"][0], "ticket": "100002",
+             "symbol": "EURUSD"})
+        with pytest.raises(VenueEvidenceError,
+                           match="never filtered"):
+            mt5_evidence("positions", mixed).verify(mt5_policy(),
+                                                    now=NOW)
+
+    def test_a_foreign_symbol_order_refuses(self):
+        foreign = json.loads(json.dumps(MT5_ORDERS))
+        foreign["orders"][0]["symbol"] = "BTCUSD"
+        with pytest.raises(VenueEvidenceError,
+                           match="foreign or mixed-symbol"):
+            mt5_evidence("open_orders", foreign).verify(mt5_policy(),
+                                                        now=NOW)
+
+    def test_a_foreign_symbol_clock_refuses(self):
+        foreign = json.loads(json.dumps(MT5_CLOCK))
+        foreign["symbol"] = "BTCUSD"
+        with pytest.raises(VenueEvidenceError,
+                           match="foreign or mixed-symbol"):
+            mt5_evidence("market_clock", foreign).verify(mt5_policy(),
+                                                         now=NOW)
+
+    def test_the_internal_account_fingerprint_is_compared(self):
+        """The envelope AGREES with the policy while the facts do
+        not -- the case the envelope check alone cannot catch."""
+        foreign = json.loads(json.dumps(MT5_ACCOUNT))
+        foreign["account_fingerprint"] = "someotherfp9"
+        item = mt5_evidence("account_session", foreign)
+        assert item.account_fingerprint == "sanitizedfp01"
+        assert item.facts["account_fingerprint"] == "someotherfp9"
+        with pytest.raises(VenueEvidenceError,
+                           match="the payload states account"):
+            item.verify(mt5_policy(), now=NOW)
+
+    def test_the_alpaca_derived_fingerprint_is_compared(self):
+        foreign = json.loads(json.dumps(ALPACA_ACCOUNT))
+        foreign["account"]["id"] = "a-completely-different-account"
+        item = evidence("alpaca_paper", "account_session", foreign)
+        assert item.account_fingerprint == ALPACA_FP
+        assert item.facts["account_fingerprint"] != ALPACA_FP
+        with pytest.raises(VenueEvidenceError,
+                           match="the payload states account"):
+            item.verify(policy(), now=NOW)
+
+    def test_duplicate_identities_refuse(self):
+        dup = json.loads(json.dumps(MT5_POSITIONS))
+        dup["positions"].append(dict(dup["positions"][0]))
+        with pytest.raises(VenueEvidenceError,
+                           match="appears twice"):
+            mt5_evidence("positions", dup)
+        dup_orders = json.loads(json.dumps(MT5_ORDERS))
+        dup_orders["orders"].append(dict(dup_orders["orders"][0]))
+        with pytest.raises(VenueEvidenceError,
+                           match="appears twice"):
+            mt5_evidence("open_orders", dup_orders)
+
+    def test_an_alpaca_leg_reusing_the_parent_identity_refuses(self):
+        clash = json.loads(json.dumps(ALPACA_ORDERS))
+        clash["orders"][0]["legs"][0]["id"] = "parent-order-id"
+        with pytest.raises(VenueEvidenceError,
+                           match="appears twice"):
+            evidence("alpaca_paper", "open_orders", clash)
+
+    def test_the_honest_path_still_binds(self):
+        for kind, payload in (("positions", MT5_POSITIONS),
+                              ("open_orders", MT5_ORDERS),
+                              ("market_clock", MT5_CLOCK),
+                              ("account_session", MT5_ACCOUNT)):
+            mt5_evidence(kind, payload).verify(mt5_policy(), now=NOW)
+
+
+# =================================================================== #
+# C3: per-venue numeric grammars                                      #
+# =================================================================== #
+
+class TestC3PerVenueNumericTypes:
+
+    @pytest.mark.parametrize("bad", [
+        True, False, "0.1", "  0.1  ", "1e-1", "NaN", "Infinity",
+        "0x10", None, [0.1]])
+    def test_mt5_refuses_anything_that_is_not_a_json_number(self,
+                                                            bad):
+        """FROZEN COUNTEREXAMPLE: volume=true was coerced to a 1.0-lot
+        position because float() ran before the strict check."""
+        payload = json.loads(json.dumps(MT5_POSITIONS))
+        payload["positions"][0]["volume"] = bad
+        with pytest.raises(VenueEvidenceError,
+                           match="JSON number is required"):
+            mt5_evidence("positions", payload)
+
+    def test_mt5_accepts_real_json_numbers(self):
+        for good in (0.1, 1, 2.5):
+            payload = json.loads(json.dumps(MT5_POSITIONS))
+            payload["positions"][0]["volume"] = good
+            facts = mt5_evidence("positions", payload).facts
+            assert facts["positions"][0]["signed_quantity"] == \
+                pytest.approx(float(good))
+
+    @pytest.mark.parametrize("bad", [
+        True, 10, 10.0, " 10", "10 ", "1e1", "NaN", "Infinity",
+        "+10", "010", "", None])
+    def test_alpaca_refuses_anything_outside_the_decimal_grammar(
+            self, bad):
+        payload = json.loads(json.dumps(ALPACA_POSITIONS))
+        payload["positions"][0]["qty"] = bad
+        with pytest.raises(VenueEvidenceError):
+            evidence("alpaca_paper", "positions", payload)
+
+    @pytest.mark.parametrize("good,expected", [
+        ("10", 10.0), ("10.5", 10.5), ("-3", -3.0), ("0", 0.0)])
+    def test_alpaca_accepts_its_documented_decimal_strings(self, good,
+                                                           expected):
+        payload = json.loads(json.dumps(ALPACA_POSITIONS))
+        payload["positions"][0]["qty"] = good
+        payload["positions"][0]["side"] = (
+            "long" if expected > 0 else "short")
+        if expected == 0.0:
+            with pytest.raises(VenueEvidenceError):
+                evidence("alpaca_paper", "positions", payload)
+            return
+        facts = evidence("alpaca_paper", "positions", payload).facts
+        assert facts["positions"][0]["signed_quantity"] == \
+            pytest.approx(expected if expected > 0 else expected)
+
+    def test_no_parser_calls_float_on_untrusted_input(self):
+        import inspect
+        import app.venue_direct_evidence as mod
+        for key, parser in mod.PARSERS.items():
+            source = inspect.getsource(parser)
+            assert "float(row[" not in source, key
+            assert "float(payload[" not in source, key
+            assert "float(account[" not in source, key

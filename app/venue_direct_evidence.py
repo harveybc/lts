@@ -38,6 +38,7 @@ import hashlib
 import inspect
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import MappingProxyType
@@ -89,6 +90,59 @@ def require_real(name: str, value: Any, *, positive: bool = False,
     number = float(value)
     if not math.isfinite(number):
         raise VenueEvidenceError(f"{name}: non-finite value {value!r}")
+    if positive and number <= 0.0:
+        raise VenueEvidenceError(f"{name}: must be > 0, got {number}")
+    if nonnegative and number < 0.0:
+        raise VenueEvidenceError(f"{name}: must be >= 0, got {number}")
+    return number
+
+
+_DECIMAL_GRAMMAR = re.compile(r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?$")
+
+
+def require_json_number(name: str, value: Any) -> float:
+    """A JSON NUMBER, and nothing that merely converts to one.
+
+    ``float(value)`` before a strict check is not a strict check: it
+    turns ``True`` into 1.0 and accepts any numeric string, which is
+    exactly how a boolean became a 1.0-lot position. MT5 emits real
+    JSON numbers, so a string here is a contract violation, not a
+    value to be rescued."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VenueEvidenceError(
+            f"{name}: a JSON number is required, got "
+            f"{type(value).__name__} {value!r} — no coercion")
+    number = float(value)
+    if not math.isfinite(number):
+        raise VenueEvidenceError(f"{name}: non-finite value {value!r}")
+    return number
+
+
+def require_decimal_string(name: str, value: Any) -> float:
+    """A finite decimal STRING in the grammar the venue documents.
+
+    Alpaca returns quantities and prices as strings. They are read
+    through an explicit grammar -- optional sign, no leading zeros, an
+    optional fractional part -- so leading or trailing whitespace,
+    exponents, ``NaN``, ``Infinity``, ``0x`` forms and bare booleans
+    all refuse instead of being handed to ``float()``."""
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise VenueEvidenceError(
+            f"{name}: a decimal string is required, got "
+            f"{type(value).__name__} {value!r}")
+    if not _DECIMAL_GRAMMAR.match(value):
+        raise VenueEvidenceError(
+            f"{name}: {value!r} is not a finite decimal in the "
+            "documented grammar (no whitespace, no exponent, no "
+            "non-finite words)")
+    number = float(value)
+    if not math.isfinite(number):  # pragma: no cover - grammar bars it
+        raise VenueEvidenceError(f"{name}: non-finite value {value!r}")
+    return number
+
+
+def bounded(name: str, number: float, *, positive: bool = False,
+            nonnegative: bool = False) -> float:
     if positive and number <= 0.0:
         raise VenueEvidenceError(f"{name}: must be > 0, got {number}")
     if nonnegative and number < 0.0:
@@ -258,7 +312,11 @@ class VenueEvidencePolicy:
 # ---------------------------------------------------------------- #
 
 def _parse_alpaca_account_session_v1(payload: Any) -> dict:
-    """Alpaca ``GET /v2/account`` joined with ``GET /v2/clock``."""
+    """Alpaca ``GET /v2/account`` joined with ``GET /v2/clock``.
+
+    Numeric strings go through the documented decimal grammar; the
+    account fingerprint is DERIVED here so it can be bound to the
+    policy rather than merely asserted by the envelope."""
     if not isinstance(payload, dict):
         raise VenueEvidenceError("account session must be an object")
     require_fields("alpaca.account_session", payload,
@@ -283,18 +341,21 @@ def _parse_alpaca_account_session_v1(payload: Any) -> dict:
         "account_status": require_text("account.status",
                                        account["status"]),
         "market_open": require_bool("clock.is_open", clock["is_open"]),
-        "cash": require_real("account.cash", float(account["cash"])),
-        "equity": require_real("account.equity",
-                               float(account["equity"])),
+        "cash": require_decimal_string("account.cash",
+                                       account["cash"]),
+        "equity": require_decimal_string("account.equity",
+                                         account["equity"]),
         "observed_at": require_utc("clock.timestamp",
                                    clock["timestamp"]).isoformat(),
+        "internal_symbols": (),
     }
 
 
 def _parse_alpaca_positions_v1(payload: Any) -> dict:
-    """Alpaca ``GET /v2/positions``. Signed quantity is derived from
-    the venue's own redundant qty/side pair, and a contradiction
-    between them refuses rather than picking a winner."""
+    """Alpaca ``GET /v2/positions``. Signed quantity comes from the
+    venue's own redundant qty/side pair, and a contradiction between
+    them refuses rather than picking a winner. Every symbol is
+    reported so the caller can BIND it to the policy."""
     if not isinstance(payload, dict):
         raise VenueEvidenceError("positions payload must be an object")
     require_fields("alpaca.positions", payload,
@@ -302,40 +363,50 @@ def _parse_alpaca_positions_v1(payload: Any) -> dict:
     rows = payload["positions"]
     if not isinstance(rows, list):
         raise VenueEvidenceError("positions must be a list")
-    parsed = []
+    parsed, identities = [], set()
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise VenueEvidenceError(f"position[{index}] not an object")
         require_fields(f"alpaca.position[{index}]", row,
                        ("asset_id", "symbol", "qty", "side",
                         "avg_entry_price"))
-        quantity = require_real(f"position[{index}].qty",
-                                float(row["qty"]))
+        quantity = require_decimal_string(f"position[{index}].qty",
+                                          row["qty"])
         side = require_enum(f"position[{index}].side", row["side"],
                             ("long", "short"))
-        if side == "short" and quantity > 0.0:
-            signed = -quantity
-        elif side == "long" and quantity > 0.0:
+        if side == "long" and quantity > 0.0:
             signed = quantity
-        elif quantity < 0.0 and side == "short":
+        elif side == "short" and quantity > 0.0:
+            signed = -quantity
+        elif side == "short" and quantity < 0.0:
             signed = quantity
         else:
             raise VenueEvidenceError(
                 f"position[{index}]: qty {quantity} contradicts side "
                 f"{side!r} — the venue's redundant facts disagree")
+        identity = require_text(f"position[{index}].asset_id",
+                                row["asset_id"])
+        if identity in identities:
+            raise VenueEvidenceError(
+                f"position identity {identity!r} appears twice — "
+                "duplicate identities refuse")
+        identities.add(identity)
         parsed.append({
-            "position_identity": require_text(
-                f"position[{index}].asset_id", row["asset_id"]),
+            "position_identity": identity,
             "symbol": require_text(f"position[{index}].symbol",
                                    row["symbol"]),
             "side": side,
             "signed_quantity": signed,
-            "entry_price": require_real(
+            "entry_price": bounded(
                 f"position[{index}].avg_entry_price",
-                float(row["avg_entry_price"]), positive=True),
+                require_decimal_string(
+                    f"position[{index}].avg_entry_price",
+                    row["avg_entry_price"]), positive=True),
         })
     return {"positions": tuple(parsed),
             "positions_total": len(parsed),
+            "internal_symbols": tuple(sorted(
+                {row["symbol"] for row in parsed})),
             "observed_at": require_utc(
                 "positions.observed_at",
                 payload["observed_at"]).isoformat()}
@@ -356,7 +427,16 @@ def _parse_alpaca_open_orders_v1(payload: Any) -> dict:
     rows = payload["orders"]
     if not isinstance(rows, list):
         raise VenueEvidenceError("orders must be a list")
-    parsed = []
+    parsed, identities = [], set()
+
+    def _remember(identity: str) -> str:
+        if identity in identities:
+            raise VenueEvidenceError(
+                f"order identity {identity!r} appears twice — "
+                "duplicate identities refuse")
+        identities.add(identity)
+        return identity
+
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise VenueEvidenceError(f"order[{index}] not an object")
@@ -374,15 +454,17 @@ def _parse_alpaca_open_orders_v1(payload: Any) -> dict:
         legs = row["legs"]
         if not isinstance(legs, list):
             raise VenueEvidenceError(f"order[{index}].legs not a list")
+        symbol = require_text(f"order[{index}].symbol", row["symbol"])
         parsed.append({
-            "order_identity": require_text(f"order[{index}].id",
-                                           row["id"]),
-            "symbol": require_text(f"order[{index}].symbol",
-                                   row["symbol"]),
+            "order_identity": _remember(
+                require_text(f"order[{index}].id", row["id"])),
+            "symbol": symbol,
             "side": require_enum(f"order[{index}].side", row["side"],
                                  ("buy", "sell")),
-            "quantity": require_real(f"order[{index}].qty",
-                                     float(row["qty"]), positive=True),
+            "quantity": bounded(
+                f"order[{index}].qty",
+                require_decimal_string(f"order[{index}].qty",
+                                       row["qty"]), positive=True),
             "role": "entry",
             "status": require_text(f"order[{index}].status",
                                    row["status"]),
@@ -404,13 +486,15 @@ def _parse_alpaca_open_orders_v1(payload: Any) -> dict:
                     f"order[{index}].leg[{leg_index}]: type "
                     f"{leg_type!r} does not state a protective role")
             parsed.append({
-                "order_identity": require_text("leg.id", leg["id"]),
-                "symbol": require_text(f"order[{index}].symbol",
-                                       row["symbol"]),
+                "order_identity": _remember(
+                    require_text("leg.id", leg["id"])),
+                "symbol": symbol,
                 "side": require_enum("leg.side", leg["side"],
                                      ("buy", "sell")),
-                "quantity": require_real("leg.qty", float(leg["qty"]),
-                                         positive=True),
+                "quantity": bounded(
+                    "leg.qty",
+                    require_decimal_string("leg.qty", leg["qty"]),
+                    positive=True),
                 "role": role,
                 "status": require_text("leg.status", leg["status"]),
             })
@@ -419,13 +503,15 @@ def _parse_alpaca_open_orders_v1(payload: Any) -> dict:
             "orders_total": len(parsed),
             "entry_orders": len(entries),
             "protective_orders": len(parsed) - len(entries),
+            "internal_symbols": tuple(sorted(
+                {row["symbol"] for row in parsed})),
             "observed_at": require_utc(
                 "orders.observed_at",
                 payload["observed_at"]).isoformat()}
 
 
 def _parse_mt5_account_session_v1(payload: Any) -> dict:
-    """MT5 heartbeat, as the EA emits it."""
+    """MT5 heartbeat, as the EA emits it. Numbers are JSON numbers."""
     if not isinstance(payload, dict):
         raise VenueEvidenceError("heartbeat must be an object")
     require_fields("mt5.account_session", payload,
@@ -445,11 +531,14 @@ def _parse_mt5_account_session_v1(payload: Any) -> dict:
                                           payload["connected"]),
         "trading_enabled": require_bool("trade_allowed",
                                         payload["trade_allowed"]),
-        "terminal_build": require_real("terminal_build",
-                                       float(payload["terminal_build"]),
-                                       positive=True),
+        "terminal_build": bounded(
+            "terminal_build",
+            require_json_number("terminal_build",
+                                payload["terminal_build"]),
+            positive=True),
         "observed_at": require_utc("observed_at",
                                    payload["observed_at"]).isoformat(),
+        "internal_symbols": (),
     }
 
 
@@ -464,7 +553,7 @@ def _parse_mt5_positions_v1(payload: Any) -> dict:
     rows = payload["positions"]
     if not isinstance(rows, list):
         raise VenueEvidenceError("positions must be a list")
-    parsed = []
+    parsed, identities = [], set()
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise VenueEvidenceError(f"position[{index}] not an object")
@@ -474,27 +563,41 @@ def _parse_mt5_positions_v1(payload: Any) -> dict:
                         "take_profit", "profit"))
         side = require_enum(f"position[{index}].side", row["side"],
                             ("long", "short"))
-        volume = require_real(f"position[{index}].volume",
-                              float(row["volume"]), positive=True)
-        stop_loss = require_real(f"position[{index}].stop_loss",
-                                 float(row["stop_loss"]),
-                                 nonnegative=True)
-        take_profit = require_real(f"position[{index}].take_profit",
-                                   float(row["take_profit"]),
-                                   nonnegative=True)
+        volume = bounded(
+            f"position[{index}].volume",
+            require_json_number(f"position[{index}].volume",
+                                row["volume"]), positive=True)
+        stop_loss = bounded(
+            f"position[{index}].stop_loss",
+            require_json_number(f"position[{index}].stop_loss",
+                                row["stop_loss"]), nonnegative=True)
+        take_profit = bounded(
+            f"position[{index}].take_profit",
+            require_json_number(f"position[{index}].take_profit",
+                                row["take_profit"]), nonnegative=True)
+        identity = require_text(f"position[{index}].ticket",
+                                row["ticket"])
+        if identity in identities:
+            raise VenueEvidenceError(
+                f"position identity {identity!r} appears twice — "
+                "duplicate identities refuse")
+        identities.add(identity)
         parsed.append({
-            "position_identity": require_text(
-                f"position[{index}].ticket", row["ticket"]),
+            "position_identity": identity,
             "symbol": require_text(f"position[{index}].symbol",
                                    row["symbol"]),
             "side": side,
             "signed_quantity": volume if side == "long" else -volume,
-            "entry_price": require_real(
+            "entry_price": bounded(
                 f"position[{index}].price_open",
-                float(row["price_open"]), positive=True),
-            "opened_at_unix": require_real(
+                require_json_number(f"position[{index}].price_open",
+                                    row["price_open"]),
+                positive=True),
+            "opened_at_unix": bounded(
                 f"position[{index}].time_open_unix",
-                float(row["time_open_unix"]), positive=True),
+                require_json_number(
+                    f"position[{index}].time_open_unix",
+                    row["time_open_unix"]), positive=True),
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "native_protection_present": stop_loss > 0.0
@@ -502,6 +605,8 @@ def _parse_mt5_positions_v1(payload: Any) -> dict:
         })
     return {"positions": tuple(parsed),
             "positions_total": len(parsed),
+            "internal_symbols": tuple(sorted(
+                {row["symbol"] for row in parsed})),
             "observed_at": require_utc(
                 "positions.observed_at",
                 payload["observed_at"]).isoformat()}
@@ -526,7 +631,7 @@ def _parse_mt5_open_orders_v1(payload: Any) -> dict:
     rows = payload["orders"]
     if not isinstance(rows, list):
         raise VenueEvidenceError("orders must be a list")
-    parsed = []
+    parsed, identities = [], set()
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise VenueEvidenceError(f"order[{index}] not an object")
@@ -537,16 +642,23 @@ def _parse_mt5_open_orders_v1(payload: Any) -> dict:
         order_type = require_enum(f"order[{index}].order_type",
                                   row["order_type"],
                                   _MT5_PENDING_ENTRY_TYPES)
+        identity = require_text(f"order[{index}].ticket",
+                                row["ticket"])
+        if identity in identities:
+            raise VenueEvidenceError(
+                f"order identity {identity!r} appears twice — "
+                "duplicate identities refuse")
+        identities.add(identity)
         parsed.append({
-            "order_identity": require_text(f"order[{index}].ticket",
-                                           row["ticket"]),
+            "order_identity": identity,
             "symbol": require_text(f"order[{index}].symbol",
                                    row["symbol"]),
             "order_type": order_type,
             "side": "buy" if "BUY" in order_type else "sell",
-            "quantity": require_real(f"order[{index}].volume",
-                                     float(row["volume"]),
-                                     positive=True),
+            "quantity": bounded(
+                f"order[{index}].volume",
+                require_json_number(f"order[{index}].volume",
+                                    row["volume"]), positive=True),
             "role": "entry",
             "status": require_text(f"order[{index}].state",
                                    row["state"]),
@@ -555,6 +667,8 @@ def _parse_mt5_open_orders_v1(payload: Any) -> dict:
             "orders_total": len(parsed),
             "entry_orders": len(parsed),
             "protective_orders": 0,
+            "internal_symbols": tuple(sorted(
+                {row["symbol"] for row in parsed})),
             "observed_at": require_utc(
                 "orders.observed_at",
                 payload["observed_at"]).isoformat()}
@@ -574,27 +688,39 @@ def _parse_mt5_market_clock_v1(payload: Any) -> dict:
     require_fields("mt5.bar", bar,
                    ("time", "open", "high", "low", "close", "volume"))
     require_fields("mt5.tick", tick, ("bid", "ask", "observed_at"))
-    high = require_real("bar.high", float(bar["high"]), positive=True)
-    low = require_real("bar.low", float(bar["low"]), positive=True)
+    high = bounded("bar.high",
+                   require_json_number("bar.high", bar["high"]),
+                   positive=True)
+    low = bounded("bar.low",
+                  require_json_number("bar.low", bar["low"]),
+                  positive=True)
     if low > high:
         raise VenueEvidenceError(
             f"bar geometry is impossible: low {low} > high {high}")
-    bid = require_real("tick.bid", float(tick["bid"]), positive=True)
-    ask = require_real("tick.ask", float(tick["ask"]), positive=True)
+    bid = bounded("tick.bid",
+                  require_json_number("tick.bid", tick["bid"]),
+                  positive=True)
+    ask = bounded("tick.ask",
+                  require_json_number("tick.ask", tick["ask"]),
+                  positive=True)
     if ask < bid:
         raise VenueEvidenceError(
             f"quote is crossed: ask {ask} < bid {bid}")
+    symbol = require_text("symbol", payload["symbol"])
     return {
-        "symbol": require_text("symbol", payload["symbol"]),
+        "symbol": symbol,
         "timeframe": require_text("timeframe", payload["timeframe"]),
         "bar_time": require_utc("bar.time", bar["time"]).isoformat(),
-        "bar_close": require_real("bar.close", float(bar["close"]),
-                                  positive=True),
+        "bar_close": bounded(
+            "bar.close",
+            require_json_number("bar.close", bar["close"]),
+            positive=True),
         "bid": bid,
         "ask": ask,
         "spread": ask - bid,
         "quote_observed_at": require_utc(
             "tick.observed_at", tick["observed_at"]).isoformat(),
+        "internal_symbols": (symbol,),
         "observed_at": require_utc(
             "market_clock.observed_at",
             payload["observed_at"]).isoformat(),
@@ -633,19 +759,19 @@ def parser_identity(key: tuple, parser: Callable) -> str:
 # constant is deliberately updated in review.
 SEALED_PARSER_IDENTITIES: Mapping[tuple, str] = MappingProxyType({
     ("alpaca_paper", "account_session", "v1"):
-        "a3aca5b763b767f1b086fb5a332a978c",
+        "91fa22c79095caddbf82ada5f525ab1f",
     ("alpaca_paper", "positions", "v1"):
-        "fa83c4eb9b4bd97384b7775fc46158fa",
+        "f3c5b6659bf88c65554706cd6e6bee9a",
     ("alpaca_paper", "open_orders", "v1"):
-        "100383bed07ae90910b066042f9721ac",
+        "b813590839e8db31f8f91801e74a1e13",
     ("mt5_demo", "account_session", "v1"):
-        "d956657db548638f65847295c407c17b",
+        "2fea3126c04002638e45d77cac493398",
     ("mt5_demo", "positions", "v1"):
-        "0bcafe790a37af252ff5b379025c73e6",
+        "6759e57dd2f194e5736801fd91e5f5ab",
     ("mt5_demo", "open_orders", "v1"):
-        "90142e533176e9bcf8be9e131663d841",
+        "34e0be893f2e43eac00a06b6a50a3301",
     ("mt5_demo", "market_clock", "v1"):
-        "e573f2914d75464f6a184620be7fbf79",
+        "a2da56287687f89dda0c144710511b82",
 })
 
 
@@ -702,8 +828,17 @@ class VenueDirectEvidence:
     @staticmethod
     def parse(*, venue: str, account_fingerprint: str, symbol: str,
               evidence_type: str, schema_version: str, source: str,
-              evidence_id: str, observed_at: Any,
-              raw_bytes: bytes) -> "VenueDirectEvidence":
+              evidence_id: str, raw_bytes: bytes,
+              transport_observed_at: Any = None
+              ) -> "VenueDirectEvidence":
+        """C1: freshness comes from the BYTES.
+
+        The envelope has no free ``observed_at`` any more. The
+        timestamp is the one the parser extracts from the payload
+        itself, so a 2020 payload cannot be rewrapped in a 2026
+        envelope and pass a 120-second policy. A transport timestamp
+        may be supplied, but only as a CHECK: it must equal the
+        internal one to the microsecond, and a mismatch refuses."""
         require_enum("venue", venue, VENUES)
         require_enum("evidence_type", evidence_type, EVIDENCE_TYPES)
         for name, value in (("account_fingerprint",
@@ -717,7 +852,6 @@ class VenueDirectEvidence:
             raise VenueEvidenceError(
                 f"source {source!r} is not venue-direct evidence and "
                 "is refused by name")
-        stamp = require_utc("observed_at", observed_at)
         decoded = decode_payload_bytes(
             raw_bytes, what=f"{venue}.{evidence_type}")
         if isinstance(decoded, dict) and "venue_direct" in decoded:
@@ -727,6 +861,21 @@ class VenueDirectEvidence:
         key = (venue, evidence_type, schema_version)
         parser, identity = resolve_parser(key)
         facts = parser(decoded)
+        if "observed_at" not in facts:
+            raise VenueEvidenceError(
+                f"{key}: the parser produced no observed_at; "
+                "freshness must come from the payload")
+        stamp = require_utc("payload.observed_at",
+                            facts["observed_at"])
+        if transport_observed_at is not None:
+            transport = require_utc("transport_observed_at",
+                                    transport_observed_at)
+            if transport != stamp:
+                raise VenueEvidenceError(
+                    f"transport timestamp {transport.isoformat()} "
+                    f"does not match the payload's "
+                    f"{stamp.isoformat()} — a transport stamp is a "
+                    "check on the body, never a substitute for it")
         canonical = canonical_bytes(decoded)
         return VenueDirectEvidence(
             venue=venue, account_fingerprint=account_fingerprint,
@@ -758,6 +907,11 @@ class VenueDirectEvidence:
             raise VenueEvidenceError(
                 f"symbol {self.symbol!r} is not the policy's "
                 f"{policy.symbol!r}")
+        if self.schema_version != policy.schema_version and \
+                policy.schema_version != SCHEMA_VERSION:
+            raise VenueEvidenceError(
+                f"schema {self.schema_version!r} is not the policy's "
+                f"{policy.schema_version!r}")
         if self.source not in policy.allowed_sources:
             raise VenueEvidenceError(
                 f"source {self.source!r} is not in the policy's "
@@ -777,6 +931,27 @@ class VenueDirectEvidence:
             raise VenueEvidenceError(
                 "parser identity mismatch — the executing parser is "
                 "not the one this evidence was derived under")
+
+        # C2: the ENVELOPE agreeing with the policy proves nothing
+        # about the FACTS. Every symbol inside the payload, and the
+        # account fingerprint the payload itself states, are bound
+        # here. A mixed-symbol payload refuses; it is never filtered
+        # and never silently summed.
+        facts = self.facts
+        internal = tuple(facts.get("internal_symbols", ()))
+        foreign = sorted({s for s in internal if s != policy.symbol})
+        if foreign:
+            raise VenueEvidenceError(
+                f"payload carries symbols {foreign} but the policy "
+                f"binds {policy.symbol!r} — a foreign or mixed-symbol "
+                "payload is refused, never filtered")
+        stated = facts.get("account_fingerprint")
+        if stated is not None and stated != policy.account_fingerprint:
+            raise VenueEvidenceError(
+                f"the payload states account fingerprint {stated!r} "
+                f"but the policy binds "
+                f"{policy.account_fingerprint!r} — the envelope may "
+                "not vouch for an account the facts contradict")
         return self
 
     def provenance(self) -> dict:
