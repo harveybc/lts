@@ -412,14 +412,47 @@ def _parse_alpaca_positions_v1(payload: Any) -> dict:
                 payload["observed_at"]).isoformat()}
 
 
+# Alpaca states what an order is FOR. These are its own values, not
+# an interpretation of side and quantity.
+_ALPACA_OPENING_INTENTS = ("buy_to_open", "sell_to_open")
+_ALPACA_CLOSING_INTENTS = ("buy_to_close", "sell_to_close")
+_ALPACA_INTENTS = _ALPACA_OPENING_INTENTS + _ALPACA_CLOSING_INTENTS
+_ALPACA_PROTECTIVE_TYPE_ROLE = {
+    "limit": "protective_take_profit",
+    "stop": "protective_stop",
+    "stop_limit": "protective_stop",
+}
+
+
+def _alpaca_intent_side(intent: str) -> str:
+    return "buy" if intent.startswith("buy_") else "sell"
+
+
 def _parse_alpaca_open_orders_v1(payload: Any) -> dict:
     """Alpaca ``GET /v2/orders?status=open&nested=true``.
 
-    The role is STRUCTURAL: a bracket parent is the entry and each leg
-    is protection typed by its own ``type``. An order whose class the
-    venue does not state as a bracket has no establishable role and
-    refuses -- guessing from side and size is exactly how an
-    independent reversal gets mistaken for protection."""
+    The role comes from what the venue DECLARES the order is for --
+    ``position_intent`` together with the order type -- and never from
+    side and quantity. An owner-authorized read-only capture disproved
+    the earlier assumption that a top-level ``order_class=bracket``
+    object is always an entry: once the parent has filled, the
+    endpoint returns the resting protective child at the top level
+    with ``legs`` null, and Alpaca declares it plainly as
+    ``position_intent=buy_to_close``. Reading that as an entry made a
+    protective take-profit a cancellation candidate during WIND_DOWN,
+    and geometry could not have rescued it either -- a BUY while SHORT
+    looks exactly like a reversal.
+
+    Exactly two shapes are supported, and anything else refuses:
+
+    * an OPENING intent with a non-empty ``legs`` list: the object is
+      the entry and each leg is protection typed by its own ``type``;
+    * a CLOSING intent with ``legs`` null or empty: the object is
+      itself the protective child, typed by its own ``type``.
+
+    ``legs`` is validated as the venue sent it. Turning null into an
+    empty list before the contract runs is precisely the
+    normalisation that produced the misclassification."""
     if not isinstance(payload, dict):
         raise VenueEvidenceError("orders payload must be an object")
     require_fields("alpaca.open_orders", payload,
@@ -442,62 +475,110 @@ def _parse_alpaca_open_orders_v1(payload: Any) -> dict:
             raise VenueEvidenceError(f"order[{index}] not an object")
         require_fields(f"alpaca.order[{index}]", row,
                        ("id", "symbol", "side", "qty", "status",
-                        "order_class", "type", "legs"))
+                        "order_class", "type", "position_intent",
+                        "legs"))
         order_class = require_text(f"order[{index}].order_class",
                                    row["order_class"])
         if order_class != "bracket":
             raise VenueEvidenceError(
                 f"order[{index}]: order_class {order_class!r} does "
-                "not state a role; only a bracket states one "
-                "structurally, and a role may never be inferred from "
-                "side or size")
-        legs = row["legs"]
-        if not isinstance(legs, list):
-            raise VenueEvidenceError(f"order[{index}].legs not a list")
+                "not state a role; only a bracket states one, and a "
+                "role may never be inferred from side or size")
+        intent = require_enum(f"order[{index}].position_intent",
+                              row["position_intent"],
+                              _ALPACA_INTENTS)
+        side = require_enum(f"order[{index}].side", row["side"],
+                            ("buy", "sell"))
+        if side != _alpaca_intent_side(intent):
+            raise VenueEvidenceError(
+                f"order[{index}]: side {side!r} contradicts "
+                f"position_intent {intent!r} — the venue's own facts "
+                "disagree")
+        order_type = require_text(f"order[{index}].type", row["type"])
         symbol = require_text(f"order[{index}].symbol", row["symbol"])
+        quantity = bounded(
+            f"order[{index}].qty",
+            require_decimal_string(f"order[{index}].qty", row["qty"]),
+            positive=True)
+        status = require_text(f"order[{index}].status", row["status"])
+
+        # legs EXACTLY as the venue sent them: null and [] are the
+        # same shape here, and a list is a different one. Nothing is
+        # normalised before the contract decides.
+        legs = row["legs"]
+        if legs is not None and not isinstance(legs, list):
+            raise VenueEvidenceError(
+                f"order[{index}].legs must be null or a list, got "
+                f"{type(legs).__name__}")
+        has_legs = bool(legs)
+
+        if intent in _ALPACA_OPENING_INTENTS:
+            if not has_legs:
+                raise VenueEvidenceError(
+                    f"order[{index}]: an opening bracket with no legs "
+                    "is not a shape this parser models; a bracket "
+                    "parent carries its protection")
+            parsed.append({
+                "order_identity": _remember(
+                    require_text(f"order[{index}].id", row["id"])),
+                "symbol": symbol, "side": side, "quantity": quantity,
+                "order_type": order_type,
+                "position_intent": intent,
+                "role": "entry", "status": status,
+            })
+            for leg_index, leg in enumerate(legs):
+                if not isinstance(leg, dict):
+                    raise VenueEvidenceError(
+                        f"order[{index}].legs[{leg_index}] not an "
+                        "object")
+                require_fields(
+                    f"alpaca.order[{index}].leg[{leg_index}]", leg,
+                    ("id", "side", "type", "qty", "status"))
+                leg_type = require_text("leg.type", leg["type"])
+                role = _ALPACA_PROTECTIVE_TYPE_ROLE.get(leg_type)
+                if role is None:
+                    raise VenueEvidenceError(
+                        f"order[{index}].leg[{leg_index}]: type "
+                        f"{leg_type!r} does not state a protective "
+                        "role")
+                parsed.append({
+                    "order_identity": _remember(
+                        require_text("leg.id", leg["id"])),
+                    "symbol": symbol,
+                    "side": require_enum("leg.side", leg["side"],
+                                         ("buy", "sell")),
+                    "quantity": bounded(
+                        "leg.qty",
+                        require_decimal_string("leg.qty", leg["qty"]),
+                        positive=True),
+                    "order_type": leg_type,
+                    "position_intent": None,
+                    "role": role,
+                    "status": require_text("leg.status",
+                                           leg["status"]),
+                })
+            continue
+
+        # a CLOSING intent: this object IS the protective child
+        if has_legs:
+            raise VenueEvidenceError(
+                f"order[{index}]: position_intent {intent!r} closes a "
+                "position but the order carries legs — a protective "
+                "child has no children of its own")
+        role = _ALPACA_PROTECTIVE_TYPE_ROLE.get(order_type)
+        if role is None:
+            raise VenueEvidenceError(
+                f"order[{index}]: a closing bracket order of type "
+                f"{order_type!r} states no protective role; only "
+                f"{sorted(_ALPACA_PROTECTIVE_TYPE_ROLE)} do")
         parsed.append({
             "order_identity": _remember(
                 require_text(f"order[{index}].id", row["id"])),
-            "symbol": symbol,
-            "side": require_enum(f"order[{index}].side", row["side"],
-                                 ("buy", "sell")),
-            "quantity": bounded(
-                f"order[{index}].qty",
-                require_decimal_string(f"order[{index}].qty",
-                                       row["qty"]), positive=True),
-            "role": "entry",
-            "status": require_text(f"order[{index}].status",
-                                   row["status"]),
+            "symbol": symbol, "side": side, "quantity": quantity,
+            "order_type": order_type, "position_intent": intent,
+            "role": role, "status": status,
         })
-        for leg_index, leg in enumerate(legs):
-            if not isinstance(leg, dict):
-                raise VenueEvidenceError(
-                    f"order[{index}].legs[{leg_index}] not an object")
-            require_fields(
-                f"alpaca.order[{index}].leg[{leg_index}]", leg,
-                ("id", "side", "type", "qty", "status"))
-            leg_type = require_text("leg.type", leg["type"])
-            if leg_type in ("stop", "stop_limit"):
-                role = "protective_stop"
-            elif leg_type == "limit":
-                role = "protective_take_profit"
-            else:
-                raise VenueEvidenceError(
-                    f"order[{index}].leg[{leg_index}]: type "
-                    f"{leg_type!r} does not state a protective role")
-            parsed.append({
-                "order_identity": _remember(
-                    require_text("leg.id", leg["id"])),
-                "symbol": symbol,
-                "side": require_enum("leg.side", leg["side"],
-                                     ("buy", "sell")),
-                "quantity": bounded(
-                    "leg.qty",
-                    require_decimal_string("leg.qty", leg["qty"]),
-                    positive=True),
-                "role": role,
-                "status": require_text("leg.status", leg["status"]),
-            })
+
     entries = tuple(o for o in parsed if o["role"] == "entry")
     return {"orders": tuple(parsed),
             "orders_total": len(parsed),
@@ -763,7 +844,7 @@ SEALED_PARSER_IDENTITIES: Mapping[tuple, str] = MappingProxyType({
     ("alpaca_paper", "positions", "v1"):
         "f3c5b6659bf88c65554706cd6e6bee9a",
     ("alpaca_paper", "open_orders", "v1"):
-        "b813590839e8db31f8f91801e74a1e13",
+        "9dee32b0f6eb0b1b65982f9e452b8d72",
     ("mt5_demo", "account_session", "v1"):
         "2fea3126c04002638e45d77cac493398",
     ("mt5_demo", "positions", "v1"):

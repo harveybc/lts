@@ -1,0 +1,45 @@
+{
+ "authority_code_identity": "25dec77ad836f63212cd496a3b312e5aea0f2be9fa1a58f59225644c574b5da5",
+ "now": "2026-08-28T15:00:00+00:00",
+ "raw_model_output": 1.0,
+ "mapped_command": 1,
+ "state_block": {
+  "state": "WIND_DOWN",
+  "policy_enabled": true,
+  "evidence_ok": true,
+  "wind_down": true,
+  "forced_flatten": false,
+  "time_to_next_close_hours": 3.0,
+  "time_since_reopen_hours": 20.0
+ },
+ "evidence_policy": {
+  "venue": "alpaca_paper",
+  "account_fingerprint": "7853afed1025c1ba",
+  "symbol": "SPY",
+  "allowed_sources": [
+   "alpaca_paper_rest_v2"
+  ],
+  "max_age_seconds": 120.0,
+  "calendar_identity": "cal-venue-v1"
+ },
+ "session_policy": {
+  "enabled": true,
+  "session_source": "venue_symbol_sessions_v1",
+  "wind_down_hours": 8.0,
+  "forced_flatten_hours": 4.0,
+  "cancel_pending_on_wind_down": true,
+  "allow_risk_increase_during_wind_down": false,
+  "reopen_min_hours": 8.0,
+  "reopen_min_closed_bars": 2,
+  "stability_consecutive_checks": 2,
+  "max_spread_relative_to_baseline": 3.0,
+  "max_gap_sigma": 6.0,
+  "max_realized_vol_relative_to_baseline": 4.0,
+  "carried_position_recovery": "protected_opportunistic_then_forced",
+  "holiday_policy": "same_as_weekly",
+  "calendar_identity": "cal-venue-v1",
+  "reopen_baseline_bars": 4,
+  "reopen_gap_sigma_bars": 4,
+  "reopen_realized_vol_bars": 4
+ }
+}

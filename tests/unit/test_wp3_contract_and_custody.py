@@ -743,12 +743,58 @@ class TestC7ProposedExportCannotAct:
                           "connect("):
             assert forbidden not in source, forbidden
 
-    def test_wp3_c7_is_still_declared_incomplete(self):
+    def test_the_synthetic_set_is_declared_as_superseded(self):
         note = (Path(__file__).resolve().parents[2] / "examples" /
                 "captures" / "wp3_alpaca_dry_run" / "NOTE.md"
                 ).read_text()
         flat = " ".join(note.lower().replace("**", "").split())
         assert "synthetic" in flat
-        assert "typed absence" in flat
+        assert "superseded" in flat
+        assert "wp3_alpaca_recorded" in flat
+
+    def test_the_recorded_note_separates_observed_from_substituted(
+            self):
+        note = (Path(__file__).resolve().parents[2] / "examples" /
+                "captures" / "wp3_alpaca_recorded" / "NOTE.md"
+                ).read_text()
+        flat = " ".join(note.lower().replace("**", "").split())
+        assert "observed" in flat and "substituted" in flat
+        for observed in ("spy short", "order_class` = `bracket",
+                         "position_intent` = `buy_to_close",
+                         "legs` is null/empty"):
+            assert observed in flat, observed
+        for substituted in ("every identifier", "every price and "
+                            "quantity", "every timestamp"):
+            assert substituted in flat, substituted
+
+    def test_the_recorded_capture_preserves_the_categorical_shape(
+            self):
+        root = (Path(__file__).resolve().parents[2] / "examples" /
+                "captures" / "wp3_alpaca_recorded")
+        orders = json.loads(json.loads(
+            (root / "open_orders.json").read_text())["payload"])
+        row = orders["orders"][0]
+        assert row["status"] == "new"
+        assert row["order_class"] == "bracket"
+        assert row["type"] == "limit"
+        assert row["position_intent"] == "buy_to_close"
+        assert row["legs"] is None
+        positions = json.loads(json.loads(
+            (root / "positions.json").read_text())["payload"])
+        assert positions["positions"][0]["side"] == "short"
+        assert positions["positions"][0]["symbol"] == "SPY"
+
+    def test_no_real_identifier_appears_in_the_recorded_capture(self):
+        root = (Path(__file__).resolve().parents[2] / "examples" /
+                "captures" / "wp3_alpaca_recorded")
+        for path in root.glob("*.json"):
+            text = path.read_text()
+            assert "synthetic" in text or "sanitized" in text or \
+                path.name == "dry_run_config.json", path.name
+
+    def test_c7_has_evidence_but_acceptance_is_not_claimed(self):
+        """C7 is no longer blocked on owner action -- the capture
+        exists -- but this package does not claim it accepted."""
         from tools.propose_alpaca_capture_export import describe
-        assert "INCOMPLETE" in describe()["note"]
+        assert describe()["performs_any_read_of_private_state"] \
+            is False

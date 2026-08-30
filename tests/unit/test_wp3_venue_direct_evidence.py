@@ -50,13 +50,28 @@ ALPACA_ORDERS = {
     "orders": [{
         "id": "parent-order-id", "symbol": "SPY", "side": "buy",
         "qty": "10", "status": "new", "order_class": "bracket",
-        "type": "market",
+        "type": "market", "position_intent": "buy_to_open",
         "legs": [
             {"id": "stop-leg-id", "side": "sell", "type": "stop",
              "qty": "10", "status": "held"},
             {"id": "limit-leg-id", "side": "sell", "type": "limit",
              "qty": "10", "status": "held"}],
     }],
+}
+ALPACA_PROTECTIVE_CHILD = {
+    "observed_at": OBSERVED,
+    "orders": [{
+        "id": "synthetic-order-0001", "symbol": "SPY",
+        "side": "buy", "qty": "1", "status": "new",
+        "order_class": "bracket", "type": "limit",
+        "position_intent": "buy_to_close", "legs": None,
+    }],
+}
+ALPACA_SHORT_POSITION = {
+    "observed_at": OBSERVED,
+    "positions": [{"asset_id": "synthetic-asset-0001",
+                   "symbol": "SPY", "qty": "1", "side": "short",
+                   "avg_entry_price": "500.00"}],
 }
 MT5_ACCOUNT = {
     "schema": "lts.mt5.heartbeat.v1", "adapter_version": "2.0.0",
@@ -610,3 +625,150 @@ class TestC3PerVenueNumericTypes:
             assert "float(row[" not in source, key
             assert "float(payload[" not in source, key
             assert "float(account[" not in source, key
+
+
+# =================================================================== #
+# WP3-C9: the role comes from the venue's DECLARED intent             #
+# =================================================================== #
+
+class TestC9RoleFromDeclaredIntent:
+
+    def test_the_recorded_protective_child_is_not_an_entry(self):
+        """FROZEN COUNTEREXAMPLE. The owner-authorized read-only
+        capture observed a top-level bracket order with legs null and
+        position_intent buy_to_close, standing against a SHORT SPY
+        position. The old parser called it an ENTRY, and geometry
+        could not have rescued it either: a BUY while SHORT looks
+        exactly like a reversal."""
+        facts = evidence("alpaca_paper", "open_orders",
+                         ALPACA_PROTECTIVE_CHILD).facts
+        assert [o["role"] for o in facts["orders"]] == [
+            "protective_take_profit"]
+        assert facts["entry_orders"] == 0
+        assert facts["protective_orders"] == 1
+        assert facts["orders"][0]["position_intent"] == "buy_to_close"
+
+    def test_the_intent_is_required_by_the_contract(self):
+        payload = json.loads(json.dumps(ALPACA_PROTECTIVE_CHILD))
+        del payload["orders"][0]["position_intent"]
+        with pytest.raises(VenueEvidenceError,
+                           match="missing fields"):
+            evidence("alpaca_paper", "open_orders", payload)
+
+    @pytest.mark.parametrize("intent", [
+        "buy", "close", "buy_to_hold", "", None, True, 1,
+        "BUY_TO_CLOSE"])
+    def test_an_unknown_intent_refuses(self, intent):
+        payload = json.loads(json.dumps(ALPACA_PROTECTIVE_CHILD))
+        payload["orders"][0]["position_intent"] = intent
+        with pytest.raises(VenueEvidenceError, match="not one of"):
+            evidence("alpaca_paper", "open_orders", payload)
+
+    @pytest.mark.parametrize("order_type,role", [
+        ("limit", "protective_take_profit"),
+        ("stop", "protective_stop"),
+        ("stop_limit", "protective_stop")])
+    def test_a_closing_child_is_typed_by_its_own_type(self,
+                                                      order_type,
+                                                      role):
+        payload = json.loads(json.dumps(ALPACA_PROTECTIVE_CHILD))
+        payload["orders"][0]["type"] = order_type
+        facts = evidence("alpaca_paper", "open_orders", payload).facts
+        assert facts["orders"][0]["role"] == role
+        assert facts["entry_orders"] == 0
+
+    @pytest.mark.parametrize("order_type", [
+        "market", "trailing_stop", "oco"])
+    def test_a_closing_child_of_an_untyped_kind_refuses(self,
+                                                        order_type):
+        payload = json.loads(json.dumps(ALPACA_PROTECTIVE_CHILD))
+        payload["orders"][0]["type"] = order_type
+        with pytest.raises(VenueEvidenceError,
+                           match="states no protective role"):
+            evidence("alpaca_paper", "open_orders", payload)
+
+    @pytest.mark.parametrize("intent,side", [
+        ("buy_to_close", "sell"), ("sell_to_close", "buy"),
+        ("buy_to_open", "sell"), ("sell_to_open", "buy")])
+    def test_a_side_contradicting_the_intent_refuses(self, intent,
+                                                     side):
+        payload = json.loads(json.dumps(ALPACA_PROTECTIVE_CHILD))
+        payload["orders"][0]["position_intent"] = intent
+        payload["orders"][0]["side"] = side
+        with pytest.raises(VenueEvidenceError,
+                           match="contradicts position_intent"):
+            evidence("alpaca_paper", "open_orders", payload)
+
+    def test_a_short_side_closing_child_is_a_protective_stop(self):
+        """The mirror shape: a SELL closing a LONG position."""
+        payload = json.loads(json.dumps(ALPACA_PROTECTIVE_CHILD))
+        payload["orders"][0]["position_intent"] = "sell_to_close"
+        payload["orders"][0]["side"] = "sell"
+        payload["orders"][0]["type"] = "stop"
+        facts = evidence("alpaca_paper", "open_orders", payload).facts
+        assert facts["orders"][0]["role"] == "protective_stop"
+
+    def test_an_unfilled_parent_with_legs_still_parses(self):
+        facts = evidence("alpaca_paper", "open_orders",
+                         ALPACA_ORDERS).facts
+        assert [o["role"] for o in facts["orders"]] == [
+            "entry", "protective_stop", "protective_take_profit"]
+        assert facts["entry_orders"] == 1
+        assert facts["protective_orders"] == 2
+        assert facts["orders"][0]["position_intent"] == "buy_to_open"
+        assert facts["orders"][1]["position_intent"] is None
+
+    def test_null_is_not_normalised_to_an_empty_list(self):
+        """The misclassification was produced by exactly this
+        normalisation, so null and a list must reach the contract as
+        the venue sent them."""
+        import inspect
+        import app.venue_direct_evidence as mod
+        source = inspect.getsource(mod._parse_alpaca_open_orders_v1)
+        assert "legs or []" not in source
+        assert "legs = []" not in source
+        payload = json.loads(json.dumps(ALPACA_PROTECTIVE_CHILD))
+        payload["orders"][0]["legs"] = []
+        empty = evidence("alpaca_paper", "open_orders", payload).facts
+        payload["orders"][0]["legs"] = None
+        null = evidence("alpaca_paper", "open_orders", payload).facts
+        assert empty["orders"][0]["role"] == null["orders"][0]["role"]
+
+    @pytest.mark.parametrize("legs", [{}, "legs", 0, 1.5])
+    def test_legs_of_a_wrong_kind_refuse(self, legs):
+        payload = json.loads(json.dumps(ALPACA_PROTECTIVE_CHILD))
+        payload["orders"][0]["legs"] = legs
+        with pytest.raises(VenueEvidenceError,
+                           match="must be null or a list"):
+            evidence("alpaca_paper", "open_orders", payload)
+
+    def test_a_closing_order_carrying_legs_refuses(self):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"][0]["position_intent"] = "buy_to_close"
+        with pytest.raises(VenueEvidenceError,
+                           match="has no children of its own"):
+            evidence("alpaca_paper", "open_orders", payload)
+
+    def test_an_opening_order_without_legs_refuses(self):
+        for legs in (None, []):
+            payload = json.loads(json.dumps(ALPACA_PROTECTIVE_CHILD))
+            payload["orders"][0]["position_intent"] = "buy_to_open"
+            payload["orders"][0]["legs"] = legs
+            with pytest.raises(VenueEvidenceError,
+                               match="opening bracket with no legs"):
+                evidence("alpaca_paper", "open_orders", payload)
+
+    def test_duplicate_identities_still_refuse_across_shapes(self):
+        payload = json.loads(json.dumps(ALPACA_PROTECTIVE_CHILD))
+        payload["orders"].append(dict(payload["orders"][0]))
+        with pytest.raises(VenueEvidenceError, match="appears twice"):
+            evidence("alpaca_paper", "open_orders", payload)
+
+    def test_a_mixed_book_of_both_shapes_parses(self):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"].append(
+            json.loads(json.dumps(
+                ALPACA_PROTECTIVE_CHILD))["orders"][0])
+        facts = evidence("alpaca_paper", "open_orders", payload).facts
+        assert facts["entry_orders"] == 1
+        assert facts["protective_orders"] == 3

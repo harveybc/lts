@@ -346,7 +346,7 @@ def derive_directive(authority: AuthorityBinding, *, policy: dict,
             final_command=session.CLOSE_COMMAND,
             effects=("cancel_pending_entries", "request_close")
             if entry_identities else ("request_close",),
-            cancel_order_identities=entry_identities,
+            cancel_order_identities=tuple(entry_identities),
             blocks_risk_increase=True,
             requires_direct_confirmation=True,
             preserve_protection=True,
@@ -355,10 +355,15 @@ def derive_directive(authority: AuthorityBinding, *, policy: dict,
                    "only on direct zero-position zero-order evidence",
             evidence_provenance=dict(provenance))
 
+    # Cancelling pending entries is a consequence of the STATE, not
+    # of what the model happened to ask for. Honouring it only inside
+    # the masked branch meant a pending entry survived WIND_DOWN
+    # whenever the model's command was not itself risk-increasing.
+    cancel = tuple(entry_identities) if decision.get(
+        "cancel_pending") else ()
+
     if overlay in ("masked_risk_increase",
                    "masked_entry_during_blackout"):
-        cancel = entry_identities if decision.get(
-            "cancel_pending") else ()
         return VenueDirective(
             venue=venue, account_fingerprint=account_fingerprint,
             symbol=symbol, session_state=state,
@@ -383,9 +388,14 @@ def derive_directive(authority: AuthorityBinding, *, policy: dict,
         raw_model_output=raw_model_output,
         mapped_command=mapped_command, mapped_action=classification,
         overlay=overlay, final_command=mapped_command,
-        effects=("submit_decision",), cancel_order_identities=(),
+        effects=(("submit_decision", "cancel_pending_entries")
+                 if cancel else ("submit_decision",)),
+        cancel_order_identities=cancel,
         blocks_risk_increase=False,
         requires_direct_confirmation=False,
         preserve_protection=True,
-        reason="ordinary decision", evidence_provenance=dict(
-            provenance))
+        reason=("ordinary decision"
+                + ("; pending entries are cancelled because the "
+                   "session state requires it, not because of the "
+                   "model's command" if cancel else "")),
+        evidence_provenance=dict(provenance))

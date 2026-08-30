@@ -17,7 +17,8 @@ import pytest
 
 from app.session_authority_adapter import (
     AdapterRefusal, AuthorityUnavailable, EFFECTS, STATES,
-    VenueDirective, derive_directive, load_authority)
+    VenueDirective, build_exposure_facts, derive_directive,
+    load_authority)
 from app.session_watchdog import (
     CALENDAR_SUPPRESSES_ONLY, CLASSIFICATIONS, classify)
 from app.venue_direct_evidence import (
@@ -25,8 +26,9 @@ from app.venue_direct_evidence import (
 
 from tests.unit.test_wp3_venue_direct_evidence import (  # noqa: E402
     ALPACA_ACCOUNT, ALPACA_FP, ALPACA_ORDERS, ALPACA_POSITIONS,
-    MT5_ACCOUNT, MT5_CLOCK, MT5_ORDERS, MT5_POSITIONS, NOW, OBSERVED,
-    evidence, mt5_evidence, mt5_policy, policy)
+    ALPACA_PROTECTIVE_CHILD, ALPACA_SHORT_POSITION, MT5_ACCOUNT,
+    MT5_CLOCK, MT5_ORDERS, MT5_POSITIONS, NOW, OBSERVED, evidence,
+    mt5_evidence, mt5_policy, policy)
 
 
 def reviewed_identity():
@@ -622,3 +624,90 @@ class TestDryRunIsStructurallyEffectFree:
         with pytest.raises(VenueEvidenceError,
                            match="ORIGINAL text"):
             evidence_from({"payload": MT5_POSITIONS})
+
+
+
+# =================================================================== #
+# WP3-C9: WIND_DOWN must never offer protection for cancellation      #
+# =================================================================== #
+
+class TestC9WindDownPreservesProtection:
+
+    def _directive(self, authority, orders_payload,
+                   positions_payload, state="WIND_DOWN"):
+        orders_ev = evidence("alpaca_paper", "open_orders",
+                             orders_payload)
+        positions_ev = evidence("alpaca_paper", "positions",
+                                positions_payload)
+        return derive_directive(
+            authority,
+            policy=authority.session_exposure.validate_policy(
+                session_policy()),
+            state_block=block(state), venue="alpaca_paper",
+            account_fingerprint=ALPACA_FP, symbol="SPY",
+            raw_model_output=1.0, mapped_command=1,
+            positions=positions_ev.facts, orders=orders_ev.facts,
+            provenance=positions_ev.provenance())
+
+    def test_the_recorded_protective_child_is_never_cancelled(
+            self, authority):
+        """FROZEN COUNTEREXAMPLE. Under the old parser this exact
+        recorded shape put the protective take-profit's identity in
+        the WIND_DOWN cancellation list."""
+        result = self._directive(authority, ALPACA_PROTECTIVE_CHILD,
+                                 ALPACA_SHORT_POSITION)
+        assert result.cancel_order_identities == ()
+        assert "cancel_pending_entries" not in result.effects
+        assert result.preserve_protection is True
+        assert "synthetic-order-0001" not in \
+            result.cancel_order_identities
+
+    def test_both_protective_children_survive_a_mixed_book(self,
+                                                            authority):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"].append(json.loads(json.dumps(
+            ALPACA_PROTECTIVE_CHILD))["orders"][0])
+        result = self._directive(authority, payload,
+                                 ALPACA_POSITIONS)
+        assert set(result.cancel_order_identities) == {
+            "parent-order-id"}, (
+            "only the true pending ENTRY may be cancelled")
+        for protective in ("stop-leg-id", "limit-leg-id",
+                           "synthetic-order-0001"):
+            assert protective not in result.cancel_order_identities
+
+    def test_forced_flatten_also_preserves_protection(self,
+                                                      authority):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"].append(json.loads(json.dumps(
+            ALPACA_PROTECTIVE_CHILD))["orders"][0])
+        result = self._directive(authority, payload,
+                                 ALPACA_POSITIONS,
+                                 state="FORCED_FLATTEN")
+        assert result.overlay == "forced_close"
+        assert result.preserve_protection is True
+        assert set(result.cancel_order_identities) == {
+            "parent-order-id"}
+
+    def test_a_book_of_protection_only_offers_nothing_to_cancel(
+            self, authority):
+        result = self._directive(authority, ALPACA_PROTECTIVE_CHILD,
+                                 ALPACA_SHORT_POSITION,
+                                 state="FORCED_FLATTEN")
+        assert result.cancel_order_identities == ()
+        assert "cancel_pending_entries" not in result.effects
+        assert "request_close" in result.effects
+
+    def test_the_exposure_facts_count_the_split_correctly(self,
+                                                          authority):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"].append(json.loads(json.dumps(
+            ALPACA_PROTECTIVE_CHILD))["orders"][0])
+        orders = evidence("alpaca_paper", "open_orders",
+                          payload).facts
+        positions = evidence("alpaca_paper", "positions",
+                             ALPACA_POSITIONS).facts
+        facts = build_exposure_facts(authority, positions=positions,
+                                     orders=orders)
+        assert facts.protective_orders == 3
+        assert facts.entry_orders == 1

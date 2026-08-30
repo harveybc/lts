@@ -1,0 +1,10 @@
+{
+ "venue": "alpaca_paper",
+ "account_fingerprint": "7853afed1025c1ba",
+ "symbol": "SPY",
+ "schema_version": "v1",
+ "source": "alpaca_paper_rest_v2",
+ "evidence_type": "positions",
+ "evidence_id": "ev-positions",
+ "payload": "{\"observed_at\": \"2026-08-28T14:59:55+00:00\", \"positions\": [{\"asset_id\": \"synthetic-asset-0001\", \"symbol\": \"SPY\", \"qty\": \"1\", \"side\": \"short\", \"avg_entry_price\": \"500.00\"}]}"
+}
