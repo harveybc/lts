@@ -1,0 +1,11 @@
+{
+ "venue": "mt5_demo",
+ "account_fingerprint": "sanitizedfp01",
+ "symbol": "USDCAD",
+ "schema_version": "v1",
+ "source": "mt5_bridge_snapshot_v1",
+ "observed_at": "2026-08-28T14:59:55+00:00",
+ "evidence_type": "market_clock",
+ "evidence_id": "ev-market_clock",
+ "payload": "{\"symbol\": \"USDCAD\", \"timeframe\": \"H4\", \"observed_at\": \"2026-08-28T14:59:55+00:00\", \"last_closed_bar\": {\"time\": \"2026-08-28T14:59:55+00:00\", \"open\": 1.35, \"high\": 1.36, \"low\": 1.34, \"close\": 1.355, \"volume\": 900}, \"tick\": {\"bid\": 1.3549, \"ask\": 1.3551, \"observed_at\": \"2026-08-28T14:59:55+00:00\"}}"
+}
