@@ -484,3 +484,271 @@ class TestC7AlpacaCoverageBoundary:
         for field in ("id", "symbol", "side", "qty", "status",
                       "order_class", "legs"):
             assert field in fixture, field
+
+
+# =================================================================== #
+# WP3-C8: the stored policy identity is enforced at discharge         #
+# =================================================================== #
+
+class TestC8PolicyIdentityIsEnforcedAtDischarge:
+
+    def _opened(self, authority, tmp_path, name="c8"):
+        live = custody(authority, tmp_path, name=name)
+        live.open("o-1", signed_exposure=0.1, requested_at_bar=5)
+        live.mark_in_flight("o-1", bar_index=6)
+        return live
+
+    def test_the_exact_A_to_B_substitution_is_refused(self, authority,
+                                                      tmp_path):
+        """FROZEN COUNTEREXAMPLE. An obligation opened under STRICT
+        policy A was discharged under LOOSE policy B for the same
+        venue, account and symbol, using evidence policy A refuses as
+        stale. The record stayed self-consistent while the policy
+        actually admitting the evidence was not the one it named."""
+        live = self._opened(authority, tmp_path)
+        loose = mt5_policy(max_age_seconds=31_536_000.0,
+                           allowed_sources=("mt5_bridge_snapshot_v1",
+                                            "anything_at_all"))
+        stale_positions = json.loads(json.dumps(MT5_POSITIONS))
+        stale_positions["positions"] = []
+        stale_positions["observed_at"] = (
+            NOW - timedelta(days=30)).isoformat()
+        stale_orders = json.loads(json.dumps(MT5_ORDERS))
+        stale_orders["orders"] = []
+        stale_orders["observed_at"] = (
+            NOW - timedelta(days=30)).isoformat()
+
+        # policy A genuinely refuses this evidence
+        with pytest.raises(VenueEvidenceError, match="stale"):
+            mt5_evidence("positions", stale_positions).verify(
+                mt5_policy(), now=NOW)
+
+        with pytest.raises(LiveCustodyError,
+                           match="policy substitution refused"):
+            live.confirm_with_direct_evidence(
+                "o-1",
+                positions=mt5_evidence("positions", stale_positions),
+                orders=mt5_evidence("open_orders", stale_orders),
+                policy=loose, now=NOW, bar_index=7)
+        assert live.read("o-1")["state"] == "flatten_in_flight"
+
+    @pytest.mark.parametrize("substitute", [
+        {"max_age_seconds": 121.0},
+        {"max_age_seconds": 31_536_000.0},
+        {"allowed_sources": ("mt5_bridge_snapshot_v1", "other")},
+        {"allowed_sources": ("some_other_feed",)},
+        {"schema_version": "lts.venue_direct_evidence.v2"},
+        {"calendar_identity": "another-calendar"},
+    ])
+    def test_any_changed_policy_term_refuses(self, authority,
+                                             tmp_path, substitute):
+        live = self._opened(authority, tmp_path,
+                            name=f"c8_{abs(hash(str(substitute)))}")
+        positions, orders = flat_evidence()
+        with pytest.raises(LiveCustodyError,
+                           match="policy substitution refused"):
+            live.confirm_with_direct_evidence(
+                "o-1", positions=positions, orders=orders,
+                policy=mt5_policy(**substitute), now=NOW, bar_index=7)
+        assert live.read("o-1")["state"] == "flatten_in_flight"
+
+    @pytest.mark.parametrize("substitute,field", [
+        ({"venue": "alpaca_paper"}, "venue"),
+        ({"account": "otherfp000001"}, "account_fingerprint"),
+        ({"symbol": "EURUSD"}, "symbol"),
+    ])
+    def test_a_policy_for_another_identity_refuses(self, authority,
+                                                   tmp_path,
+                                                   substitute, field):
+        live = self._opened(authority, tmp_path, name=f"c8_{field}")
+        positions, orders = flat_evidence()
+        with pytest.raises(LiveCustodyError,
+                           match="policy substitution refused|"
+                                 "the discharge policy names"):
+            live.confirm_with_direct_evidence(
+                "o-1", positions=positions, orders=orders,
+                policy=mt5_policy(**substitute), now=NOW, bar_index=7)
+        assert live.read("o-1")["state"] == "flatten_in_flight"
+
+    def test_a_forged_digest_in_the_binding_cannot_help(self,
+                                                        authority,
+                                                        tmp_path):
+        """A binding that names a digest no real policy produces can
+        never be satisfied, so the forgery blocks itself."""
+        forged = custody(authority, tmp_path, name="c8_forged",
+                         evidence_policy_digest="a" * 64)
+        forged.open("o-1", signed_exposure=0.1, requested_at_bar=5)
+        positions, orders = flat_evidence()
+        for candidate in (mt5_policy(),
+                          mt5_policy(max_age_seconds=999.0)):
+            with pytest.raises(LiveCustodyError,
+                               match="policy substitution refused"):
+                forged.confirm_with_direct_evidence(
+                    "o-1", positions=positions, orders=orders,
+                    policy=candidate, now=NOW, bar_index=7)
+
+    def test_a_record_that_does_not_name_the_policy_refuses(
+            self, authority, tmp_path):
+        """Even when the binding agrees, the DURABLE record must name
+        the same policy."""
+        from app.live_flatten_custody import require_bound_policy
+        live = self._opened(authority, tmp_path, name="c8_record")
+        record = dict(live.read("o-1"))
+        record["checkpoint_identity"] = "evidence_policy_digest=" + \
+            "b" * 64
+        with pytest.raises(LiveCustodyError,
+                           match="durable record does not name"):
+            require_bound_policy(mt5_policy(), binding=live.binding,
+                                 record=record)
+
+    def test_the_policy_check_precedes_freshness_and_facts(self,
+                                                           authority,
+                                                           tmp_path):
+        """The refusal must be the SUBSTITUTION, not staleness: an
+        unbound policy never gets the chance to admit anything."""
+        live = self._opened(authority, tmp_path, name="c8_order")
+        stale = json.loads(json.dumps(MT5_POSITIONS))
+        stale["positions"] = []
+        stale["observed_at"] = (NOW - timedelta(days=30)).isoformat()
+        _p, orders = flat_evidence()
+        with pytest.raises(LiveCustodyError) as caught:
+            live.confirm_with_direct_evidence(
+                "o-1", positions=mt5_evidence("positions", stale),
+                orders=orders, policy=mt5_policy(max_age_seconds=9e8),
+                now=NOW, bar_index=7)
+        assert "policy substitution refused" in str(caught.value)
+        assert "stale" not in str(caught.value)
+
+    def test_the_bound_policy_still_discharges(self, authority,
+                                               tmp_path):
+        live = self._opened(authority, tmp_path, name="c8_honest")
+        positions, orders = flat_evidence()
+        record = live.confirm_with_direct_evidence(
+            "o-1", positions=positions, orders=orders,
+            policy=mt5_policy(), now=NOW, bar_index=7)
+        assert record["state"] == "flatten_confirmed"
+        assert record["reconciliation"]["evidence_policy_digest"] == \
+            mt5_policy().policy_digest, (
+            "the discharge records WHICH policy authorised it")
+
+    def test_the_binding_survives_a_clean_store_reload(self,
+                                                       authority,
+                                                       tmp_path):
+        live = self._opened(authority, tmp_path, name="c8_reload")
+        reborn = custody(authority, tmp_path, name="c8_reload")
+        record = reborn.recover()
+        assert record["state"] == "flatten_in_flight"
+        assert mt5_policy().policy_digest in \
+            record["checkpoint_identity"]
+        loose = mt5_policy(max_age_seconds=9e8)
+        positions, orders = flat_evidence()
+        with pytest.raises(LiveCustodyError,
+                           match="policy substitution refused"):
+            reborn.confirm_with_direct_evidence(
+                "o-1", positions=positions, orders=orders,
+                policy=loose, now=NOW, bar_index=7)
+        confirmed = reborn.confirm_with_direct_evidence(
+            "o-1", positions=positions, orders=orders,
+            policy=mt5_policy(), now=NOW, bar_index=7)
+        assert confirmed["state"] == "flatten_confirmed"
+
+    def test_a_non_policy_object_refuses(self, authority, tmp_path):
+        live = self._opened(authority, tmp_path, name="c8_type")
+        positions, orders = flat_evidence()
+        for bogus in (None, {}, "policy", 1.0,
+                      type("P", (), {"policy_digest": "0" * 64})()):
+            with pytest.raises(LiveCustodyError,
+                               match="validated VenueEvidencePolicy"):
+                live.confirm_with_direct_evidence(
+                    "o-1", positions=positions, orders=orders,
+                    policy=bogus, now=NOW, bar_index=7)
+
+
+class TestC8DigestFieldsAreCanonical:
+
+    @pytest.mark.parametrize("bad", [
+        "not-a-digest", "", "   ", "A" * 64, "0" * 63, "0" * 65,
+        "0" * 64 + " ", " " + "0" * 64, True, False, 123, None,
+        "g" * 64, "0" * 32])
+    def test_a_non_digest_refuses_before_any_store_access(self,
+                                                          authority,
+                                                          bad):
+        with pytest.raises(LiveCustodyError,
+                           match="hex digest"):
+            VenueObligationBinding(
+                venue="mt5_demo",
+                account_fingerprint="sanitizedfp01",
+                symbol="USDCAD", position_identity="100001",
+                evidence_policy_digest=bad,
+                calendar_identity="cal-venue-v1",
+                authority_code_identity=authority.code_identity)
+
+    @pytest.mark.parametrize("bad", ["A" * 64, "0" * 63,
+                                     "not-a-digest", True])
+    def test_the_authority_identity_is_also_a_digest(self, bad):
+        with pytest.raises(LiveCustodyError, match="hex digest"):
+            VenueObligationBinding(
+                venue="mt5_demo",
+                account_fingerprint="sanitizedfp01",
+                symbol="USDCAD", position_identity="100001",
+                evidence_policy_digest="0" * 64,
+                calendar_identity="cal-venue-v1",
+                authority_code_identity=bad)
+
+    def test_no_normalisation_is_applied(self, authority):
+        """Uppercase hex is a DIFFERENT string, and silently lowering
+        it would make two distinct bindings compare equal."""
+        upper = authority.code_identity.upper()
+        assert upper != authority.code_identity
+        with pytest.raises(LiveCustodyError, match="no normalisation"):
+            VenueObligationBinding(
+                venue="mt5_demo",
+                account_fingerprint="sanitizedfp01",
+                symbol="USDCAD", position_identity="100001",
+                evidence_policy_digest=upper,
+                calendar_identity="cal-venue-v1",
+                authority_code_identity=authority.code_identity)
+
+
+# =================================================================== #
+# C7 stays INCOMPLETE, and the proposed export cannot act             #
+# =================================================================== #
+
+class TestC7ProposedExportCannotAct:
+
+    def test_it_prints_a_plan_and_touches_nothing(self, capsys):
+        from tools.propose_alpaca_capture_export import main
+        assert main([]) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["status"].startswith("PROPOSED")
+        assert report["performs_any_read_of_private_state"] is False
+        assert report["connects_to_alpaca"] is False
+        assert report["holds_credentials"] is False
+        assert [s["stage"] for s in report["stages"]] == [
+            "read", "stage", "redact"]
+
+    def test_even_the_owner_gate_has_no_execution_body(self, capsys):
+        from tools.propose_alpaca_capture_export import main
+        assert main(["--i-am-the-owner"]) == 3
+        report = json.loads(capsys.readouterr().out)
+        assert "EXECUTION BODY DELIBERATELY ABSENT" in \
+            report["status"]
+
+    def test_the_module_cannot_read_private_state_or_connect(self):
+        import tools.propose_alpaca_capture_export as tool
+        source = Path(tool.__file__).read_text()
+        for forbidden in ("sqlite3", "import requests", "urllib",
+                          "expanduser", "Path.home()",
+                          "AlpacaPaper", "os.environ",
+                          "connect("):
+            assert forbidden not in source, forbidden
+
+    def test_wp3_c7_is_still_declared_incomplete(self):
+        note = (Path(__file__).resolve().parents[2] / "examples" /
+                "captures" / "wp3_alpaca_dry_run" / "NOTE.md"
+                ).read_text()
+        flat = " ".join(note.lower().replace("**", "").split())
+        assert "synthetic" in flat
+        assert "typed absence" in flat
+        from tools.propose_alpaca_capture_export import describe
+        assert "INCOMPLETE" in describe()["note"]

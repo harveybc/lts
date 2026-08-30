@@ -46,6 +46,29 @@ class LiveCustodyDispositionRequired(LiveCustodyError):
     """Several open obligations: only an operator may dispose."""
 
 
+_HEX = frozenset("0123456789abcdef")
+
+
+def require_digest(name: str, value: Any) -> str:
+    """A CANONICAL 64-character lowercase hex digest.
+
+    A digest-shaped field that is not a digest is not a weaker
+    identity, it is no identity at all: ``"not-a-digest"``,
+    uppercase hex, a 63-character string and a trailing space were
+    all accepted before, so a binding could name something that could
+    never equal a real digest and the comparison below would be
+    vacuous."""
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise LiveCustodyError(
+            f"{name}: a 64-character hex digest is required, got "
+            f"{type(value).__name__} {value!r}")
+    if len(value) != 64 or any(c not in _HEX for c in value):
+        raise LiveCustodyError(
+            f"{name}: {value!r} is not a canonical 64-character "
+            "lowercase hex digest — no normalisation is applied")
+    return value
+
+
 @dataclass(frozen=True)
 class VenueObligationBinding:
     """Everything an obligation must be tied to, in one value."""
@@ -60,9 +83,13 @@ class VenueObligationBinding:
 
     def __post_init__(self):
         for name in ("venue", "account_fingerprint", "symbol",
-                     "position_identity", "evidence_policy_digest",
-                     "calendar_identity", "authority_code_identity"):
+                     "position_identity", "calendar_identity"):
             require_text(name, getattr(self, name))
+        # digest-shaped fields are validated as DIGESTS, before any
+        # store is touched
+        for name in ("evidence_policy_digest",
+                     "authority_code_identity"):
+            require_digest(name, getattr(self, name))
 
     def as_identity(self) -> str:
         return "|".join((self.venue, self.account_fingerprint,
@@ -97,6 +124,52 @@ class VenueObligationBinding:
         ))
 
 
+def require_bound_policy(policy: Any, *,
+                         binding: "VenueObligationBinding",
+                         record: Optional[Mapping[str, Any]] = None
+                         ) -> str:
+    """WP3-C8: the policy that AUTHORISES the evidence must be the one
+    the obligation was opened under.
+
+    Previously the discharge path accepted an independent policy and
+    only ran ``evidence.verify(policy)``. An obligation opened under a
+    strict policy could therefore be discharged under a looser one for
+    the same venue, account and symbol -- a longer freshness horizon
+    or a wider source allowlist -- and the record stayed
+    self-consistent while the policy actually admitting the evidence
+    was not the one it named. The digest is recomputed here and
+    required to equal the binding AND the durable record BEFORE any
+    freshness or fact is evaluated."""
+    if not isinstance(policy, VenueEvidencePolicy):
+        raise LiveCustodyError(
+            "a validated VenueEvidencePolicy is required to discharge "
+            "an obligation")
+    supplied = require_digest("policy.policy_digest",
+                              policy.policy_digest)
+    if supplied != binding.evidence_policy_digest:
+        raise LiveCustodyError(
+            f"policy substitution refused: the obligation is bound to "
+            f"policy {binding.evidence_policy_digest[:12]}… and the "
+            f"discharge presents {supplied[:12]}… — a different "
+            "freshness horizon, source allowlist, schema or identity "
+            "may not authorise this evidence")
+    if record is not None:
+        stated = record.get("checkpoint_identity") or ""
+        if f"evidence_policy_digest={supplied}" not in stated:
+            raise LiveCustodyError(
+                "policy substitution refused: the durable record does "
+                f"not name policy {supplied[:12]}…")
+    for name, value in (("venue", policy.venue),
+                        ("account_fingerprint",
+                         policy.account_fingerprint),
+                        ("symbol", policy.symbol)):
+        if value != getattr(binding, name):
+            raise LiveCustodyError(
+                f"the discharge policy names {name} {value!r} but the "
+                f"obligation binds {getattr(binding, name)!r}")
+    return supplied
+
+
 def flat_from_direct_evidence(
         positions: VenueDirectEvidence,
         orders: VenueDirectEvidence, *,
@@ -122,6 +195,7 @@ def flat_from_direct_evidence(
     flat = int(positions_total) == 0 and int(orders_total) == 0
     return {
         "flat_confirmed": flat,
+        "evidence_policy_digest": policy.policy_digest,
         "positions": int(positions_total),
         "orders": int(orders_total),
         "venue": policy.venue,
@@ -211,6 +285,10 @@ class LiveFlattenCustody:
             raise LiveCustodyError(
                 f"{obligation_id} disagrees on {list(differing)} and "
                 "may not be confirmed by this runner")
+        # C8: policy identity is checked BEFORE freshness or facts.
+        # An unbound policy never gets the chance to admit anything.
+        require_bound_policy(policy, binding=self.binding,
+                             record=record)
         reconciliation = flat_from_direct_evidence(
             positions, orders, policy=policy, now=now)
         if not reconciliation["flat_confirmed"]:
