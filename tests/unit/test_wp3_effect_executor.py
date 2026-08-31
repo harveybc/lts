@@ -3016,3 +3016,240 @@ class TestE13DescriptorBoundObjects:
         # second registration and never a crash
         assert all(r["result"] in ("accepted", "refused")
                    for r in results), results
+
+
+# ================================================================== #
+# E15: release intent binding                                        #
+# ================================================================== #
+
+class TestE15ReleaseIntentBinding:
+    """E15 FROZEN (Musashi's reproducer, verbatim): delete
+    register.lock.rel.<epoch> after a valid cycle and a fresh
+    claimant was admitted by the completion alone — 'BYPASS:
+    accepted without release intent'. Mirrored on the run lock. The
+    completion now binds the cryptographic digest of the exact
+    immutable intent record and the holder token, and recovery
+    verifies BOTH records before admitting anyone."""
+
+    def _ledger(self, tmp_path, name="ledger"):
+        from app.venue_direct_evidence import ReceiptLedger
+        return ReceiptLedger(tmp_path / name)
+
+    def _receipt(self, seq=1, body=b"body-1", **kw):
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        return receipt_for(body, seq=seq, **kw)
+
+    def _released_route(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(), route="v|a|s")
+        route_dir = next(d for d in ledger.root.iterdir()
+                         if d.is_dir())
+        epoch = (route_dir /
+                 "register.lock").read_text().split(":", 1)[1]
+        return (ledger, route_dir,
+                route_dir / f"register.lock.rel.{epoch}",
+                route_dir / f"register.lock.reldone.{epoch}")
+
+    def _released_run(self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.execute()
+        root = executor.journal.root
+        epoch = (root / "run.lock").read_text().split(":", 1)[1]
+        second = make_executor(authority, tmp_path, directive,
+                               FakePort())
+        return (executor, second, root / f"run.lock.rel.{epoch}",
+                root / f"run.lock.reldone.{epoch}")
+
+    def test_route_lock_missing_intent_never_authorizes(
+            self, tmp_path):
+        """The PRE bypass, dead."""
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        ledger, _dir, intent, _done = self._released_route(tmp_path)
+        intent.unlink()
+        with pytest.raises(ReceiptLedgerError,
+                           match="completion without its intent"):
+            ReceiptLedger(ledger.root).register(
+                self._receipt(seq=2, body=b"b2"), route="v|a|s")
+
+    def test_run_lock_missing_intent_never_authorizes(
+            self, authority, tmp_path):
+        _e, second, intent, _done = self._released_run(authority,
+                                                       tmp_path)
+        intent.unlink()
+        with pytest.raises(PlanLockHeld,
+                           match="completion without its intent"):
+            second.resume()
+
+    def test_route_lock_mutated_intent_fails_the_binding(
+            self, tmp_path):
+        """A consistently REFORGED intent is self-integral, but the
+        completion still names the ORIGINAL intent's digest."""
+        from app.venue_direct_evidence import (
+            LOCK_RELEASE_INTENT_SCHEMA, ReceiptLedger,
+            ReceiptLedgerError, sealed_json_bytes)
+        ledger, _dir, intent, _done = self._released_route(tmp_path)
+        original = json.loads(intent.read_text())
+        _forge(intent, sealed_json_bytes({
+            "schema": LOCK_RELEASE_INTENT_SCHEMA,
+            "scope": original["scope"], "epoch": original["epoch"],
+            "holder_pid": original["holder_pid"] + 1}))
+        with pytest.raises(ReceiptLedgerError,
+                           match="names another intent"):
+            ReceiptLedger(ledger.root).register(
+                self._receipt(seq=2, body=b"b2"), route="v|a|s")
+
+    def test_run_lock_mutated_intent_fails_the_binding(
+            self, authority, tmp_path):
+        from app.venue_direct_evidence import (
+            LOCK_RELEASE_INTENT_SCHEMA, sealed_json_bytes)
+        _e, second, intent, _done = self._released_run(authority,
+                                                       tmp_path)
+        original = json.loads(intent.read_text())
+        _forge(intent, sealed_json_bytes({
+            "schema": LOCK_RELEASE_INTENT_SCHEMA,
+            "scope": original["scope"], "epoch": original["epoch"],
+            "holder_pid": original["holder_pid"] + 1}))
+        with pytest.raises(PlanLockHeld,
+                           match="names another intent"):
+            second.resume()
+
+    def test_completion_naming_another_intent_digest_refuses(
+            self, tmp_path):
+        from app.venue_direct_evidence import (
+            LOCK_RELEASE_COMPLETION_SCHEMA, ReceiptLedger,
+            ReceiptLedgerError, sealed_json_bytes)
+        ledger, _dir, _intent, done = self._released_route(tmp_path)
+        original = json.loads(done.read_text())
+        _forge(done, sealed_json_bytes({
+            "schema": LOCK_RELEASE_COMPLETION_SCHEMA,
+            "scope": original["scope"], "epoch": original["epoch"],
+            "intent_digest": "ab" * 32,
+            "holder_pid": original["holder_pid"]}))
+        with pytest.raises(ReceiptLedgerError,
+                           match="names another intent"):
+            ReceiptLedger(ledger.root).register(
+                self._receipt(seq=2, body=b"b2"), route="v|a|s")
+
+    def test_completion_holder_mismatch_refuses(self, authority,
+                                                tmp_path):
+        """A consistently reforged completion that names the true
+        intent digest but a different holder still refuses."""
+        from app.venue_direct_evidence import (
+            LOCK_RELEASE_COMPLETION_SCHEMA, sealed_json_bytes)
+        _e, second, intent, done = self._released_run(authority,
+                                                      tmp_path)
+        true_intent = json.loads(intent.read_text())
+        original = json.loads(done.read_text())
+        _forge(done, sealed_json_bytes({
+            "schema": LOCK_RELEASE_COMPLETION_SCHEMA,
+            "scope": original["scope"], "epoch": original["epoch"],
+            "intent_digest": true_intent["digest"],
+            "holder_pid": true_intent["holder_pid"] + 7}))
+        with pytest.raises(PlanLockHeld,
+                           match="names another holder"):
+            second.resume()
+
+    def test_transplanted_pair_from_another_epoch_refuses(
+            self, tmp_path):
+        """ABA: a full intent+completion pair from a PRIOR epoch,
+        transplanted under the current epoch's names, still names
+        its own epoch inside and refuses."""
+        import shutil
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(), route="v|a|s")
+        ledger.register(self._receipt(seq=2, body=b"b2"),
+                        route="v|a|s")
+        route_dir = next(d for d in ledger.root.iterdir()
+                         if d.is_dir())
+        current = (route_dir /
+                   "register.lock").read_text().split(":", 1)[1]
+        epochs = {p.name.rsplit(".", 1)[1]
+                  for p in route_dir.glob("register.lock.rel.*")
+                  if ".reldone." not in p.name}
+        prior = next(e for e in epochs if e != current)
+        for kind in ("rel", "reldone"):
+            src = route_dir / f"register.lock.{kind}.{prior}"
+            dst = route_dir / f"register.lock.{kind}.{current}"
+            shutil.copy(src, dst.with_name(dst.name + ".tmp"))
+            os.replace(dst.with_name(dst.name + ".tmp"), dst)
+            os.chmod(dst, 0o600)
+        with pytest.raises(ReceiptLedgerError,
+                           match="malformed, mismatched or from "
+                                 "another generation"):
+            ReceiptLedger(ledger.root).register(
+                self._receipt(seq=9, body=b"b9"), route="v|a|s")
+
+    def test_wrong_mode_and_symlinked_intent_refuse(self, tmp_path,
+                                                    monkeypatch):
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        ledger, _dir, intent, _done = self._released_route(tmp_path)
+        os.chmod(intent, 0o644)
+        with pytest.raises(ReceiptLedgerError, match="not 0600"):
+            ReceiptLedger(ledger.root).register(
+                self._receipt(seq=2, body=b"b2"), route="v|a|s")
+        os.chmod(intent, 0o600)
+        stash = intent.with_name("stash_intent")
+        stash.write_bytes(intent.read_bytes())
+        os.chmod(stash, 0o600)
+        intent.unlink()
+        intent.symlink_to(stash)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+        with pytest.raises(ReceiptLedgerError, match="symlink"):
+            ReceiptLedger(ledger.root).register(
+                self._receipt(seq=2, body=b"b2"), route="v|a|s")
+
+    def test_two_processes_refuse_a_completion_without_intent(
+            self, tmp_path):
+        """Two REAL processes contend over the PRE bypass state:
+        both must refuse; neither may be admitted by the completion
+        alone."""
+        import subprocess
+        import sys as _sys
+        ledger, _dir, intent, _done = self._released_route(tmp_path)
+        intent.unlink()
+        repo = str(Path(__file__).resolve().parents[2])
+        script = (
+            "import json, sys\n"
+            f"sys.path.insert(0, {repo!r})\n"
+            f"sys.path.insert(0, {repo!r} + '/tests')\n"
+            "from unit.test_wp3_venue_direct_evidence import "
+            "receipt_for\n"
+            "from app.venue_direct_evidence import (ReceiptLedger,\n"
+            "    ReceiptLedgerError)\n"
+            "try:\n"
+            "    ReceiptLedger(sys.argv[1]).register(\n"
+            "        receipt_for(b'later', seq=8), route='v|a|s')\n"
+            "    print(json.dumps({'result': 'registered'}))\n"
+            "except ReceiptLedgerError as exc:\n"
+            "    print(json.dumps({'result': 'refused',\n"
+            "        'bound': 'completion without its intent'\n"
+            "                 in str(exc)}))\n")
+        outputs = []
+        for _index in (0, 1):
+            proc = subprocess.run(
+                [_sys.executable, "-c", script, str(ledger.root)],
+                capture_output=True, text=True, timeout=180)
+            outputs.append(json.loads(
+                proc.stdout.strip().splitlines()[-1]))
+        assert all(o == {"result": "refused", "bound": True}
+                   for o in outputs), outputs
+
+    def test_the_clean_cycle_still_admits_and_binds(self, authority,
+                                                    tmp_path):
+        """After the binding, legitimate reclaim still works and the
+        artefacts really carry the binding fields."""
+        _e, second, intent, done = self._released_run(authority,
+                                                      tmp_path)
+        completion = json.loads(done.read_text())
+        intent_obj = json.loads(intent.read_text())
+        assert completion["intent_digest"] == intent_obj["digest"]
+        assert completion["holder_pid"] == intent_obj["holder_pid"]
+        assert second.resume() == {"state": "completed",
+                                   "resumed": True}

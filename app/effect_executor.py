@@ -355,7 +355,8 @@ class EffectExecutor:
         completion record is durable too — anything less refuses."""
         import re as re_module
         from app.venue_direct_evidence import (
-            LOCK_RELEASE_COMPLETION_SCHEMA, load_sealed_json)
+            LOCK_RELEASE_COMPLETION_SCHEMA,
+            LOCK_RELEASE_INTENT_SCHEMA, load_sealed_json)
         content = self._read_lock_content(lock)
         if not re_module.fullmatch(r"released:[0-9a-f]{32}",
                                    content):
@@ -378,7 +379,8 @@ class EffectExecutor:
                 "claimant may enter; an operator disposes") from exc
         completion = load_sealed_json(
             raw, schema=LOCK_RELEASE_COMPLETION_SCHEMA,
-            fields=("schema", "scope", "epoch"))
+            fields=("schema", "scope", "epoch", "intent_digest",
+                    "holder_pid"))
         if completion is None or \
                 completion["scope"] != str(self.plan_id) or \
                 completion["epoch"] != epoch:
@@ -387,6 +389,37 @@ class EffectExecutor:
                 "record is malformed, mismatched or from another "
                 "generation — a stale completion never releases a "
                 "new holder; an operator disposes")
+        # E15: the completion must name the exact immutable intent
+        # record — digest and holder — or it authorizes nothing
+        try:
+            intent_raw = secure_read_bytes(
+                self._release_intent_path(epoch),
+                what="run lock release intent")
+        except FileNotFoundError as exc:
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: no release intent record for "
+                f"epoch {epoch} — a completion without its intent "
+                "never authorizes; an operator disposes") from exc
+        intent = load_sealed_json(
+            intent_raw, schema=LOCK_RELEASE_INTENT_SCHEMA,
+            fields=("schema", "scope", "epoch", "holder_pid"))
+        if intent is None or \
+                intent["scope"] != str(self.plan_id) or \
+                intent["epoch"] != epoch:
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: the release intent record is "
+                "malformed or mismatched — refused; an operator "
+                "disposes")
+        if completion["intent_digest"] != intent["digest"]:
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: the completion names another "
+                "intent — a completion bound to a different intent "
+                "record never authorizes; an operator disposes")
+        if completion["holder_pid"] != intent["holder_pid"]:
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: the completion names another "
+                "holder than the intent — refused; an operator "
+                "disposes")
         return epoch
 
     def _reclaim_run_lock(self, lock: Path):
@@ -440,25 +473,31 @@ class EffectExecutor:
         otherwise."""
         from app.venue_direct_evidence import (
             LOCK_RELEASE_COMPLETION_SCHEMA,
-            LOCK_RELEASE_INTENT_SCHEMA, sealed_json_bytes)
+            LOCK_RELEASE_INTENT_SCHEMA, seal_json,
+            sealed_json_bytes)
         lock, epoch = handle
         lock = Path(lock)
         try:
+            holder = os.getpid()
+            intent, intent_bytes = seal_json({
+                "schema": LOCK_RELEASE_INTENT_SCHEMA,
+                "scope": str(self.plan_id), "epoch": epoch,
+                "holder_pid": holder})
             secure_create_bytes(
-                self._release_intent_path(epoch),
-                sealed_json_bytes({
-                    "schema": LOCK_RELEASE_INTENT_SCHEMA,
-                    "scope": str(self.plan_id), "epoch": epoch,
-                    "holder_pid": os.getpid()}),
+                self._release_intent_path(epoch), intent_bytes,
                 what="run lock release intent")
             _fsync_dir(lock.parent)
             self._write_lock_state(lock, f"releasing:{epoch}")
             self._write_lock_state(lock, f"released:{epoch}")
+            # E15: the completion binds the exact intent record's
+            # digest and holder
             secure_create_bytes(
                 self._release_completion_path(epoch),
                 sealed_json_bytes({
                     "schema": LOCK_RELEASE_COMPLETION_SCHEMA,
-                    "scope": str(self.plan_id), "epoch": epoch}),
+                    "scope": str(self.plan_id), "epoch": epoch,
+                    "intent_digest": intent["digest"],
+                    "holder_pid": holder}),
                 what="run lock release completion")
             _fsync_dir(lock.parent)
         except Exception as exc:

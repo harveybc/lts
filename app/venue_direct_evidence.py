@@ -1165,16 +1165,26 @@ LOCK_RELEASE_COMPLETION_SCHEMA = "lts.lock.release_completion.v1"
 _ACK_WITNESS_FIELDS = ("schema", "route", "monotonic_seq",
                        "generation", "record_digest")
 _RELEASE_INTENT_FIELDS = ("schema", "scope", "epoch", "holder_pid")
-_RELEASE_COMPLETION_FIELDS = ("schema", "scope", "epoch")
+# E15: the completion BINDS the cryptographic digest of the exact
+# immutable intent record and the holder token, so a completion can
+# never authorize without — or against — the intent that established
+# its generation and holder.
+_RELEASE_COMPLETION_FIELDS = ("schema", "scope", "epoch",
+                              "intent_digest", "holder_pid")
+
+
+def seal_json(payload: Mapping[str, Any]) -> tuple:
+    """Seal a JSON artefact and return (sealed dict, bytes): the
+    digest covers every other field, so a torn or edited artefact
+    fails verification instead of being trusted — and the digest is
+    available to bind from a dependent artefact."""
+    body = dict(payload)
+    body["digest"] = sha256_hex(canonical_bytes(body))
+    return body, json.dumps(body, indent=1, sort_keys=True).encode()
 
 
 def sealed_json_bytes(payload: Mapping[str, Any]) -> bytes:
-    """A self-integral JSON artefact: its digest covers every other
-    field, so a torn or edited artefact fails verification instead
-    of being trusted."""
-    body = dict(payload)
-    body["digest"] = sha256_hex(canonical_bytes(body))
-    return json.dumps(body, indent=1, sort_keys=True).encode()
+    return seal_json(payload)[1]
 
 
 def load_sealed_json(raw: bytes, *, schema: str,
@@ -1410,10 +1420,13 @@ class ReceiptLedger:
     def _completed_release_epoch(self, lock: Path,
                                  route: str) -> str:
         """The epoch of a VERIFIED completed release, or a typed
-        refusal. Entering requires released:<epoch> plus an
-        epoch-bound, self-integral completion record; anything
-        less — held, releasing, malformed, unepoched 'released',
-        missing/malformed/mismatched completion — refuses."""
+        refusal. Entering requires released:<epoch>, the immutable
+        release-intent record for that epoch, AND the completion
+        record that names the intent's own digest and holder — all
+        descriptor-read and self-digest-verified. E15: a completion
+        without its intent never authorizes; anything less — held,
+        releasing, malformed, unepoched 'released', missing or
+        mismatched artefacts — refuses."""
         content = self._lock_reads(lock, route)
         if not re.fullmatch(r"released:[0-9a-f]{32}", content):
             raise ReceiptLedgerError(
@@ -1441,6 +1454,34 @@ class ReceiptLedger:
                 "for epoch is malformed, mismatched or from another "
                 "generation — a stale completion never releases a "
                 "new holder; an operator disposes")
+        try:
+            intent_raw = secure_read_bytes(
+                self._release_intent_path(lock, epoch),
+                what="release intent record")
+        except FileNotFoundError as exc:
+            raise ReceiptLedgerError(
+                f"route {route!r}: no release intent record for "
+                f"epoch {epoch} — a completion without its intent "
+                "never authorizes; an operator disposes") from exc
+        intent = load_sealed_json(
+            intent_raw, schema=LOCK_RELEASE_INTENT_SCHEMA,
+            fields=_RELEASE_INTENT_FIELDS)
+        if intent is None or intent["scope"] != route or \
+                intent["epoch"] != epoch:
+            raise ReceiptLedgerError(
+                f"route {route!r}: the release intent record is "
+                "malformed or mismatched — refused; an operator "
+                "disposes")
+        if completion["intent_digest"] != intent["digest"]:
+            raise ReceiptLedgerError(
+                f"route {route!r}: the completion names another "
+                "intent — a completion bound to a different intent "
+                "record never authorizes; an operator disposes")
+        if completion["holder_pid"] != intent["holder_pid"]:
+            raise ReceiptLedgerError(
+                f"route {route!r}: the completion names another "
+                "holder than the intent — refused; an operator "
+                "disposes")
         return epoch
 
     def _reclaim_lock(self, lock: Path, route: str):
@@ -1476,23 +1517,29 @@ class ReceiptLedger:
     def _release_lock(self, lock: Path, epoch: str,
                       route: str) -> None:
         try:
+            holder = os.getpid()
+            intent, intent_bytes = seal_json({
+                "schema": LOCK_RELEASE_INTENT_SCHEMA,
+                "scope": route, "epoch": epoch,
+                "holder_pid": holder})
             secure_create_bytes(
                 self._release_intent_path(lock, epoch),
-                sealed_json_bytes({
-                    "schema": LOCK_RELEASE_INTENT_SCHEMA,
-                    "scope": route, "epoch": epoch,
-                    "holder_pid": os.getpid()}),
-                what="release intent record")
+                intent_bytes, what="release intent record")
             _ledger_fsync_dir(lock.parent)
             secure_rewrite_bytes(lock, f"releasing:{epoch}".encode(),
                                  what="register lock")
             secure_rewrite_bytes(lock, f"released:{epoch}".encode(),
                                  what="register lock")
+            # E15: the completion BINDS the exact intent record's
+            # digest and holder, so it can never authorize without
+            # — or against — that intent
             secure_create_bytes(
                 self._release_completion_path(lock, epoch),
                 sealed_json_bytes({
                     "schema": LOCK_RELEASE_COMPLETION_SCHEMA,
-                    "scope": route, "epoch": epoch}),
+                    "scope": route, "epoch": epoch,
+                    "intent_digest": intent["digest"],
+                    "holder_pid": holder}),
                 what="release completion record")
             _ledger_fsync_dir(lock.parent)
         except Exception as exc:
