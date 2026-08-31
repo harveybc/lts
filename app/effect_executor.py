@@ -295,9 +295,6 @@ class EffectExecutor:
     def _lock_path(self) -> Path:
         return self.journal.root / "run.lock"
 
-    def _lock_witness_path(self) -> Path:
-        return self.journal.root / "run.lock.rw"
-
     @staticmethod
     def _write_lock_state(lock: Path, state: str, *,
                           fsync: bool = True) -> None:
@@ -306,8 +303,16 @@ class EffectExecutor:
         secure_rewrite_bytes(Path(lock), state.encode(),
                              what="run lock", fsync=fsync)
 
+    def _release_intent_path(self, epoch: str) -> Path:
+        return self.journal.root / f"run.lock.rel.{epoch}"
+
+    def _release_completion_path(self, epoch: str) -> Path:
+        return self.journal.root / f"run.lock.reldone.{epoch}"
+
     def _acquire_run_lock(self):
+        from app.venue_direct_evidence import new_generation
         lock = self._lock_path()
+        epoch = new_generation()
         try:
             fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
                          os.O_NOFOLLOW | os.O_CLOEXEC, FILE_MODE)
@@ -319,13 +324,11 @@ class EffectExecutor:
                 f"created ({exc}) — an operator disposes") from exc
         try:
             try:
-                os.write(fd, f"held:{os.getpid()}".encode())
+                os.write(fd, f"held:{os.getpid()}:{epoch}".encode())
                 os.fchmod(fd, FILE_MODE)
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            secure_create_bytes(self._lock_witness_path(), b"done",
-                                what="run lock release witness")
             _fsync_dir(lock.parent)
         except Exception as exc:
             raise PlanLockHeld(
@@ -333,7 +336,7 @@ class EffectExecutor:
                 f"not be made durable ({exc}) — an uncertain acquire "
                 "blocks execution, the lock stays in place, and an "
                 "operator disposes") from exc
-        return lock
+        return lock, epoch
 
     def _read_lock_content(self, lock: Path) -> str:
         try:
@@ -344,33 +347,55 @@ class EffectExecutor:
         except SecureFileError as exc:
             return f"<unverifiable: {exc}>"
 
-    def _reclaim_run_lock(self, lock: Path):
-        """Enter ONLY over the exact durable content \"released\"
-        CONFIRMED by a release witness reading \"done\". The reclaim
-        transition is elected by its own O_EXCL lock so two claimants
-        reading \"released\" cannot both rewrite it."""
+    def _completed_release_epoch(self, lock: Path) -> str:
+        """E14: entering requires released:<epoch> plus an epoch-
+        bound, self-integral completion record. Recovery evaluates
+        the physical state: a released write that reached storage
+        while its fsync failed admits a claimant exactly when its
+        completion record is durable too — anything less refuses."""
+        import re as re_module
+        from app.venue_direct_evidence import (
+            LOCK_RELEASE_COMPLETION_SCHEMA, load_sealed_json)
         content = self._read_lock_content(lock)
-        if content != "released":
+        if not re_module.fullmatch(r"released:[0-9a-f]{32}",
+                                   content):
             raise PlanLockHeld(
                 f"plan {self.plan_id}: the run lock reads "
-                f"{content[:80]!r}, not 'released' — another claimant "
-                "holds it or its release is uncertain; an operator "
-                "disposes, never an automatic takeover")
-        witness = self._lock_witness_path()
+                f"{content[:80]!r}, not a completed epoch release — "
+                "another claimant holds it or its release is "
+                "uncertain; an operator disposes, never an "
+                "automatic takeover")
+        epoch = content.split(":", 1)[1]
         try:
-            wit = secure_read_bytes(witness,
-                                    what="run lock release witness")
+            raw = secure_read_bytes(
+                self._release_completion_path(epoch),
+                what="run lock release completion")
         except FileNotFoundError as exc:
             raise PlanLockHeld(
-                f"plan {self.plan_id}: the lock reads 'released' but "
-                "no release witness exists — an unwitnessed release "
-                "authorizes nothing; an operator disposes") from exc
-        if wit != b"done":
+                f"plan {self.plan_id}: the lock reads "
+                f"released:{epoch} but no durable release completion "
+                "record exists — the release never completed and no "
+                "claimant may enter; an operator disposes") from exc
+        completion = load_sealed_json(
+            raw, schema=LOCK_RELEASE_COMPLETION_SCHEMA,
+            fields=("schema", "scope", "epoch"))
+        if completion is None or \
+                completion["scope"] != str(self.plan_id) or \
+                completion["epoch"] != epoch:
             raise PlanLockHeld(
-                f"plan {self.plan_id}: the release witness reads "
-                f"{wit[:24]!r}, not 'done' — the release never "
-                "completed durably; an operator disposes, never an "
-                "automatic takeover")
+                f"plan {self.plan_id}: the release completion "
+                "record is malformed, mismatched or from another "
+                "generation — a stale completion never releases a "
+                "new holder; an operator disposes")
+        return epoch
+
+    def _reclaim_run_lock(self, lock: Path):
+        """Enter ONLY over a completed, epoch-witnessed release. The
+        reclaim transition is elected by its own O_EXCL lock so two
+        claimants reading the same released state cannot both
+        rewrite it."""
+        from app.venue_direct_evidence import new_generation
+        self._completed_release_epoch(lock)
         reclaim = lock.with_suffix(".lock.reclaim")
         try:
             fd = os.open(reclaim, os.O_WRONLY | os.O_CREAT |
@@ -382,59 +407,66 @@ class EffectExecutor:
                 f"plan {self.plan_id}: a competing reclaim is in "
                 "progress") from exc
         os.close(fd)
+        epoch = new_generation()
         try:
             # revalidate under the election, descriptor-first,
             # before authority passes
-            if self._read_lock_content(lock) != "released" or \
-                    secure_read_bytes(
-                        witness,
-                        what="run lock release witness") != b"done":
-                raise PlanLockHeld(
-                    f"plan {self.plan_id}: the lock changed under "
-                    "the reclaim — refused")
+            self._completed_release_epoch(lock)
             try:
-                self._write_lock_state(lock, f"held:{os.getpid()}")
+                self._write_lock_state(
+                    lock, f"held:{os.getpid()}:{epoch}")
             except Exception as exc:
                 raise PlanLockHeld(
                     f"plan {self.plan_id}: the reclaim could not be "
                     f"made durable ({exc}) — refused; whatever "
-                    "content remains is not 'released' or is "
-                    "unverifiable, and refuses") from exc
+                    "content remains is not a completed release, "
+                    "and refuses") from exc
         finally:
             try:
                 os.unlink(reclaim)
             except FileNotFoundError:
                 pass
-        return lock
+        return lock, epoch
 
-    def _release_run_lock(self, lock) -> None:
-        """Monotone WITNESSED release. The witness durably says
-        "releasing" BEFORE the lock may say "released" and "done"
-        only after "released" is durable, so on the crash branch
-        where a failed released-fsync reached storage anyway the
-        witness still refuses every claimant. E13: the failure path
-        restores "held" DURABLY — and if even that write cannot be
-        fsynced, the durable witness already refuses; no exception
-        path relies on an un-fsynced restorative write."""
+    def _release_run_lock(self, handle) -> None:
+        """E14: append-only witnessed release. An immutable intent
+        record is durable BEFORE the lock moves; the lock walks
+        releasing:<epoch> -> released:<epoch> in place; success is a
+        SEPARATE exclusive completion record persisted only after
+        released is durable. Nothing is overwritten or deleted to
+        establish or undo the release, and NO restoration write is
+        trusted: recovery admits a claimant exactly when the epoch-
+        bound completion physically persisted, and refuses
+        otherwise."""
+        from app.venue_direct_evidence import (
+            LOCK_RELEASE_COMPLETION_SCHEMA,
+            LOCK_RELEASE_INTENT_SCHEMA, sealed_json_bytes)
+        lock, epoch = handle
         lock = Path(lock)
-        witness = self._lock_witness_path()
         try:
-            secure_rewrite_bytes(witness, b"releasing",
-                                 what="run lock release witness")
-            self._write_lock_state(lock, "releasing")
-            self._write_lock_state(lock, "released")
-            secure_rewrite_bytes(witness, b"done",
-                                 what="run lock release witness")
+            secure_create_bytes(
+                self._release_intent_path(epoch),
+                sealed_json_bytes({
+                    "schema": LOCK_RELEASE_INTENT_SCHEMA,
+                    "scope": str(self.plan_id), "epoch": epoch,
+                    "holder_pid": os.getpid()}),
+                what="run lock release intent")
+            _fsync_dir(lock.parent)
+            self._write_lock_state(lock, f"releasing:{epoch}")
+            self._write_lock_state(lock, f"released:{epoch}")
+            secure_create_bytes(
+                self._release_completion_path(epoch),
+                sealed_json_bytes({
+                    "schema": LOCK_RELEASE_COMPLETION_SCHEMA,
+                    "scope": str(self.plan_id), "epoch": epoch}),
+                what="run lock release completion")
+            _fsync_dir(lock.parent)
         except Exception as exc:
-            try:
-                self._write_lock_state(lock, f"held:{os.getpid()}")
-            except Exception:
-                pass    # the durable witness still refuses
             raise ExecutorError(
                 f"plan {self.plan_id}: the lock release could not be "
-                f"made durable ({exc}) — the lock stays authoritative,"
-                " a future claimant will refuse, and an operator must "
-                "dispose") from exc
+                f"made durable ({exc}) — no claimant may enter "
+                "unless recovery finds a durable completion record; "
+                "an operator must dispose") from exc
 
     # -- plan persistence ------------------------------------------
     def _persist_plan(self) -> dict:

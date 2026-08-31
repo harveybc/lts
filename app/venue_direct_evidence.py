@@ -1143,14 +1143,64 @@ _RECORD_FIELDS = ("schema", "collector_source",
                   "monotonic_seq", "body_sha256", "route", "digest")
 _ACK_PENDING = b"PENDING"
 
-# E13: the durable uncertainty witness. Its content is written and
-# fsynced BEFORE the authorizing transition it guards, so on every
-# crash branch — including the one where a write whose fsync FAILED
-# reached storage anyway — the durable witness still names the
-# transition as in flight, and every fresh reader fails closed.
-_WITNESS_AUTHORIZING = b"authorizing"
-_WITNESS_RELEASING = b"releasing"
-_WITNESS_DONE = b"done"
+# E14: append-only recovery. An fsync error proves ONLY that the
+# caller received no durability guarantee — never that the bytes did
+# not persist. So no transition is ever established, or un-
+# established, by overwriting a durable intent: the intent record is
+# written once and never touched again, and success is a SEPARATE,
+# exclusive completion record persisted only after all protected
+# data is durable. Recovery evaluates the PHYSICAL state: complete,
+# internally consistent data plus a valid completion record recovers
+# as completed — even if the original caller observed an fsync
+# exception; a missing, malformed, mismatched or partially durable
+# completion is UNCERTAIN and authorizes nothing. No restoration
+# write is required or trusted. Completions are bound to the exact
+# generation/epoch of their intent, so a stale completion from a
+# prior generation can never authorize a new transition.
+LEDGER_ACK_INTENT_SCHEMA = "lts.receipt_ledger.ack_intent.v1"
+LEDGER_ACK_COMPLETION_SCHEMA = "lts.receipt_ledger.ack_completion.v1"
+LOCK_RELEASE_INTENT_SCHEMA = "lts.lock.release_intent.v1"
+LOCK_RELEASE_COMPLETION_SCHEMA = "lts.lock.release_completion.v1"
+
+_ACK_WITNESS_FIELDS = ("schema", "route", "monotonic_seq",
+                       "generation", "record_digest")
+_RELEASE_INTENT_FIELDS = ("schema", "scope", "epoch", "holder_pid")
+_RELEASE_COMPLETION_FIELDS = ("schema", "scope", "epoch")
+
+
+def sealed_json_bytes(payload: Mapping[str, Any]) -> bytes:
+    """A self-integral JSON artefact: its digest covers every other
+    field, so a torn or edited artefact fails verification instead
+    of being trusted."""
+    body = dict(payload)
+    body["digest"] = sha256_hex(canonical_bytes(body))
+    return json.dumps(body, indent=1, sort_keys=True).encode()
+
+
+def load_sealed_json(raw: bytes, *, schema: str,
+                     fields: Sequence[str]) -> Optional[dict]:
+    """None on ANY defect — unparseable, wrong shape, wrong schema,
+    broken digest. The caller maps None to UNCERTAIN; a defective
+    artefact never authorizes and never crashes recovery."""
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or \
+            set(obj) != set(fields) | {"digest"}:
+        return None
+    if obj.get("schema") != schema:
+        return None
+    body = {k: v for k, v in obj.items() if k != "digest"}
+    if obj["digest"] != sha256_hex(canonical_bytes(body)):
+        return None
+    return obj
+
+
+def new_generation() -> str:
+    """A fresh generation/epoch token binding an intent to its own
+    completion and to nothing else."""
+    return os.urandom(16).hex()
 
 
 def _ledger_fsync_dir(path: Path) -> None:
@@ -1300,20 +1350,29 @@ class ReceiptLedger:
         return directory
 
     # -- the monotone route lock ------------------------------------
-    # E13: release is guarded by a durable RELEASE WITNESS
-    # (register.lock.rw), written and fsynced to "releasing" BEFORE
-    # the lock may say "released" and to "done" only after "released"
-    # is durable. On the crash branch where a failed released-fsync
-    # reached storage anyway, the durable witness still says
-    # "releasing" and every claimant refuses. No exception path
-    # relies on an un-fsynced restorative write.
+    # E14: append-only witnessed release. The lock content carries
+    # its epoch (held:<pid>:<epoch> -> releasing:<epoch> ->
+    # released:<epoch>, in place, never unlinked). Release first
+    # persists an immutable INTENT record for its epoch, then moves
+    # the lock, then persists a separate exclusive COMPLETION record
+    # — and NEVER overwrites either to establish or undo anything.
+    # A claimant enters only over released:<epoch> whose epoch-bound
+    # completion record verifies; recovery therefore evaluates the
+    # physical state, and a released write that reached storage while
+    # its fsync failed authorizes entry exactly when its completion
+    # is durable too — never on the word of a restoration.
 
     @staticmethod
-    def _witness_path(lock: Path) -> Path:
-        return lock.parent / "register.lock.rw"
+    def _release_intent_path(lock: Path, epoch: str) -> Path:
+        return lock.with_name(f"{lock.name}.rel.{epoch}")
 
-    def _acquire_lock(self, directory: Path, route: str) -> Path:
+    @staticmethod
+    def _release_completion_path(lock: Path, epoch: str) -> Path:
+        return lock.with_name(f"{lock.name}.reldone.{epoch}")
+
+    def _acquire_lock(self, directory: Path, route: str):
         lock = directory / "register.lock"
+        epoch = new_generation()
         try:
             fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
                          os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -1325,52 +1384,67 @@ class ReceiptLedger:
                 f"be created ({exc}) — refused") from exc
         try:
             try:
-                os.write(fd, f"held:{os.getpid()}".encode())
+                os.write(fd, f"held:{os.getpid()}:{epoch}".encode())
                 os.fchmod(fd, 0o600)
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            secure_create_bytes(self._witness_path(lock),
-                                _WITNESS_DONE,
-                                what=f"route {route!r} release "
-                                     "witness")
             _ledger_fsync_dir(directory)
         except Exception as exc:
             raise ReceiptLedgerError(
                 f"route {route!r}: the registration lock could not "
                 f"be made durable ({exc}) — registration refused and "
                 "the lock stays for operator disposition") from exc
-        return lock
+        return lock, epoch
 
-    def _reclaim_lock(self, lock: Path, route: str) -> Path:
-        def lock_reads() -> str:
-            try:
-                return secure_read_bytes(
-                    lock, what="register lock").decode(
-                        "utf-8", errors="replace")
-            except FileNotFoundError:
-                return "<absent>"
-            except SecureFileError as exc:
-                return f"<unverifiable: {exc}>"
-        content = lock_reads()
-        if content != "released":
+    def _lock_reads(self, lock: Path, route: str) -> str:
+        try:
+            return secure_read_bytes(
+                lock, what="register lock").decode(
+                    "utf-8", errors="replace")
+        except FileNotFoundError:
+            return "<absent>"
+        except SecureFileError as exc:
+            return f"<unverifiable: {exc}>"
+
+    def _completed_release_epoch(self, lock: Path,
+                                 route: str) -> str:
+        """The epoch of a VERIFIED completed release, or a typed
+        refusal. Entering requires released:<epoch> plus an
+        epoch-bound, self-integral completion record; anything
+        less — held, releasing, malformed, unepoched 'released',
+        missing/malformed/mismatched completion — refuses."""
+        content = self._lock_reads(lock, route)
+        if not re.fullmatch(r"released:[0-9a-f]{32}", content):
             raise ReceiptLedgerError(
                 f"route {route!r}: the registration lock reads "
-                f"{content[:80]!r}, not 'released' — a concurrent or "
-                "uncertain registration holds it")
-        witness = self._witness_path(lock)
+                f"{content[:80]!r}, not a completed epoch release — "
+                "a concurrent or uncertain registration holds it")
+        epoch = content.split(":", 1)[1]
         try:
-            wit = secure_read_bytes(witness, what="release witness")
+            raw = secure_read_bytes(
+                self._release_completion_path(lock, epoch),
+                what="release completion record")
         except FileNotFoundError as exc:
             raise ReceiptLedgerError(
-                f"route {route!r}: the lock reads 'released' but no "
-                "release witness exists — an unwitnessed release "
-                "authorizes nothing") from exc
-        if wit != _WITNESS_DONE:
+                f"route {route!r}: the lock reads released:{epoch} "
+                "but no durable release completion record exists — "
+                "the release never completed and no claimant may "
+                "enter; an operator disposes") from exc
+        completion = load_sealed_json(
+            raw, schema=LOCK_RELEASE_COMPLETION_SCHEMA,
+            fields=_RELEASE_COMPLETION_FIELDS)
+        if completion is None or completion["scope"] != route or \
+                completion["epoch"] != epoch:
             raise ReceiptLedgerError(
-                f"route {route!r}: the release witness reads "
-                f"{wit[:24]!r}, not 'done' — an uncertain release "
-                "holds the lock for operator disposition")
+                f"route {route!r}: the release completion record "
+                "for epoch is malformed, mismatched or from another "
+                "generation — a stale completion never releases a "
+                "new holder; an operator disposes")
+        return epoch
+
+    def _reclaim_lock(self, lock: Path, route: str):
+        self._completed_release_epoch(lock, route)
         reclaim = lock.with_suffix(".lock.reclaim")
         try:
             fd = os.open(reclaim, os.O_WRONLY | os.O_CREAT |
@@ -1384,52 +1458,53 @@ class ReceiptLedger:
                 f"route {route!r}: a competing reclaim is in "
                 "progress") from exc
         os.close(fd)
+        epoch = new_generation()
         try:
             # revalidate the identity UNDER the election, from the
             # descriptor-verified objects, before authority passes
-            if lock_reads() != "released" or secure_read_bytes(
-                    witness,
-                    what="release witness") != _WITNESS_DONE:
-                raise ReceiptLedgerError(
-                    f"route {route!r}: the lock changed under the "
-                    "reclaim — refused")
-            secure_rewrite_bytes(lock,
-                                 f"held:{os.getpid()}".encode(),
-                                 what="register lock")
+            self._completed_release_epoch(lock, route)
+            secure_rewrite_bytes(
+                lock, f"held:{os.getpid()}:{epoch}".encode(),
+                what="register lock")
         finally:
             try:
                 os.unlink(reclaim)
             except FileNotFoundError:
                 pass
-        return lock
+        return lock, epoch
 
-    def _release_lock(self, lock: Path, route: str) -> None:
-        witness = self._witness_path(lock)
+    def _release_lock(self, lock: Path, epoch: str,
+                      route: str) -> None:
         try:
-            secure_rewrite_bytes(witness, _WITNESS_RELEASING,
-                                 what="release witness")
-            secure_rewrite_bytes(lock, b"releasing",
+            secure_create_bytes(
+                self._release_intent_path(lock, epoch),
+                sealed_json_bytes({
+                    "schema": LOCK_RELEASE_INTENT_SCHEMA,
+                    "scope": route, "epoch": epoch,
+                    "holder_pid": os.getpid()}),
+                what="release intent record")
+            _ledger_fsync_dir(lock.parent)
+            secure_rewrite_bytes(lock, f"releasing:{epoch}".encode(),
                                  what="register lock")
-            secure_rewrite_bytes(lock, b"released",
+            secure_rewrite_bytes(lock, f"released:{epoch}".encode(),
                                  what="register lock")
-            secure_rewrite_bytes(witness, _WITNESS_DONE,
-                                 what="release witness")
+            secure_create_bytes(
+                self._release_completion_path(lock, epoch),
+                sealed_json_bytes({
+                    "schema": LOCK_RELEASE_COMPLETION_SCHEMA,
+                    "scope": route, "epoch": epoch}),
+                what="release completion record")
+            _ledger_fsync_dir(lock.parent)
         except Exception as exc:
-            # DURABLE restoration: held is written AND fsynced. If
-            # even that fails, the release witness already says
-            # "releasing" durably — it was fsynced before the lock
-            # could say "released" — so every claimant on every
-            # crash branch still refuses.
-            try:
-                secure_rewrite_bytes(lock,
-                                     f"held:{os.getpid()}".encode(),
-                                     what="register lock")
-            except Exception:
-                pass
+            # NO restoration write: recovery evaluates the physical
+            # state. Without a durable epoch-bound completion no
+            # claimant enters; with one, the release stands even
+            # though this caller received no durability guarantee.
             raise ReceiptLedgerError(
                 f"route {route!r}: the lock release could not be "
-                f"made durable ({exc}) — the lock stays authoritative "
-                "for operator disposition") from exc
+                f"made durable ({exc}) — no claimant may enter "
+                "unless recovery finds a durable completion record; "
+                "an operator disposes") from exc
 
     # -- verified reads ---------------------------------------------
     def _verify_record(self, path: Path, route: str) -> dict:
@@ -1485,25 +1560,62 @@ class ReceiptLedger:
             raise ReceiptUncertainError(
                 f"{path.name}: acknowledgement does not name this "
                 "record's digest — REGISTRATION_UNCERTAIN")
-        # E13: the acknowledgement witness must say the authorizing
-        # transition COMPLETED. On the crash branch where the digest
-        # write reached storage although its fsync failed, the
-        # durable witness still says "authorizing" and this record
-        # authorizes nothing.
-        witness_path = path.with_suffix(".json.aw")
+        # E14: append-only recovery. The immutable intent record and
+        # the separate exclusive completion record must BOTH verify
+        # and agree on the generation. A missing, malformed,
+        # mismatched or partially durable completion is UNCERTAIN;
+        # a valid completion over internally consistent data
+        # authorizes — even if the registering caller observed an
+        # fsync exception — because it proves the transition
+        # physically completed. No restoration write is trusted.
+        intent_path = path.with_suffix(".json.aw")
         try:
-            wit = secure_read_bytes(
-                witness_path,
-                what=f"ack witness {witness_path.name}").strip()
+            intent_raw = secure_read_bytes(
+                intent_path,
+                what=f"ack intent {intent_path.name}")
         except FileNotFoundError as exc:
             raise ReceiptUncertainError(
-                f"{path.name}: no acknowledgement witness — "
+                f"{path.name}: no acknowledgement intent record — "
                 "REGISTRATION_UNCERTAIN, authorizes nothing") from exc
-        if wit != _WITNESS_DONE:
+        intent = load_sealed_json(intent_raw,
+                                  schema=LEDGER_ACK_INTENT_SCHEMA,
+                                  fields=_ACK_WITNESS_FIELDS)
+        if intent is None or intent["route"] != route or \
+                intent["monotonic_seq"] != seq or \
+                intent["record_digest"] != record["digest"]:
             raise ReceiptUncertainError(
-                f"{path.name}: the acknowledgement witness reads "
-                f"{wit[:24]!r}, not 'done' — the authorizing "
-                "transition never completed, REGISTRATION_UNCERTAIN")
+                f"{path.name}: malformed or mismatched "
+                "acknowledgement intent record — "
+                "REGISTRATION_UNCERTAIN, authorizes nothing")
+        completion_path = path.with_suffix(".json.done")
+        try:
+            completion_raw = secure_read_bytes(
+                completion_path,
+                what=f"ack completion {completion_path.name}")
+        except FileNotFoundError as exc:
+            raise ReceiptUncertainError(
+                f"{path.name}: no completion record — the "
+                "authorizing transition never completed, "
+                "REGISTRATION_UNCERTAIN") from exc
+        completion = load_sealed_json(
+            completion_raw, schema=LEDGER_ACK_COMPLETION_SCHEMA,
+            fields=_ACK_WITNESS_FIELDS)
+        if completion is None:
+            raise ReceiptUncertainError(
+                f"{path.name}: malformed or partially durable "
+                "completion record — REGISTRATION_UNCERTAIN, "
+                "authorizes nothing")
+        if completion["route"] != route or \
+                completion["monotonic_seq"] != seq or \
+                completion["record_digest"] != record["digest"]:
+            raise ReceiptUncertainError(
+                f"{path.name}: mismatched completion record — "
+                "REGISTRATION_UNCERTAIN, authorizes nothing")
+        if completion["generation"] != intent["generation"]:
+            raise ReceiptUncertainError(
+                f"{path.name}: the completion record names another "
+                "generation — a stale completion authorizes "
+                "nothing, REGISTRATION_UNCERTAIN")
         return record
 
     def _read_route(self, directory: Path, route: str) -> dict:
@@ -1511,8 +1623,9 @@ class ReceiptLedger:
         for path in sorted(directory.glob("[0-9]*.json")):
             record = self._verify_record(path, route)
             records[record["monotonic_seq"]] = record
-        for stray in list(directory.glob("[0-9]*.json.ack")) + \
-                list(directory.glob("[0-9]*.json.aw")):
+        for stray in (list(directory.glob("[0-9]*.json.ack")) +
+                      list(directory.glob("[0-9]*.json.aw")) +
+                      list(directory.glob("[0-9]*.json.done"))):
             record_path = stray.parent / (stray.name.rsplit(
                 ".", 1)[0].removesuffix(".json") + ".json")
             if not record_path.exists():
@@ -1528,7 +1641,7 @@ class ReceiptLedger:
             raise ReceiptLedgerError(
                 "a typed AcquisitionReceipt is required")
         directory = self._route_dir(route)
-        lock = self._acquire_lock(directory, route)
+        lock, lock_epoch = self._acquire_lock(directory, route)
         try:
             records = self._read_route(directory, route)
             payload = {"schema": RECEIPT_RECORD_SCHEMA,
@@ -1558,19 +1671,25 @@ class ReceiptLedger:
 
             path = directory / f"{seq:08d}.json"
             ack_path = path.with_suffix(".json.ack")
-            witness_path = path.with_suffix(".json.aw")
+            intent_path = path.with_suffix(".json.aw")
+            completion_path = path.with_suffix(".json.done")
+            generation = new_generation()
             # durable INTENT before anything becomes visible: the
-            # PENDING acknowledgement AND the "authorizing" witness
-            # are both durable before the record can exist, so every
-            # later crash branch — the failed dir fsync, the digest
-            # write that reached storage despite its failed fsync —
-            # resolves as uncertain in a fresh process.
+            # PENDING acknowledgement AND the immutable, generation-
+            # bound intent record are durable before the record can
+            # exist. The intent is never touched again; only the
+            # exclusive completion record below can close it.
             secure_create_bytes(ack_path, _ACK_PENDING,
                                 what=f"acknowledgement "
                                      f"{ack_path.name}")
-            secure_create_bytes(witness_path, _WITNESS_AUTHORIZING,
-                                what=f"ack witness "
-                                     f"{witness_path.name}")
+            secure_create_bytes(
+                intent_path,
+                sealed_json_bytes({
+                    "schema": LEDGER_ACK_INTENT_SCHEMA,
+                    "route": route, "monotonic_seq": seq,
+                    "generation": generation,
+                    "record_digest": payload["digest"]}),
+                what=f"ack intent {intent_path.name}")
             _ledger_fsync_dir(directory)
             # the record, via the audited uncertain-write shape
             tmp = path.with_suffix(f".json.tmp.{os.getpid()}")
@@ -1592,46 +1711,46 @@ class ReceiptLedger:
             os.replace(tmp, path)
             _ledger_fsync_dir(directory)
             # MONOTONE acknowledgement, in place: only now does the
-            # record authorize anything. E13: the restoration is
-            # DURABLE — PENDING is written and fsynced. Even if that
-            # second durable write also fails, the "authorizing"
-            # witness fsynced before the digest write keeps every
-            # crash branch fail-closed, including the branch where
-            # the digest write reached storage.
+            # record authorize anything. E14: NO restoration write —
+            # an fsync error proves only that this caller received
+            # no durability guarantee. Recovery evaluates the
+            # physical state: without a durable completion record
+            # the record authorizes nothing, whatever bytes landed.
             try:
                 secure_rewrite_bytes(ack_path,
                                      payload["digest"].encode(),
                                      what="acknowledgement")
             except Exception as exc:
-                try:
-                    secure_rewrite_bytes(ack_path, _ACK_PENDING,
-                                         what="acknowledgement")
-                except Exception:
-                    pass    # the durable witness still refuses
                 raise ReceiptUncertainError(
                     f"route {route!r}: the acknowledgement could not "
                     f"be made durable ({exc}) — "
                     "REGISTRATION_UNCERTAIN") from exc
-            # the completion witness closes the authorizing
-            # transition; until it durably reads "done", every fresh
-            # reader classifies the record as uncertain
+            # the SEPARATE exclusive completion record closes the
+            # authorizing transition, persisted only after all
+            # protected data is durable. If its own durability
+            # fails, this caller reports uncertain and recovery
+            # decides by what physically persisted: a fully durable
+            # completion recovers as completed; anything less stays
+            # uncertain.
             try:
-                secure_rewrite_bytes(witness_path, _WITNESS_DONE,
-                                     what="ack witness")
+                secure_create_bytes(
+                    completion_path,
+                    sealed_json_bytes({
+                        "schema": LEDGER_ACK_COMPLETION_SCHEMA,
+                        "route": route, "monotonic_seq": seq,
+                        "generation": generation,
+                        "record_digest": payload["digest"]}),
+                    what=f"ack completion {completion_path.name}")
+                _ledger_fsync_dir(directory)
             except Exception as exc:
-                try:
-                    secure_rewrite_bytes(witness_path,
-                                         _WITNESS_AUTHORIZING,
-                                         what="ack witness")
-                except Exception:
-                    pass    # durable content is still 'authorizing'
                 raise ReceiptUncertainError(
-                    f"route {route!r}: the acknowledgement witness "
-                    f"could not be made durable ({exc}) — "
-                    "REGISTRATION_UNCERTAIN") from exc
+                    f"route {route!r}: the completion record could "
+                    f"not be made durable ({exc}) — "
+                    "REGISTRATION_UNCERTAIN; recovery will evaluate "
+                    "the physical state") from exc
             return payload
         finally:
-            self._release_lock(lock, route)
+            self._release_lock(lock, lock_epoch, route)
 
 
 # ---------------------------------------------------------------- #

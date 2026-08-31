@@ -1091,19 +1091,22 @@ class TestE4RunLock:
         executor = make_executor(authority, tmp_path, directive,
                                  FakePort())
         executor.execute()
-        # E9: the lock is MONOTONE — it is never unlinked. Release
-        # leaves the durable content "released", which is the only
-        # content a future claimant may enter over.
-        assert (executor.journal.root /
-                "run.lock").read_text() == "released"
+        # E9/E14: the lock is MONOTONE — never unlinked. Release
+        # leaves released:<epoch> plus a durable epoch-bound
+        # completion record, the only state a claimant may enter
+        # over.
+        assert re.fullmatch(r"released:[0-9a-f]{32}",
+                            (executor.journal.root /
+                             "run.lock").read_text())
         stopping = make_executor(
             authority, tmp_path, alpaca_directive(authority),
             FakePort(), plan_id="plan-stop",
             outcome_map={"parent-order-id": "rejected"})
         with pytest.raises(PlanStopped):
             stopping.execute()
-        assert (stopping.journal.root /
-                "run.lock").read_text() == "released"
+        assert re.fullmatch(r"released:[0-9a-f]{32}",
+                            (stopping.journal.root /
+                             "run.lock").read_text())
 
     def test_concurrent_resume_of_an_unacknowledged_close_is_single(
             self, authority, tmp_path):
@@ -1485,7 +1488,7 @@ class TestE6LockDurability:
         real = EffectExecutor._write_lock_state
 
         def failing(lock, state, *, fsync=True):
-            if state == "released":
+            if state.startswith("released:"):
                 raise OSError("simulated fsync failure on release")
             return real(lock, state, fsync=fsync)
 
@@ -1501,7 +1504,7 @@ class TestE6LockDurability:
         # claimant refuses immediately — the E9 counterexample dies
         lock = executor.journal.root / "run.lock"
         assert lock.exists()
-        assert lock.read_text() != "released"
+        assert not lock.read_text().startswith("released:")
         with pytest.raises(PlanLockHeld):
             make_executor(authority, tmp_path, directive,
                           FakePort()).resume()
@@ -1512,8 +1515,9 @@ class TestE6LockDurability:
         executor = make_executor(authority, tmp_path, directive,
                                  FakePort())
         executor.execute()
-        assert (executor.journal.root /
-                "run.lock").read_text() == "released"
+        assert re.fullmatch(r"released:[0-9a-f]{32}",
+                            (executor.journal.root /
+                             "run.lock").read_text())
         reborn = make_executor(authority, tmp_path, directive,
                                FakePort())
         assert reborn.resume() == {"state": "completed",
@@ -1684,7 +1688,7 @@ class TestE9MonotoneLock:
         real = EffectExecutor._write_lock_state
 
         def failing(lock, state, *, fsync=True):
-            if state == "released":
+            if state.startswith("released:"):
                 raise OSError("release boundary failure")
             return real(lock, state, fsync=fsync)
 
@@ -1710,7 +1714,7 @@ class TestE9MonotoneLock:
         real = EffectExecutor._write_lock_state
 
         def failing(lock, state, *, fsync=True):
-            if state == "released":
+            if state.startswith("released:"):
                 raise OSError("release boundary failure")
             return real(lock, state, fsync=fsync)
 
@@ -2083,12 +2087,23 @@ class TestE12LedgerDurability:
         # LOCK-directory fsync: the lock stays held for operator
         # disposition and every later claimant refuses
         (2, "lock_held"),
-        # intent (PENDING ack) dir fsync: the ack may be visible
-        # with no record — uncertain
+        # intent (PENDING ack + intent record) dir fsync: artefacts
+        # may be visible with no record — uncertain
         (3, "uncertain"),
-        # post-rename dir fsync: record visible, ack still PENDING —
+        # post-rename dir fsync: record visible, no completion —
         # uncertain
         (4, "uncertain"),
+        # completion-record dir fsync: the completion file itself is
+        # durable and valid — recovery evaluates the physical state
+        # and the record stands; the next sequence registers
+        (5, "complete"),
+        # release-intent dir fsync: registration completed but the
+        # lock release is uncertain and the lock stays held
+        (6, "lock_held"),
+        # release-completion dir fsync: the completion record is
+        # visible and valid — the next claimant reclaims and a later
+        # registration is legal
+        (7, "clean"),
     ])
     def test_every_dirfsync_failure_registers_nothing_authoritative(
             self, tmp_path, monkeypatch, fail_at, aftermath):
@@ -2120,17 +2135,24 @@ class TestE12LedgerDurability:
                                match="lock reads"):
                 fresh.register(self._receipt(seq=2, body=b"b2"),
                                route="v|a|s")
+        elif aftermath == "complete":
+            # the physically complete record STANDS and the next
+            # sequence registers over a reclaimed lock
+            result = fresh.register(
+                self._receipt(seq=2, body=b"b2"), route="v|a|s")
+            assert result["monotonic_seq"] == 2
         else:
-            # nothing authoritative survived, and nothing blocks a
-            # clean later registration
+            # nothing authoritative blocks a clean registration
             fresh.register(self._receipt(seq=2, body=b"b2"),
                            route="v|a|s")
 
-    def test_an_acknowledgement_failure_stays_pending(self, tmp_path,
-                                                      monkeypatch):
+    def test_an_acknowledgement_failure_authorizes_nothing(
+            self, tmp_path, monkeypatch):
         """The fsync of the AUTHORIZING digest write fails — targeted
-        by content, not by ordinal, so the witness files added by E13
-        cannot silently retarget it."""
+        by content, not by ordinal, so witness files cannot silently
+        retarget it. E14: there is no restoration write; whatever
+        bytes landed, the missing completion record keeps the record
+        unauthorized in a fresh process."""
         import app.venue_direct_evidence as mod
         from app.venue_direct_evidence import (ReceiptLedger,
                                                ReceiptUncertainError)
@@ -2148,12 +2170,12 @@ class TestE12LedgerDurability:
             return real_fsync(fd)
 
         monkeypatch.setattr(mod.os, "fsync", failing)
-        with pytest.raises(Exception):
+        with pytest.raises(ReceiptUncertainError):
             ledger.register(self._receipt(), route="v|a|s")
         monkeypatch.undo()
         fresh = ReceiptLedger(ledger.root)
         with pytest.raises(ReceiptUncertainError,
-                           match="PENDING"):
+                           match="REGISTRATION_UNCERTAIN"):
             fresh.register(self._receipt(), route="v|a|s")
 
     def test_the_executor_refuses_when_registration_is_uncertain(
@@ -2343,6 +2365,7 @@ class TestE12LedgerDurability:
 # ================================================================== #
 
 import os
+import re
 
 
 def _forge(path, data):
@@ -2355,13 +2378,15 @@ def _forge(path, data):
 
 
 class TestE13DurableRestoration:
-    """E13-1/E13-2 FROZEN: when the fsync of an authorizing write
-    failed, the restorative write was NOT fsynced. On the crash
-    branch where the failed write reached storage anyway, a fresh
-    process treated a REJECTED registration as authoritative and a
-    claimant entered over a REJECTED release. The durable witness —
-    written and fsynced BEFORE the authorizing transition — now
-    refuses every branch."""
+    """E13/E14 FROZEN. E13: restorative writes were not fsynced, so
+    the reached-storage branch of a failed authorizing write escaped
+    them. E14: the E13 witness moved the same uncertainty to its own
+    final overwrite. Now nothing is overwritten to establish or undo
+    a transition: an immutable intent record precedes it, a separate
+    exclusive completion record closes it, and recovery evaluates
+    the PHYSICAL state — a durable completion recovers as completed
+    even when the caller saw an fsync exception; anything less is
+    uncertain and authorizes nothing."""
 
     def _ledger(self, tmp_path, name="ledger"):
         from app.venue_direct_evidence import ReceiptLedger
@@ -2375,32 +2400,25 @@ class TestE13DurableRestoration:
     def _route_dir(self, ledger):
         return next(d for d in ledger.root.iterdir() if d.is_dir())
 
-    @pytest.mark.parametrize("restore_also_fails", [False, True])
     def test_ack_reached_storage_branch_is_uncertain(
-            self, tmp_path, monkeypatch, restore_also_fails):
-        """The digest write's fsync fails; the crash branch where
-        that write reached storage is materialised. The durable
-        'authorizing' witness refuses it in a fresh process — with
-        and without the restorative PENDING fsync failing too."""
+            self, tmp_path, monkeypatch):
+        """E13 FROZEN, restated for E14: the digest write's fsync
+        fails and the crash branch where it reached storage is
+        materialised. The MISSING completion record — not any
+        restoration — keeps a fresh process uncertain."""
         import app.venue_direct_evidence as mod
         from app.venue_direct_evidence import (ReceiptLedger,
                                                ReceiptUncertainError)
         ledger = self._ledger(tmp_path)
         digest = _expected_digest(self._receipt(), "v|a|s")
         real_fsync = mod.os.fsync
-        armed = {"failed_digest": False}
 
         def failing(fd):
             import stat as stat_mod
             if not stat_mod.S_ISDIR(mod.os.fstat(fd).st_mode):
                 with open(f"/proc/self/fd/{fd}", "rb") as handle:
-                    content = handle.read()
-                if content == digest.encode():
-                    armed["failed_digest"] = True
-                    raise OSError("ack digest fsync failed")
-                if restore_also_fails and armed["failed_digest"] \
-                        and content == b"PENDING":
-                    raise OSError("restorative fsync failed too")
+                    if handle.read() == digest.encode():
+                        raise OSError("ack digest fsync failed")
             return real_fsync(fd)
 
         monkeypatch.setattr(mod.os, "fsync", failing)
@@ -2408,19 +2426,25 @@ class TestE13DurableRestoration:
             ledger.register(self._receipt(), route="v|a|s")
         monkeypatch.undo()
         route_dir = self._route_dir(ledger)
-        witness = route_dir / "00000001.json.aw"
-        assert witness.read_bytes() == b"authorizing"
         # the crash branch: the failed digest write reached storage
         _forge(route_dir / "00000001.json.ack", digest.encode())
+        assert not (route_dir / "00000001.json.done").exists()
         fresh = ReceiptLedger(ledger.root)
-        with pytest.raises(ReceiptUncertainError, match="witness"):
+        with pytest.raises(ReceiptUncertainError,
+                           match="no completion record"):
             fresh.register(self._receipt(), route="v|a|s")
-        with pytest.raises(ReceiptUncertainError, match="witness"):
+        with pytest.raises(ReceiptUncertainError,
+                           match="no completion record"):
             fresh.register(self._receipt(seq=9, body=b"b9"),
                            route="v|a|s")
 
-    def test_completion_witness_fsync_failure_is_uncertain(
+    def test_completion_fsync_failure_recovers_by_physical_state(
             self, tmp_path, monkeypatch):
+        """E14 ORDER §5: 'done' reaches modeled storage, its fsync
+        fails. BOTH physically possible recoveries: the fully
+        durable completion recovers as COMPLETED even though the
+        caller saw an exception; the partially durable completion
+        stays uncertain."""
         import app.venue_direct_evidence as mod
         from app.venue_direct_evidence import (ReceiptLedger,
                                                ReceiptUncertainError)
@@ -2431,45 +2455,87 @@ class TestE13DurableRestoration:
             import stat as stat_mod
             if not stat_mod.S_ISDIR(mod.os.fstat(fd).st_mode):
                 name = os.readlink(f"/proc/self/fd/{fd}")
-                if name.endswith(".json.aw"):
-                    with open(f"/proc/self/fd/{fd}", "rb") as handle:
-                        if handle.read() == b"done":
-                            raise OSError("witness fsync failed")
+                if name.endswith(".json.done"):
+                    raise OSError("completion fsync failed")
             return real_fsync(fd)
 
         monkeypatch.setattr(mod.os, "fsync", failing)
-        with pytest.raises(ReceiptUncertainError, match="witness"):
+        with pytest.raises(ReceiptUncertainError,
+                           match="completion record could not be "
+                                 "made durable"):
             ledger.register(self._receipt(), route="v|a|s")
         monkeypatch.undo()
+        route_dir = self._route_dir(ledger)
+        done = route_dir / "00000001.json.done"
+        durable_bytes = done.read_bytes()
+        # branch A: the completion record fully reached storage —
+        # recovery finds complete, internally consistent state and
+        # recovers COMPLETED: the identical receipt is idempotently
+        # accepted and the next sequence registers cleanly
         fresh = ReceiptLedger(ledger.root)
-        with pytest.raises(ReceiptUncertainError, match="witness"):
-            fresh.register(self._receipt(seq=9, body=b"b9"),
-                           route="v|a|s")
+        assert fresh.register(self._receipt(),
+                              route="v|a|s")["monotonic_seq"] == 1
+        # branch B: the completion was only PARTIALLY durable — a
+        # torn artefact authorizes nothing
+        _forge(done, durable_bytes[:len(durable_bytes) // 2])
+        with pytest.raises(ReceiptUncertainError,
+                           match="malformed or partially durable"):
+            ReceiptLedger(ledger.root).register(
+                self._receipt(seq=9, body=b"b9"), route="v|a|s")
 
-    @pytest.mark.parametrize("restore_also_fails", [False, True])
-    def test_route_lock_release_reached_storage_branch_refuses(
-            self, tmp_path, monkeypatch, restore_also_fails):
-        """The released write's fsync fails; the crash branch where
-        'released' reached storage is materialised. The durable
-        'releasing' witness refuses every claimant."""
+    def test_stale_completion_generation_refuses(self, tmp_path):
+        """E14 ORDER §3: a completion from another generation never
+        authorizes. The intent is reforged self-consistently with a
+        different generation; the completion no longer matches."""
+        from app.venue_direct_evidence import (
+            LEDGER_ACK_INTENT_SCHEMA, ReceiptLedger,
+            ReceiptUncertainError, sealed_json_bytes)
+        ledger = self._ledger(tmp_path)
+        payload = ledger.register(self._receipt(), route="v|a|s")
+        route_dir = self._route_dir(ledger)
+        _forge(route_dir / "00000001.json.aw", sealed_json_bytes({
+            "schema": LEDGER_ACK_INTENT_SCHEMA, "route": "v|a|s",
+            "monotonic_seq": 1, "generation": "ab" * 16,
+            "record_digest": payload["digest"]}))
+        with pytest.raises(ReceiptUncertainError,
+                           match="another generation"):
+            ReceiptLedger(ledger.root).register(
+                self._receipt(seq=9, body=b"b9"), route="v|a|s")
+
+    def test_transplanted_completion_refuses(self, tmp_path):
+        """A completion record moved from another sequence is
+        mismatched, not authoritative."""
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptUncertainError)
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(), route="v|a|s")
+        ledger.register(self._receipt(seq=2, body=b"body-2"),
+                        route="v|a|s")
+        route_dir = self._route_dir(ledger)
+        _forge(route_dir / "00000002.json.done",
+               (route_dir / "00000001.json.done").read_bytes())
+        with pytest.raises(ReceiptUncertainError,
+                           match="mismatched completion"):
+            ReceiptLedger(ledger.root).register(
+                self._receipt(seq=9, body=b"b9"), route="v|a|s")
+
+    def test_route_lock_release_reached_storage_branch(
+            self, tmp_path, monkeypatch):
+        """The released:<epoch> write's fsync fails. Without a
+        durable completion record no claimant enters — whatever
+        bytes landed."""
         import app.venue_direct_evidence as mod
         from app.venue_direct_evidence import (ReceiptLedger,
                                                ReceiptLedgerError)
         ledger = self._ledger(tmp_path)
         real_fsync = mod.os.fsync
-        armed = {"failed_release": False}
 
         def failing(fd):
             import stat as stat_mod
             if not stat_mod.S_ISDIR(mod.os.fstat(fd).st_mode):
                 with open(f"/proc/self/fd/{fd}", "rb") as handle:
-                    content = handle.read()
-                if content == b"released":
-                    armed["failed_release"] = True
-                    raise OSError("released fsync failed")
-                if restore_also_fails and armed["failed_release"] \
-                        and content.startswith(b"held:"):
-                    raise OSError("restorative fsync failed too")
+                    if handle.read().startswith(b"released:"):
+                        raise OSError("released fsync failed")
             return real_fsync(fd)
 
         monkeypatch.setattr(mod.os, "fsync", failing)
@@ -2478,28 +2544,61 @@ class TestE13DurableRestoration:
             ledger.register(self._receipt(), route="v|a|s")
         monkeypatch.undo()
         route_dir = self._route_dir(ledger)
-        assert (route_dir /
-                "register.lock.rw").read_bytes() == b"releasing"
-        # the crash branch: 'released' reached storage, the
-        # restorative 'held' did not
-        _forge(route_dir / "register.lock", b"released")
-        fresh = ReceiptLedger(ledger.root)
+        # the crash branch: released:<epoch> IS the live content —
+        # the write happened, only its fsync failed — and no
+        # completion record exists for that epoch
+        content = (route_dir / "register.lock").read_bytes()
+        assert content.startswith(b"released:")
+        epoch = content.decode().split(":", 1)[1]
+        assert not (route_dir /
+                    f"register.lock.reldone.{epoch}").exists()
         with pytest.raises(ReceiptLedgerError,
-                           match="release witness"):
-            fresh.register(self._receipt(seq=9, body=b"b9"),
-                           route="v|a|s")
+                           match="no durable release completion"):
+            ReceiptLedger(ledger.root).register(
+                self._receipt(seq=9, body=b"b9"), route="v|a|s")
+
+    def test_route_lock_completion_fsync_failure_recovers(
+            self, tmp_path, monkeypatch):
+        """E14 ORDER §5, other branch: the completion record reached
+        storage though its fsync failed — the release physically
+        completed, and a fresh claimant enters."""
+        import app.venue_direct_evidence as mod
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        ledger = self._ledger(tmp_path)
+        real_fsync = mod.os.fsync
+
+        def failing(fd):
+            import stat as stat_mod
+            if not stat_mod.S_ISDIR(mod.os.fstat(fd).st_mode):
+                name = os.readlink(f"/proc/self/fd/{fd}")
+                if ".reldone." in name:
+                    raise OSError("completion fsync failed")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(mod.os, "fsync", failing)
+        with pytest.raises(ReceiptLedgerError,
+                           match="release could not be made durable"):
+            ledger.register(self._receipt(), route="v|a|s")
+        monkeypatch.undo()
+        # the completion record fully reached storage: recovery
+        # evaluates the physical state and admits the next claimant
+        fresh = ReceiptLedger(ledger.root)
+        result = fresh.register(self._receipt(seq=9, body=b"b9"),
+                                route="v|a|s")
+        assert result["monotonic_seq"] == 9
 
     def test_run_lock_release_reached_storage_branch_refuses(
             self, authority, tmp_path, monkeypatch):
-        """E13-2 FROZEN for the executor lock: previously the second
-        claimant ENTERED over this exact crash branch."""
+        """E13-2/E14 FROZEN for the executor lock: the claimant used
+        to enter over this exact crash branch."""
         directive = alpaca_directive(authority)
         executor = make_executor(authority, tmp_path, directive,
                                  FakePort())
         real = EffectExecutor._write_lock_state
 
         def failing(lock, state, *, fsync=True):
-            if state == "released":
+            if state.startswith("released:"):
                 raise OSError("released fsync failed")
             return real(lock, state, fsync=fsync)
 
@@ -2509,51 +2608,104 @@ class TestE13DurableRestoration:
                            match="release could not be made durable"):
             executor.execute()
         monkeypatch.undo()
-        lock = executor.journal.root / "run.lock"
-        witness = executor.journal.root / "run.lock.rw"
-        assert witness.read_bytes() == b"releasing"
-        # the crash branch: 'released' reached storage, the durable
-        # 'held' restoration did not
-        _forge(lock, b"released")
+        root = executor.journal.root
+        intent = next(root.glob("run.lock.rel.*"))
+        epoch = intent.name.rsplit(".", 1)[1]
+        # the crash branch: released:<epoch> reached storage; the
+        # completion record does not exist
+        _forge(root / "run.lock", f"released:{epoch}".encode())
+        assert not (root / f"run.lock.reldone.{epoch}").exists()
         second = make_executor(authority, tmp_path, directive,
                                FakePort())
-        with pytest.raises(PlanLockHeld, match="release witness"):
+        with pytest.raises(PlanLockHeld,
+                           match="no durable release completion"):
             second.resume()
 
-    def test_run_lock_witness_gates_reclaim(self, authority,
-                                            tmp_path):
+    def test_run_lock_completion_fsync_failure_recovers(
+            self, authority, tmp_path, monkeypatch):
+        """The completion record reached storage though its fsync
+        failed: the release physically completed and a fresh
+        executor resumes the completed plan."""
+        import app.venue_direct_evidence as vmod
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        real_fsync = vmod.os.fsync
+
+        def failing(fd):
+            import stat as stat_mod
+            if not stat_mod.S_ISDIR(vmod.os.fstat(fd).st_mode):
+                name = os.readlink(f"/proc/self/fd/{fd}")
+                # ONLY the run lock's completion — the ledger route
+                # lock inside the gate must release normally
+                if "run.lock.reldone." in name:
+                    raise OSError("completion fsync failed")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(vmod.os, "fsync", failing)
+        with pytest.raises(ExecutorError,
+                           match="release could not be made durable"):
+            executor.execute()
+        monkeypatch.undo()
+        second = make_executor(authority, tmp_path, directive,
+                               FakePort())
+        assert second.resume() == {"state": "completed",
+                                   "resumed": True}
+
+    def test_run_lock_completion_gates_reclaim(self, authority,
+                                               tmp_path):
+        from app.venue_direct_evidence import (
+            LOCK_RELEASE_COMPLETION_SCHEMA, sealed_json_bytes)
         directive = alpaca_directive(authority)
         executor = make_executor(authority, tmp_path, directive,
                                  FakePort())
         executor.execute()
-        lock = executor.journal.root / "run.lock"
-        witness = executor.journal.root / "run.lock.rw"
-        assert lock.read_bytes() == b"released"
-        assert witness.read_bytes() == b"done"
-        # an uncertain release refuses even over a 'released' lock
-        _forge(witness, b"releasing")
+        root = executor.journal.root
+        content = (root / "run.lock").read_text()
+        epoch = content.split(":", 1)[1]
+        done = root / f"run.lock.reldone.{epoch}"
+        durable = done.read_bytes()
         second = make_executor(authority, tmp_path, directive,
                                FakePort())
-        with pytest.raises(PlanLockHeld, match="release witness"):
+        # completion absent -> refuse
+        done.rename(root / "stashed.away")
+        with pytest.raises(PlanLockHeld,
+                           match="no durable release completion"):
             second._acquire_run_lock()
-        # a witnessed release admits the claimant again
-        _forge(witness, b"done")
-        lock_handle = second._acquire_run_lock()
-        second._release_run_lock(lock_handle)
+        # a stale completion from ANOTHER epoch under the right
+        # name -> refuse: it names a generation this lock never
+        # released
+        _forge(done, sealed_json_bytes({
+            "schema": LOCK_RELEASE_COMPLETION_SCHEMA,
+            "scope": str(executor.plan_id), "epoch": "ab" * 16}))
+        with pytest.raises(PlanLockHeld,
+                           match="stale completion"):
+            second._acquire_run_lock()
+        # the true completion admits the claimant
+        _forge(done, durable)
+        handle = second._acquire_run_lock()
+        second._release_run_lock(handle)
 
-    def test_release_restoration_is_fsynced(self):
-        """The restorative writes carry a durable fsync: no
-        exception path may rely on an un-fsynced restorative
-        write."""
+    def test_no_restoration_writes_exist(self):
+        """E14 ORDER §2: no restoration write is required or
+        trusted — release and registration exception paths contain
+        neither an un-fsynced write nor a rewrite to a held or
+        pending state."""
         import inspect
         from app.effect_executor import EffectExecutor as Exe
         import app.venue_direct_evidence as mod
         for source in (inspect.getsource(Exe._release_run_lock),
                        inspect.getsource(
-                           mod.ReceiptLedger._release_lock),
-                       inspect.getsource(mod.ReceiptLedger.register)):
-            assert "fsync=False" not in source, (
-                "a restorative write relies on an un-fsynced write")
+                           mod.ReceiptLedger._release_lock)):
+            assert "fsync=False" not in source
+            assert "held:" not in source, (
+                "a release path rewrites the lock to held — "
+                "restoration is not trusted and must not exist")
+        register_src = inspect.getsource(mod.ReceiptLedger.register)
+        assert "fsync=False" not in register_src
+        assert register_src.count("_ACK_PENDING") == 1, (
+            "register writes PENDING once at intent time and never "
+            "as a restoration")
 
 
 class TestE13DescriptorBoundObjects:
@@ -2583,7 +2735,7 @@ class TestE13DescriptorBoundObjects:
 
     @pytest.mark.parametrize("target", [
         "00000001.json", "00000001.json.ack", "00000001.json.aw",
-        "register.lock"])
+        "00000001.json.done", "register.lock"])
     def test_symlink_substitution_race_refuses(self, tmp_path,
                                                monkeypatch, target):
         """The race is modelled by disabling every path-time
@@ -2618,7 +2770,8 @@ class TestE13DescriptorBoundObjects:
                            route="v|a|s")
 
     @pytest.mark.parametrize("target", [
-        "00000001.json.ack", "00000001.json.aw", "register.lock"])
+        "00000001.json.ack", "00000001.json.aw",
+        "00000001.json.done", "register.lock"])
     def test_wrong_mode_refuses(self, tmp_path, target):
         from app.venue_direct_evidence import (ReceiptLedger,
                                                ReceiptLedgerError)
@@ -2651,28 +2804,30 @@ class TestE13DescriptorBoundObjects:
         executor.journal.root.mkdir(parents=True, exist_ok=True)
         lock = executor.journal.root / "run.lock"
         stash = tmp_path / "attacker_lock"
-        stash.write_bytes(b"released")
+        stash.write_bytes(b"released:" + b"ab" * 16)
         os.chmod(stash, 0o600)
         lock.symlink_to(stash)
-        witness = executor.journal.root / "run.lock.rw"
-        witness.write_bytes(b"done")
-        os.chmod(witness, 0o600)
         monkeypatch.setattr(Path, "is_symlink", lambda self: False)
-        with pytest.raises(PlanLockHeld, match="not 'released'"):
+        with pytest.raises(PlanLockHeld, match="operator disposes"):
             executor._acquire_run_lock()
 
     def test_unwitnessed_released_run_lock_refuses(self, authority,
                                                    tmp_path):
-        """A lock that reads 'released' without any release witness
-        is an unwitnessed release and authorizes nothing."""
+        """E14: a bare, unepoched 'released' is not a completed
+        release; an epoched one without its completion record is a
+        release that never completed. Both refuse."""
         directive = alpaca_directive(authority)
         executor = make_executor(authority, tmp_path, directive,
                                  FakePort())
         executor.journal.root.mkdir(parents=True, exist_ok=True)
         lock = executor.journal.root / "run.lock"
-        lock.write_bytes(b"released")
-        os.chmod(lock, 0o600)
-        with pytest.raises(PlanLockHeld, match="no release witness"):
+        _forge(lock, b"released")
+        with pytest.raises(PlanLockHeld,
+                           match="not a completed epoch release"):
+            executor._acquire_run_lock()
+        _forge(lock, b"released:" + b"ab" * 16)
+        with pytest.raises(PlanLockHeld,
+                           match="no durable release completion"):
             executor._acquire_run_lock()
 
     def test_two_processes_refuse_an_uncertain_route(self, tmp_path):
@@ -2750,8 +2905,10 @@ class TestE13DescriptorBoundObjects:
         ledger = self._ledger(tmp_path, name="proc_ledger")
         ledger.register(self._receipt(), route="v|a|s")
         route_dir = self._route_dir(ledger)
-        _forge(route_dir / "register.lock", b"released")
-        _forge(route_dir / "register.lock.rw", b"releasing")
+        # released:<epoch> whose completion record never persisted —
+        # the release the holder attempted never completed
+        _forge(route_dir / "register.lock",
+               b"released:" + b"cd" * 16)
         repo = str(Path(__file__).resolve().parents[2])
         script = (
             "import json, sys\n"
@@ -2767,7 +2924,8 @@ class TestE13DescriptorBoundObjects:
             "    print(json.dumps({'result': 'registered'}))\n"
             "except ReceiptLedgerError as exc:\n"
             "    print(json.dumps({'result': 'refused',\n"
-            "        'witnessed': 'release witness' in str(exc)}))\n")
+            "        'witnessed': 'no durable release completion'\n"
+            "                     in str(exc)}))\n")
         outputs = []
         for _index in (0, 1):
             proc = subprocess.run(
@@ -2777,3 +2935,84 @@ class TestE13DescriptorBoundObjects:
                 proc.stdout.strip().splitlines()[-1]))
         assert all(o == {"result": "refused", "witnessed": True}
                    for o in outputs), outputs
+
+    def test_two_processes_over_a_recovered_complete_state(
+            self, tmp_path, monkeypatch):
+        """E14 ORDER §5: the completion reached storage while its
+        fsync failed. Under two-process contention over the
+        recovered state, the physically complete record is honoured
+        idempotently and nothing double-registers."""
+        import subprocess
+        import sys as _sys
+        import time as _time
+        import app.venue_direct_evidence as mod
+        from app.venue_direct_evidence import ReceiptUncertainError
+        ledger = self._ledger(tmp_path, name="proc_ledger")
+        real_fsync = mod.os.fsync
+
+        def failing(fd):
+            import stat as stat_mod
+            if not stat_mod.S_ISDIR(mod.os.fstat(fd).st_mode):
+                if os.readlink(f"/proc/self/fd/{fd}").endswith(
+                        ".json.done"):
+                    raise OSError("completion fsync failed")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(mod.os, "fsync", failing)
+        with pytest.raises(ReceiptUncertainError):
+            ledger.register(self._receipt(), route="v|a|s")
+        monkeypatch.undo()
+        repo = str(Path(__file__).resolve().parents[2])
+        barrier = tmp_path / "GO"
+        script = (
+            "import json, sys, time\n"
+            f"sys.path.insert(0, {repo!r})\n"
+            f"sys.path.insert(0, {repo!r} + '/tests')\n"
+            "from unit.test_wp3_venue_direct_evidence import "
+            "receipt_for\n"
+            "from app.venue_direct_evidence import (ReceiptLedger,\n"
+            "    VenueEvidenceError)\n"
+            "from pathlib import Path\n"
+            "root, ready, barrier = sys.argv[1:4]\n"
+            "ledger = ReceiptLedger(root)\n"
+            "Path(ready).write_text('ready')\n"
+            "while not Path(barrier).exists():\n"
+            "    time.sleep(0.001)\n"
+            "try:\n"
+            "    out = ledger.register(receipt_for(b'body-1', "
+            "seq=1),\n"
+            "                          route='v|a|s')\n"
+            "    print(json.dumps({'result': 'accepted',\n"
+            "                      'seq': out['monotonic_seq']}))\n"
+            "except VenueEvidenceError as exc:\n"
+            "    print(json.dumps({'result': 'refused',\n"
+            "                      'kind': type(exc).__name__}))\n")
+        procs = []
+        for index in (0, 1):
+            ready = tmp_path / f"ready_{index}"
+            procs.append((subprocess.Popen(
+                [_sys.executable, "-c", script, str(ledger.root),
+                 str(ready), str(barrier)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True), ready))
+        try:
+            waited = 0.0
+            while waited < 90.0 and not all(
+                    r.exists() for _p, r in procs):
+                _time.sleep(0.02)
+                waited += 0.02
+            barrier.write_text("go")
+            outputs = [p.communicate(timeout=180) for p, _r in procs]
+        finally:
+            for p, _r in procs:
+                if p.poll() is None:
+                    p.kill()
+        results = [json.loads(o.strip().splitlines()[-1])
+                   for o, _e in outputs]
+        accepted = [r for r in results if r["result"] == "accepted"]
+        assert len(accepted) >= 1, results
+        assert all(r.get("seq", 1) == 1 for r in accepted), results
+        # the loser, if any, refused on lock contention — never a
+        # second registration and never a crash
+        assert all(r["result"] in ("accepted", "refused")
+                   for r in results), results
