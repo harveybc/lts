@@ -2016,3 +2016,312 @@ class TestE11ReceiptLedgerAuthority:
         registered = record["payload"]["receipt_registered"]
         assert registered["monotonic_seq"] >= 0
         assert len(registered["body_sha256"]) == 64
+
+
+# ================================================================== #
+# E12: ledger durability and record integrity                        #
+# ================================================================== #
+
+class TestE12LedgerDurability:
+
+    def _ledger(self, tmp_path, name="ledger"):
+        from app.venue_direct_evidence import ReceiptLedger
+        return ReceiptLedger(tmp_path / name)
+
+    def _receipt(self, seq=1, body=b"body-1", **kw):
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        return receipt_for(body, seq=seq, **kw)
+
+    def _route_dir(self, ledger):
+        return next(d for d in ledger.root.iterdir() if d.is_dir())
+
+    def test_rename_success_dirfsync_failure_is_uncertain(
+            self, tmp_path, monkeypatch):
+        """E12 FROZEN. The rename made the record visible, the
+        directory fsync failed, and a FRESH process read the record
+        as fully authoritative."""
+        import app.venue_direct_evidence as mod
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptUncertainError)
+        ledger = self._ledger(tmp_path)
+        calls = {"n": 0}
+        real = mod._ledger_fsync_dir
+
+        def failing(path):
+            calls["n"] += 1
+            # 1: route-dir creation, 2: intent, 3: post-rename
+            if calls["n"] == 3:
+                raise OSError("dir fsync failed AFTER the rename")
+            return real(path)
+
+        monkeypatch.setattr(mod, "_ledger_fsync_dir", failing)
+        with pytest.raises(Exception):
+            ledger.register(self._receipt(), route="v|a|s")
+        monkeypatch.undo()
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptUncertainError,
+                           match="REGISTRATION_UNCERTAIN"):
+            fresh.register(self._receipt(), route="v|a|s")
+        with pytest.raises(ReceiptUncertainError):
+            fresh.register(self._receipt(seq=99, body=b"other"),
+                           route="v|a|s")
+
+    @pytest.mark.parametrize("fail_at,aftermath", [
+        # route-dir creation fsync: NOTHING became visible, so a
+        # later clean registration is legal
+        (1, "clean"),
+        # LOCK-directory fsync: the lock stays held for operator
+        # disposition and every later claimant refuses
+        (2, "lock_held"),
+        # intent (PENDING ack) dir fsync: the ack may be visible
+        # with no record — uncertain
+        (3, "uncertain"),
+        # post-rename dir fsync: record visible, ack still PENDING —
+        # uncertain
+        (4, "uncertain"),
+    ])
+    def test_every_dirfsync_failure_registers_nothing_authoritative(
+            self, tmp_path, monkeypatch, fail_at, aftermath):
+        import app.venue_direct_evidence as mod
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptUncertainError)
+        ledger = self._ledger(tmp_path, name=f"l{fail_at}")
+        calls = {"n": 0}
+        real = mod._ledger_fsync_dir
+
+        def failing(path):
+            calls["n"] += 1
+            if calls["n"] == fail_at:
+                raise OSError(f"dir fsync {fail_at} failed")
+            return real(path)
+
+        monkeypatch.setattr(mod, "_ledger_fsync_dir", failing)
+        with pytest.raises(Exception):
+            ledger.register(self._receipt(), route="v|a|s")
+        monkeypatch.undo()
+        from app.venue_direct_evidence import ReceiptLedgerError
+        fresh = ReceiptLedger(ledger.root)
+        if aftermath == "uncertain":
+            with pytest.raises(ReceiptUncertainError):
+                fresh.register(self._receipt(seq=2, body=b"b2"),
+                               route="v|a|s")
+        elif aftermath == "lock_held":
+            with pytest.raises(ReceiptLedgerError,
+                               match="lock reads"):
+                fresh.register(self._receipt(seq=2, body=b"b2"),
+                               route="v|a|s")
+        else:
+            # nothing authoritative survived, and nothing blocks a
+            # clean later registration
+            fresh.register(self._receipt(seq=2, body=b"b2"),
+                           route="v|a|s")
+
+    def test_an_acknowledgement_failure_stays_pending(self, tmp_path,
+                                                      monkeypatch):
+        import app.venue_direct_evidence as mod
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptUncertainError)
+        ledger = self._ledger(tmp_path)
+        real_fsync = mod.os.fsync
+        state = {"records_seen": 0}
+
+        def failing(fd):
+            import stat as stat_mod
+            if not stat_mod.S_ISDIR(mod.os.fstat(fd).st_mode):
+                state["records_seen"] += 1
+                # file fsyncs: 1 lock, 2 intent ack, 3 record tmp,
+                # 4 final ack
+                if state["records_seen"] == 4:
+                    raise OSError("ack fsync failed")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(mod.os, "fsync", failing)
+        with pytest.raises(Exception):
+            ledger.register(self._receipt(), route="v|a|s")
+        monkeypatch.undo()
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptUncertainError,
+                           match="PENDING"):
+            fresh.register(self._receipt(), route="v|a|s")
+
+    def test_the_executor_refuses_when_registration_is_uncertain(
+            self, authority, tmp_path):
+        from app.venue_direct_evidence import ReceiptLedger
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        executor = make_executor(authority, tmp_path, directive, port)
+        # plant an uncertain record on the executor's route
+        route = "|".join(("alpaca_paper", ALPACA_FP, "SPY"))
+        route_dir = executor.receipt_ledger._route_dir(route)
+        (route_dir / "00000099.json.ack").write_bytes(b"PENDING")
+        with pytest.raises(PlanStopped,
+                           match="registration refused"):
+            executor.execute()
+        assert port.submit_calls == []
+
+    MUTABLE = ("collector_source", "collector_code_identity",
+               "received_at", "monotonic_seq", "body_sha256",
+               "route", "schema", "digest")
+
+    @pytest.mark.parametrize("field", MUTABLE)
+    def test_mutating_any_record_field_refuses(self, tmp_path, field):
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        import os as os_mod
+        ledger = self._ledger(tmp_path, name=f"m_{field}")
+        ledger.register(self._receipt(), route="v|a|s")
+        route_dir = self._route_dir(ledger)
+        path = next(route_dir.glob("[0-9]*.json"))
+        record = json.loads(path.read_text())
+        record[field] = ("ffff" * 16 if field in
+                         ("body_sha256", "digest",
+                          "collector_code_identity")
+                         else "TAMPERED" if isinstance(
+                             record[field], str) else 7)
+        path.write_text(json.dumps(record))
+        os_mod.chmod(path, 0o600)
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(Exception):
+            fresh.register(self._receipt(seq=2, body=b"b2"),
+                           route="v|a|s")
+
+    def test_a_consistently_reforged_record_fails_the_ack(
+            self, tmp_path):
+        """Reforging the record digest makes the FILE self-consistent
+        but the acknowledgement still names the original digest."""
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptUncertainError,
+                                               canonical_bytes,
+                                               sha256_hex)
+        import os as os_mod
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(), route="v|a|s")
+        route_dir = self._route_dir(ledger)
+        path = next(route_dir.glob("[0-9]*.json"))
+        record = json.loads(path.read_text())
+        record["body_sha256"] = "f" * 64
+        body = {k: v for k, v in record.items() if k != "digest"}
+        record["digest"] = sha256_hex(canonical_bytes(body))
+        path.write_text(json.dumps(record))
+        os_mod.chmod(path, 0o600)
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptUncertainError,
+                           match="does not name this record's "
+                                 "digest"):
+            fresh.register(self._receipt(seq=2, body=b"b2"),
+                           route="v|a|s")
+
+    def test_a_wrong_mode_record_refuses(self, tmp_path):
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        import os as os_mod
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(), route="v|a|s")
+        path = next(self._route_dir(ledger).glob("[0-9]*.json"))
+        os_mod.chmod(path, 0o644)
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptLedgerError, match="not 0600"):
+            fresh.register(self._receipt(seq=2, body=b"b2"),
+                           route="v|a|s")
+
+    def test_distinct_routes_cannot_collide(self, tmp_path):
+        """E12 FROZEN: 'v|a_s' and 'v_a|s' previously landed in ONE
+        directory via character replacement."""
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(seq=1, body=b"x1"),
+                        route="v|a_s")
+        ledger.register(self._receipt(seq=1, body=b"x1"),
+                        route="v_a|s")     # distinct route, no clash
+        dirs = [d for d in ledger.root.iterdir() if d.is_dir()]
+        assert len(dirs) == 2
+        for directory in dirs:
+            record = json.loads(next(
+                directory.glob("[0-9]*.json")).read_text())
+            assert record["route"] in ("v|a_s", "v_a|s")
+
+    def test_a_record_moved_between_routes_refuses(self, tmp_path):
+        import shutil
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(), route="route-A")
+        ledger.register(self._receipt(seq=1, body=b"body-B"),
+                        route="route-B")
+        dir_a, dir_b = sorted(
+            d for d in ledger.root.iterdir() if d.is_dir())
+        # transplant A's record (and its ack) into B's directory
+        for path in list(dir_a.glob("00000001.json*")):
+            shutil.copy(path, dir_b / f"00000002{path.suffix if path.suffix != '.json' else '.json'}")
+        # normalise names: 00000002.json / 00000002.json.ack
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(Exception):
+            for route in ("route-A", "route-B"):
+                fresh.register(self._receipt(seq=9, body=b"b9"),
+                               route=route)
+
+    def test_a_non_hex_collector_code_refuses_everywhere(self):
+        from app.venue_direct_evidence import (AcquisitionReceipt,
+                                               VenueEvidenceError)
+        with pytest.raises(VenueEvidenceError, match="canonical"):
+            AcquisitionReceipt(
+                collector_source="x",
+                collector_code_identity="collector-code-0001",
+                received_at=NOW, monotonic_seq=1,
+                body_sha256="a" * 64)
+        with pytest.raises(Exception, match="canonical"):
+            policy(collector_code_identity="not-a-digest")
+
+    def test_two_real_processes_register_exactly_one(self, tmp_path):
+        import subprocess
+        import sys as _sys
+        import time as _time
+        repo = str(Path(__file__).resolve().parents[2])
+        root = tmp_path / "proc_ledger"
+        barrier = tmp_path / "GO"
+        script = (
+            "import json, os, sys, time\n"
+            f"sys.path.insert(0, {repo!r})\n"
+            f"sys.path.insert(0, {repo!r} + '/tests')\n"
+            "from unit.test_wp3_venue_direct_evidence import "
+            "receipt_for\n"
+            "from app.venue_direct_evidence import (ReceiptLedger,\n"
+            "    VenueEvidenceError)\n"
+            "from pathlib import Path\n"
+            "root, ready, barrier, tag = sys.argv[1:5]\n"
+            "ledger = ReceiptLedger(root)\n"
+            "Path(ready).write_text('ready')\n"
+            "while not Path(barrier).exists():\n"
+            "    time.sleep(0.001)\n"
+            "try:\n"
+            "    ledger.register(receipt_for(tag.encode(), seq=7),\n"
+            "                    route='v|a|s')\n"
+            "    print(json.dumps({'result': 'registered'}))\n"
+            "except VenueEvidenceError as exc:\n"
+            "    print(json.dumps({'result': 'refused',\n"
+            "                      'kind': type(exc).__name__}))\n")
+        procs = []
+        for index in (0, 1):
+            ready = tmp_path / f"ready_{index}"
+            procs.append((subprocess.Popen(
+                [_sys.executable, "-c", script, str(root),
+                 str(ready), str(barrier), f"body-{index}"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True), ready))
+        try:
+            waited = 0.0
+            while waited < 90.0 and not all(
+                    r.exists() for _p, r in procs):
+                _time.sleep(0.02)
+                waited += 0.02
+            barrier.write_text("go")
+            outputs = [p.communicate(timeout=180) for p, _r in procs]
+        finally:
+            for p, _r in procs:
+                if p.poll() is None:
+                    p.kill()
+        results = [json.loads(o.strip().splitlines()[-1])
+                   for o, _e in outputs]
+        registered = [r for r in results if r["result"] ==
+                      "registered"]
+        assert len(registered) == 1, results

@@ -113,7 +113,7 @@ def policy(venue="alpaca_paper", symbol="SPY",
                 max_age_seconds=120.0,
                 calendar_identity="cal-venue-v1",
                 collector_source="wp3_test_collector",
-                collector_code_identity="collector-code-0001")
+                collector_code_identity=COLLECTOR_CODE)
     base.update(kw)
     return VenueEvidencePolicy.build(**base)
 
@@ -121,12 +121,15 @@ def policy(venue="alpaca_paper", symbol="SPY",
 ALPACA_FP = "7853afed1025c1ba"
 
 
+COLLECTOR_CODE = "a3" * 32
+
+
 def receipt_for(raw, *, received=None, seq=1, body=None,
-                source="wp3_test_collector"):
+                source="wp3_test_collector", code=None):
     from app.venue_direct_evidence import AcquisitionReceipt
     return AcquisitionReceipt.build(
         collector_source=source,
-        collector_code_identity="collector-code-0001",
+        collector_code_identity=code or COLLECTOR_CODE,
         received_at=received or OBSERVED, monotonic_seq=seq,
         body=body if body is not None else raw)
 

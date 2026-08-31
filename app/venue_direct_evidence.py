@@ -274,10 +274,18 @@ class VenueEvidencePolicy:
         require_enum("venue", self.venue, VENUES)
         for name in ("account_fingerprint", "symbol",
                      "schema_version", "calendar_identity",
-                     "collector_source", "collector_code_identity"):
+                     "collector_source"):
             require_text(name, getattr(self, name))
         require_real("max_age_seconds", self.max_age_seconds,
                      positive=True)
+        if not isinstance(self.collector_code_identity, str) or \
+                len(self.collector_code_identity) != 64 or any(
+                    c not in "0123456789abcdef"
+                    for c in self.collector_code_identity):
+            raise VenuePolicyError(
+                "collector_code_identity must be the canonical "
+                "64-character lowercase hex digest of the reviewed "
+                "collector code")
         if not isinstance(self.allowed_sources, tuple) or \
                 not self.allowed_sources:
             raise VenuePolicyError(
@@ -1066,8 +1074,14 @@ class AcquisitionReceipt:
 
     def __post_init__(self):
         require_text("collector_source", self.collector_source)
-        require_text("collector_code_identity",
-                     self.collector_code_identity)
+        if not isinstance(self.collector_code_identity, str) or \
+                len(self.collector_code_identity) != 64 or any(
+                    c not in "0123456789abcdef"
+                    for c in self.collector_code_identity):
+            raise VenueEvidenceError(
+                "collector_code_identity must be the canonical "
+                "64-character lowercase hex digest of the reviewed "
+                "collector code — a label is not an identity")
         if not isinstance(self.received_at, datetime) or \
                 self.received_at.tzinfo is None:
             raise VenueEvidenceError(
@@ -1116,100 +1130,283 @@ class ReceiptLedgerError(VenueEvidenceError):
     """The receipt ledger refuses — typed, never a default."""
 
 
+class ReceiptUncertainError(ReceiptLedgerError):
+    """REGISTRATION_UNCERTAIN: a write was never acknowledged. The
+    route authorizes nothing until an operator disposes."""
+
+
+RECEIPT_RECORD_SCHEMA = "lts.receipt_ledger.record.v1"
+_RECORD_FIELDS = ("schema", "collector_source",
+                  "collector_code_identity", "received_at",
+                  "monotonic_seq", "body_sha256", "route", "digest")
+_ACK_PENDING = b"PENDING"
+
+
+def _ledger_fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class ReceiptLedger:
-    """E11: a DURABLE per-route ledger that makes receipt
-    monotonicity and body uniqueness facts instead of declarations.
+    """E11/E12: a DURABLE per-route ledger built on the ACCEPTED
+    monotone-acknowledgement protocol rather than a new invention.
 
-    One directory per route (venue|account|symbol). One file per
-    sequence number, created with the audited uncertain-write
-    protocol: an O_EXCL temporary, write, fchmod 0600, fsync, an
-    exclusive final create, rename, parent fsync — a failure at any
-    point registers nothing. A route-level registration lock makes
-    the read-check-create transaction exclusive, so:
+    Every record has a per-record acknowledgement file whose content
+    is PENDING before anything lands and the record's digest only
+    after the record is durable — both updates in place, so no later
+    directory fsync can strand them. A rename that succeeded before a
+    failing directory fsync therefore leaves a VISIBLE record whose
+    acknowledgement still says PENDING, and a fresh process classifies
+    it as REGISTRATION_UNCERTAIN: it authorizes nothing and blocks the
+    route until an operator disposes.
 
-    * a sequence rollback or reuse refuses (strictly increasing,
-      atomically enforced);
-    * a replayed BODY under a fresh, higher, fabricated sequence
-      refuses (body uniqueness per route);
-    * two concurrent collectors elect exactly one registration;
-    * re-registering the identical receipt is idempotent, because a
-      resume must not fail on its own history.
+    Records carry a strict schema, the canonical route and a content
+    digest, all verified on EVERY read together with file mode and
+    symlink refusal. Route directories are named by the sha256 of the
+    canonical route, so distinct routes cannot collide by character
+    replacement, and the route inside each verified record must match
+    the route being read.
 
-    Registration happens BEFORE a receipt's evidence may authorize
-    any effect; an unregistered receipt authorizes nothing."""
+    Registration is serialized by a MONOTONE route lock (held ->
+    releasing -> released, never unlinked) so two claimants reading
+    "released" cannot both enter and no unlink can strand the lock."""
 
     def __init__(self, root: Any):
         self.root = Path(root)
         if self.root.is_symlink():
             raise ReceiptLedgerError(
                 f"{self.root}: symlinked ledger root refused")
+        created = not self.root.exists()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
+        if created:
+            _ledger_fsync_dir(self.root.parent)
 
+    # -- routes -----------------------------------------------------
     def _route_dir(self, route: str) -> Path:
         require_text("route", route)
-        safe = route.replace("|", "_").replace("/", "_")
-        directory = self.root / safe
+        name = sha256_hex(route.encode("utf-8"))[:32]
+        directory = self.root / name
         if directory.is_symlink():
             raise ReceiptLedgerError(
-                f"{safe}: symlinked route refused")
+                f"route {route!r}: symlinked route dir refused")
+        created = not directory.exists()
         directory.mkdir(exist_ok=True, mode=0o700)
         os.chmod(directory, 0o700)
+        if created:
+            _ledger_fsync_dir(self.root)
         return directory
 
+    # -- the monotone route lock ------------------------------------
+    def _acquire_lock(self, directory: Path, route: str) -> Path:
+        lock = directory / "register.lock"
+        if lock.is_symlink():
+            raise ReceiptLedgerError("symlinked register lock refused")
+        try:
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         0o600)
+        except FileExistsError:
+            return self._reclaim_lock(lock, route)
+        try:
+            try:
+                os.write(fd, f"held:{os.getpid()}".encode())
+                os.fchmod(fd, 0o600)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            _ledger_fsync_dir(directory)
+        except Exception as exc:
+            raise ReceiptLedgerError(
+                f"route {route!r}: the registration lock could not "
+                f"be made durable ({exc}) — registration refused and "
+                "the lock stays for operator disposition") from exc
+        return lock
+
+    def _reclaim_lock(self, lock: Path, route: str) -> Path:
+        try:
+            content = lock.read_bytes().decode("utf-8",
+                                               errors="replace")
+        except Exception:
+            content = "<unreadable>"
+        if content != "released":
+            raise ReceiptLedgerError(
+                f"route {route!r}: the registration lock reads "
+                f"{content[:24]!r}, not 'released' — a concurrent or "
+                "uncertain registration holds it")
+        reclaim = lock.with_suffix(".lock.reclaim")
+        if reclaim.is_symlink():
+            raise ReceiptLedgerError("symlinked reclaim lock refused")
+        try:
+            fd = os.open(reclaim, os.O_WRONLY | os.O_CREAT |
+                         os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            raise ReceiptLedgerError(
+                f"route {route!r}: a competing reclaim is in "
+                "progress") from exc
+        os.close(fd)
+        try:
+            if lock.read_bytes() != b"released":
+                raise ReceiptLedgerError(
+                    f"route {route!r}: the lock changed under the "
+                    "reclaim — refused")
+            fd = os.open(lock, os.O_WRONLY | os.O_TRUNC)
+            try:
+                os.write(fd, f"held:{os.getpid()}".encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        finally:
+            try:
+                os.unlink(reclaim)
+            except FileNotFoundError:
+                pass
+        return lock
+
+    def _release_lock(self, lock: Path, route: str) -> None:
+        try:
+            for state in (b"releasing", b"released"):
+                fd = os.open(lock, os.O_WRONLY | os.O_TRUNC)
+                try:
+                    os.write(fd, state)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        except Exception as exc:
+            try:
+                fd = os.open(lock, os.O_WRONLY | os.O_TRUNC)
+                try:
+                    os.write(fd, f"held:{os.getpid()}".encode())
+                finally:
+                    os.close(fd)
+            except Exception:
+                pass
+            raise ReceiptLedgerError(
+                f"route {route!r}: the lock release could not be "
+                f"made durable ({exc}) — the lock stays authoritative "
+                "for operator disposition") from exc
+
+    # -- verified reads ---------------------------------------------
+    def _verify_record(self, path: Path, route: str) -> dict:
+        if path.is_symlink():
+            raise ReceiptLedgerError(
+                f"{path.name}: symlinked record refused")
+        mode = os.stat(path).st_mode & 0o777
+        if mode != 0o600:
+            raise ReceiptLedgerError(
+                f"{path.name}: mode {oct(mode)} is not 0600")
+        try:
+            record = json.loads(path.read_text())
+        except Exception as exc:
+            raise ReceiptUncertainError(
+                f"{path.name}: unreadable record — "
+                f"REGISTRATION_UNCERTAIN ({exc})") from exc
+        if not isinstance(record, dict) or \
+                set(record) != set(_RECORD_FIELDS):
+            raise ReceiptLedgerError(
+                f"{path.name}: record fields "
+                f"{sorted(record) if isinstance(record, dict) else record!r}"
+                f" do not match the schema — refused")
+        if record["schema"] != RECEIPT_RECORD_SCHEMA:
+            raise ReceiptLedgerError(
+                f"{path.name}: schema {record['schema']!r} refused")
+        body = {k: v for k, v in record.items() if k != "digest"}
+        if record["digest"] != sha256_hex(canonical_bytes(body)):
+            raise ReceiptLedgerError(
+                f"{path.name}: record digest mismatch — altered "
+                "record refused")
+        if record["route"] != route:
+            raise ReceiptLedgerError(
+                f"{path.name}: record names route "
+                f"{record['route']!r}, not {route!r}")
+        seq = record["monotonic_seq"]
+        if isinstance(seq, bool) or not isinstance(seq, int) or \
+                seq < 0 or path.name != f"{seq:08d}.json":
+            raise ReceiptLedgerError(
+                f"{path.name}: malformed or mismatched sequence "
+                f"{seq!r}")
+        ack_path = path.with_suffix(".json.ack")
+        if ack_path.is_symlink():
+            raise ReceiptLedgerError(
+                f"{ack_path.name}: symlinked acknowledgement refused")
+        if not ack_path.is_file():
+            raise ReceiptUncertainError(
+                f"{path.name}: no acknowledgement — "
+                "REGISTRATION_UNCERTAIN, authorizes nothing")
+        ack = ack_path.read_bytes().strip()
+        if ack == _ACK_PENDING:
+            raise ReceiptUncertainError(
+                f"{path.name}: acknowledgement is PENDING — "
+                "REGISTRATION_UNCERTAIN, authorizes nothing")
+        if ack.decode("utf-8", errors="replace") != record["digest"]:
+            raise ReceiptUncertainError(
+                f"{path.name}: acknowledgement does not name this "
+                "record's digest — REGISTRATION_UNCERTAIN")
+        return record
+
+    def _read_route(self, directory: Path, route: str) -> dict:
+        records = {}
+        for path in sorted(directory.glob("[0-9]*.json")):
+            record = self._verify_record(path, route)
+            records[record["monotonic_seq"]] = record
+        for ack in directory.glob("[0-9]*.json.ack"):
+            record_path = ack.with_suffix("")
+            if not record_path.exists():
+                raise ReceiptUncertainError(
+                    f"{ack.name}: an acknowledgement without its "
+                    "record — REGISTRATION_UNCERTAIN")
+        return records
+
+    # -- registration ----------------------------------------------
     def register(self, receipt: AcquisitionReceipt, *,
                  route: str) -> dict:
         if not isinstance(receipt, AcquisitionReceipt):
             raise ReceiptLedgerError(
                 "a typed AcquisitionReceipt is required")
         directory = self._route_dir(route)
-        payload = receipt.as_dict()
-        lock = directory / "register.lock"
-        if lock.is_symlink():
-            raise ReceiptLedgerError("symlinked register lock refused")
+        lock = self._acquire_lock(directory, route)
         try:
-            lock_fd = os.open(lock, os.O_WRONLY | os.O_CREAT |
-                              os.O_EXCL, 0o600)
-        except FileExistsError as exc:
-            raise ReceiptLedgerError(
-                f"route {route!r}: a concurrent registration holds "
-                "the lock — exactly one collector registers at a "
-                "time") from exc
-        try:
-            os.write(lock_fd, str(os.getpid()).encode())
-            os.fsync(lock_fd)
-        finally:
-            os.close(lock_fd)
-        try:
-            existing = {}
-            for path in directory.glob("[0-9]*.json"):
-                if path.is_symlink():
-                    raise ReceiptLedgerError(
-                        f"{path.name}: symlinked ledger record "
-                        "refused")
-                record = json.loads(path.read_text())
-                existing[int(record["monotonic_seq"])] = record
+            records = self._read_route(directory, route)
+            payload = {"schema": RECEIPT_RECORD_SCHEMA,
+                       **receipt.as_dict(), "route": route}
+            payload["digest"] = sha256_hex(canonical_bytes(
+                {k: v for k, v in payload.items() if k != "digest"}))
             seq = receipt.monotonic_seq
-            if seq in existing:
-                if existing[seq] == payload:
-                    return existing[seq]        # idempotent resume
+            if seq in records:
+                if records[seq] == payload:
+                    return records[seq]          # idempotent resume
                 raise ReceiptLedgerError(
                     f"route {route!r}: sequence {seq} is already "
                     "registered with DIFFERENT content — reuse "
                     "refused")
-            if existing and seq <= max(existing):
+            if records and seq <= max(records):
                 raise ReceiptLedgerError(
                     f"route {route!r}: sequence {seq} does not "
-                    f"exceed the registered maximum {max(existing)} "
+                    f"exceed the registered maximum {max(records)} "
                     "— rollback or reuse refused")
-            for record in existing.values():
+            for record in records.values():
                 if record["body_sha256"] == payload["body_sha256"]:
                     raise ReceiptLedgerError(
                         f"route {route!r}: this exact body was "
                         f"already registered at sequence "
                         f"{record['monotonic_seq']} — a replayed "
                         "body under a fresh receipt is refused")
+
             path = directory / f"{seq:08d}.json"
+            ack_path = path.with_suffix(".json.ack")
+            # durable INTENT before anything becomes visible
+            fd = os.open(ack_path, os.O_WRONLY | os.O_CREAT |
+                         os.O_EXCL, 0o600)
+            try:
+                os.write(fd, _ACK_PENDING)
+                os.fchmod(fd, 0o600)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            _ledger_fsync_dir(directory)
+            # the record, via the audited uncertain-write shape
             tmp = path.with_suffix(f".json.tmp.{os.getpid()}")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                          0o600)
@@ -1226,27 +1423,35 @@ class ReceiptLedger:
                     pass
                 raise
             os.close(fd)
-            try:
-                final = os.open(path, os.O_WRONLY | os.O_CREAT |
-                                os.O_EXCL, 0o600)
-            except FileExistsError as exc:
-                os.unlink(tmp)
-                raise ReceiptLedgerError(
-                    f"route {route!r}: sequence {seq} was registered "
-                    "concurrently") from exc
-            os.close(final)
             os.replace(tmp, path)
-            fd = os.open(directory, os.O_RDONLY)
+            _ledger_fsync_dir(directory)
+            # MONOTONE acknowledgement, in place: only now does the
+            # record authorize anything. A failure RESTORES PENDING,
+            # so an unverified acknowledgement can never read as
+            # acknowledged in the live namespace either.
             try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+                fd = os.open(ack_path, os.O_WRONLY | os.O_TRUNC)
+                try:
+                    os.write(fd, payload["digest"].encode())
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except Exception as exc:
+                try:
+                    fd = os.open(ack_path, os.O_WRONLY | os.O_TRUNC)
+                    try:
+                        os.write(fd, _ACK_PENDING)
+                    finally:
+                        os.close(fd)
+                except Exception:
+                    pass        # whatever remains is not the digest
+                raise ReceiptUncertainError(
+                    f"route {route!r}: the acknowledgement could not "
+                    f"be made durable ({exc}) — "
+                    "REGISTRATION_UNCERTAIN") from exc
             return payload
         finally:
-            try:
-                os.unlink(lock)
-            except FileNotFoundError:
-                pass
+            self._release_lock(lock, route)
 
 
 # ---------------------------------------------------------------- #
