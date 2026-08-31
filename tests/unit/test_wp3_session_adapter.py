@@ -711,3 +711,203 @@ class TestC9WindDownPreservesProtection:
                                      orders=orders)
         assert facts.protective_orders == 3
         assert facts.entry_orders == 1
+
+
+# =================================================================== #
+# WP3-C10-B: cancellation precedes and gates every model effect       #
+# =================================================================== #
+
+WIND_DOWN_COMMANDS = [0, 1, 2, 3]
+
+
+class TestC10BCancellationPrecedesAndGates:
+
+    def _book(self):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"].append(json.loads(json.dumps(
+            ALPACA_PROTECTIVE_CHILD))["orders"][0])
+        return payload
+
+    def _directive(self, authority, command, state="WIND_DOWN"):
+        orders_ev = evidence("alpaca_paper", "open_orders",
+                             self._book())
+        positions_ev = evidence("alpaca_paper", "positions",
+                                ALPACA_POSITIONS)
+        return derive_directive(
+            authority,
+            policy=authority.session_exposure.validate_policy(
+                session_policy()),
+            state_block=block(state), venue="alpaca_paper",
+            account_fingerprint=ALPACA_FP, symbol="SPY",
+            raw_model_output=float(command), mapped_command=command,
+            positions=positions_ev.facts, orders=orders_ev.facts,
+            provenance=positions_ev.provenance())
+
+    @pytest.mark.parametrize("command", WIND_DOWN_COMMANDS)
+    def test_cancellation_precedes_every_model_effect(self, authority,
+                                                      command):
+        """FROZEN COUNTEREXAMPLE. HOLD, long, short and close each
+        emitted submit_decision BEFORE cancel_pending_entries."""
+        result = self._directive(authority, command)
+        effects = list(result.effects)
+        assert "cancel_pending_entries" in effects
+        for later in ("submit_decision", "request_close"):
+            if later in effects:
+                assert effects.index("cancel_pending_entries") < \
+                    effects.index(later), effects
+
+    @pytest.mark.parametrize("command", WIND_DOWN_COMMANDS)
+    def test_only_the_true_entry_is_cancelled(self, authority,
+                                              command):
+        result = self._directive(authority, command)
+        assert set(result.cancel_order_identities) == {
+            "parent-order-id"}
+        for protective in ("stop-leg-id", "limit-leg-id",
+                           "synthetic-order-0001"):
+            assert protective not in result.cancel_order_identities
+
+    @pytest.mark.parametrize("command", WIND_DOWN_COMMANDS)
+    def test_the_decision_is_blocked_until_cancellation_confirms(
+            self, authority, command):
+        result = self._directive(authority, command)
+        if "submit_decision" not in result.effects and \
+                "request_close" not in result.effects:
+            assert result.\
+                decision_blocked_until_cancellation_confirmed is False
+            return
+        assert result.decision_blocked_until_cancellation_confirmed \
+            is True
+        assert result.as_dict()[
+            "decision_blocked_until_cancellation_confirmed"] is True
+
+    @pytest.mark.parametrize("outcome", [
+        "rejected", "filled_before_cancel", "still_open",
+        "gone_without_verdict", "refused_role_None", None])
+    def test_a_failed_or_unknown_cancellation_blocks_the_decision(
+            self, authority, outcome):
+        """Ordering alone is a convention an executor could ignore.
+        The precondition is evaluated against what the broker
+        ACTUALLY did."""
+        result = self._directive(authority, 1)
+        outcomes = ({} if outcome is None
+                    else {"parent-order-id": outcome})
+        verdict = result.permits_dependent_effects(outcomes)
+        assert verdict["permitted"] is False
+        assert verdict["unresolved"] == ("parent-order-id",)
+        assert "unresolved" in verdict["reason"]
+
+    def test_only_a_terminal_cancelled_verdict_releases_the_block(
+            self, authority):
+        result = self._directive(authority, 1)
+        verdict = result.permits_dependent_effects(
+            {"parent-order-id": "cancelled"})
+        assert verdict["permitted"] is True
+        assert verdict["unresolved"] == ()
+
+    def test_a_partially_cancelled_inventory_still_blocks(self,
+                                                          authority):
+        payload = self._book()
+        payload["orders"].append({
+            "id": "second-entry", "symbol": "SPY", "side": "buy",
+            "qty": "5", "status": "new", "order_class": "bracket",
+            "type": "market", "position_intent": "buy_to_open",
+            "legs": [{"id": "second-stop", "side": "sell",
+                      "type": "stop", "qty": "5", "status": "held"}]})
+        orders_ev = evidence("alpaca_paper", "open_orders", payload)
+        positions_ev = evidence("alpaca_paper", "positions",
+                                ALPACA_POSITIONS)
+        result = derive_directive(
+            authority,
+            policy=authority.session_exposure.validate_policy(
+                session_policy()),
+            state_block=block("WIND_DOWN"), venue="alpaca_paper",
+            account_fingerprint=ALPACA_FP, symbol="SPY",
+            raw_model_output=1.0, mapped_command=1,
+            positions=positions_ev.facts, orders=orders_ev.facts,
+            provenance=positions_ev.provenance())
+        assert set(result.cancel_order_identities) == {
+            "parent-order-id", "second-entry"}
+        verdict = result.permits_dependent_effects(
+            {"parent-order-id": "cancelled"})
+        assert verdict["permitted"] is False
+        assert verdict["unresolved"] == ("second-entry",)
+
+    def test_a_directive_with_no_cancellation_has_no_precondition(
+            self, authority):
+        orders_ev = evidence("alpaca_paper", "open_orders",
+                             {"observed_at": OBSERVED, "orders": []})
+        positions_ev = evidence("alpaca_paper", "positions",
+                                ALPACA_POSITIONS)
+        result = derive_directive(
+            authority,
+            policy=authority.session_exposure.validate_policy(
+                session_policy()),
+            state_block=block("NORMAL_TRADING"),
+            venue="alpaca_paper", account_fingerprint=ALPACA_FP,
+            symbol="SPY", raw_model_output=1.0, mapped_command=1,
+            positions=positions_ev.facts, orders=orders_ev.facts,
+            provenance=positions_ev.provenance())
+        assert result.effects == ("submit_decision",)
+        assert result.\
+            decision_blocked_until_cancellation_confirmed is False
+        assert result.permits_dependent_effects({})["permitted"] \
+            is True
+
+    def test_outcomes_of_a_wrong_kind_refuse(self, authority):
+        result = self._directive(authority, 1)
+        for bogus in (None, [], "cancelled", 1):
+            with pytest.raises(AdapterRefusal,
+                               match="must be a mapping"):
+                result.permits_dependent_effects(bogus)
+
+    def test_the_contract_itself_refuses_a_bad_effect_order(self):
+        with pytest.raises(AdapterRefusal,
+                           match="precedes cancel_pending_entries"):
+            VenueDirective(
+                venue="alpaca_paper", account_fingerprint=ALPACA_FP,
+                symbol="SPY", session_state="WIND_DOWN",
+                raw_model_output=1.0, mapped_command=1,
+                mapped_action={"kind": "hold",
+                               "risk_increasing": False},
+                overlay="pass_through", final_command=1,
+                effects=("submit_decision", "cancel_pending_entries"),
+                cancel_order_identities=("parent-order-id",),
+                blocks_risk_increase=False,
+                requires_direct_confirmation=False,
+                preserve_protection=True, reason="test",
+                evidence_provenance={"venue_direct": True})
+
+    def test_a_cancellation_effect_must_name_its_identities(self):
+        with pytest.raises(AdapterRefusal,
+                           match="must name the identities"):
+            VenueDirective(
+                venue="alpaca_paper", account_fingerprint=ALPACA_FP,
+                symbol="SPY", session_state="WIND_DOWN",
+                raw_model_output=1.0, mapped_command=1,
+                mapped_action={"kind": "hold",
+                               "risk_increasing": False},
+                overlay="pass_through", final_command=1,
+                effects=("cancel_pending_entries", "submit_decision"),
+                cancel_order_identities=(),
+                blocks_risk_increase=False,
+                requires_direct_confirmation=False,
+                preserve_protection=True, reason="test",
+                evidence_provenance={"venue_direct": True})
+
+    def test_named_identities_require_an_authorised_effect(self):
+        with pytest.raises(AdapterRefusal,
+                           match="no cancellation effect is "
+                                 "authorised"):
+            VenueDirective(
+                venue="alpaca_paper", account_fingerprint=ALPACA_FP,
+                symbol="SPY", session_state="WIND_DOWN",
+                raw_model_output=1.0, mapped_command=1,
+                mapped_action={"kind": "hold",
+                               "risk_increasing": False},
+                overlay="pass_through", final_command=1,
+                effects=("submit_decision",),
+                cancel_order_identities=("parent-order-id",),
+                blocks_risk_increase=False,
+                requires_direct_confirmation=False,
+                preserve_protection=True, reason="test",
+                evidence_provenance={"venue_direct": True})

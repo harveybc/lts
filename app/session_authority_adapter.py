@@ -209,6 +209,70 @@ class VenueDirective:
                 "request_close" not in self.effects:
             raise AdapterRefusal(
                 "direct confirmation is only required by a close")
+        # C10-B: cancellation is a STATE prerequisite, so it precedes
+        # every model-derived effect in the tuple AND is enforced as
+        # a precondition below. Ordering alone would only be a
+        # convention an executor could ignore.
+        if "cancel_pending_entries" in self.effects:
+            if not self.cancel_order_identities:
+                raise AdapterRefusal(
+                    "a cancellation effect must name the identities "
+                    "it cancels")
+            index = self.effects.index("cancel_pending_entries")
+            for later in ("submit_decision", "request_close"):
+                if later in self.effects and \
+                        self.effects.index(later) < index:
+                    raise AdapterRefusal(
+                        f"{later!r} precedes cancel_pending_entries; "
+                        "the pending-entry inventory must be resolved "
+                        "first")
+        elif self.cancel_order_identities:
+            raise AdapterRefusal(
+                "identities are named for cancellation but no "
+                "cancellation effect is authorised")
+
+    @property
+    def decision_blocked_until_cancellation_confirmed(self) -> bool:
+        """True whenever a model-derived effect may only run after the
+        pending-entry inventory has been resolved."""
+        return ("cancel_pending_entries" in self.effects
+                and any(effect in self.effects
+                        for effect in ("submit_decision",
+                                       "request_close")))
+
+    def permits_dependent_effects(self, cancellation_outcomes
+                                  ) -> dict:
+        """Whether an executor may proceed to the model-derived
+        effects, given what the broker ACTUALLY did with each
+        cancellation.
+
+        Only a terminal ``cancelled`` verdict releases the block. A
+        rejection, a fill before the cancel landed, an order still
+        resting, an unverified disappearance and a ref with no outcome
+        at all each keep the decision blocked -- "we do not know" is
+        not "it was cancelled"."""
+        if not self.decision_blocked_until_cancellation_confirmed:
+            return {"permitted": True, "unresolved": (),
+                    "reason": "no cancellation precondition"}
+        if not isinstance(cancellation_outcomes, Mapping):
+            raise AdapterRefusal(
+                "cancellation outcomes must be a mapping of order "
+                "identity to the broker's terminal verdict")
+        unresolved = tuple(
+            identity for identity in self.cancel_order_identities
+            if cancellation_outcomes.get(identity) != "cancelled")
+        if unresolved:
+            return {
+                "permitted": False,
+                "unresolved": unresolved,
+                "reason": (
+                    "the pending-entry inventory is unresolved for "
+                    f"{list(unresolved)}; a model-derived effect may "
+                    "not run until every named entry is terminally "
+                    "cancelled"),
+            }
+        return {"permitted": True, "unresolved": (),
+                "reason": "every named pending entry was cancelled"}
 
     def as_dict(self) -> dict:
         return {
@@ -229,6 +293,8 @@ class VenueDirective:
             "blocks_risk_increase": self.blocks_risk_increase,
             "requires_direct_confirmation":
                 self.requires_direct_confirmation,
+            "decision_blocked_until_cancellation_confirmed":
+                self.decision_blocked_until_cancellation_confirmed,
             "preserve_protection": self.preserve_protection,
             "reason": self.reason,
             "evidence_provenance": dict(self.evidence_provenance),
@@ -388,7 +454,9 @@ def derive_directive(authority: AuthorityBinding, *, policy: dict,
         raw_model_output=raw_model_output,
         mapped_command=mapped_command, mapped_action=classification,
         overlay=overlay, final_command=mapped_command,
-        effects=(("submit_decision", "cancel_pending_entries")
+        # cancellation FIRST: it is a state prerequisite, not a
+        # companion to the model's decision
+        effects=(("cancel_pending_entries", "submit_decision")
                  if cancel else ("submit_decision",)),
         cancel_order_identities=cancel,
         blocks_risk_increase=False,

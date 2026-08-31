@@ -541,12 +541,28 @@ def _parse_alpaca_open_orders_v1(payload: Any) -> dict:
                         f"order[{index}].leg[{leg_index}]: type "
                         f"{leg_type!r} does not state a protective "
                         "role")
+                leg_side = require_enum(
+                    f"order[{index}].leg[{leg_index}].side",
+                    leg["side"], ("buy", "sell"))
+                # C10-A: a protective leg CLOSES what the parent
+                # opened, so it must oppose it. Validating the side
+                # only as buy|sell accepted a buy_to_open parent
+                # carrying BUY protection, which cannot close a long
+                # position: the venue's own facts contradict the
+                # claimed role, and the whole order population is
+                # refused rather than partially derived.
+                if leg_side == side:
+                    raise VenueEvidenceError(
+                        f"order[{index}].leg[{leg_index}]: a "
+                        f"protective leg on side {leg_side!r} cannot "
+                        f"close a parent opened on side {side!r} — "
+                        "the venue's facts contradict the claimed "
+                        "protective role")
                 parsed.append({
                     "order_identity": _remember(
                         require_text("leg.id", leg["id"])),
                     "symbol": symbol,
-                    "side": require_enum("leg.side", leg["side"],
-                                         ("buy", "sell")),
+                    "side": leg_side,
                     "quantity": bounded(
                         "leg.qty",
                         require_decimal_string("leg.qty", leg["qty"]),
@@ -844,7 +860,7 @@ SEALED_PARSER_IDENTITIES: Mapping[tuple, str] = MappingProxyType({
     ("alpaca_paper", "positions", "v1"):
         "f3c5b6659bf88c65554706cd6e6bee9a",
     ("alpaca_paper", "open_orders", "v1"):
-        "9dee32b0f6eb0b1b65982f9e452b8d72",
+        "3788ff42f8e06d4fb64ca9b1b7f7ebec",
     ("mt5_demo", "account_session", "v1"):
         "2fea3126c04002638e45d77cac493398",
     ("mt5_demo", "positions", "v1"):

@@ -772,3 +772,97 @@ class TestC9RoleFromDeclaredIntent:
         facts = evidence("alpaca_paper", "open_orders", payload).facts
         assert facts["entry_orders"] == 1
         assert facts["protective_orders"] == 3
+
+
+# =================================================================== #
+# WP3-C10-A: a protective leg must oppose the parent it protects      #
+# =================================================================== #
+
+class TestC10AProtectiveLegSideIsReconciled:
+
+    def test_a_same_side_protective_leg_refuses(self):
+        """FROZEN COUNTEREXAMPLE. A buy_to_open parent carrying BUY
+        protective legs was accepted: a buy cannot close a long
+        position, so the venue's own facts contradict the claimed
+        protective role."""
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        assert payload["orders"][0]["side"] == "buy"
+        for leg in payload["orders"][0]["legs"]:
+            leg["side"] = "buy"
+        with pytest.raises(VenueEvidenceError,
+                           match="cannot close a parent opened on "
+                                 "side"):
+            evidence("alpaca_paper", "open_orders", payload)
+
+    @pytest.mark.parametrize("leg_index", [0, 1])
+    def test_a_single_contradictory_leg_refuses_the_whole_order(
+            self, leg_index):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"][0]["legs"][leg_index]["side"] = "buy"
+        with pytest.raises(VenueEvidenceError) as caught:
+            evidence("alpaca_paper", "open_orders", payload)
+        assert f"leg[{leg_index}]" in str(caught.value)
+
+    def test_a_rejection_leaves_no_partially_derived_population(self):
+        """One valid leg and one contradictory leg must produce
+        NOTHING, not a population containing the valid half."""
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"][0]["legs"][0]["side"] = "buy"
+        with pytest.raises(VenueEvidenceError):
+            evidence("alpaca_paper", "open_orders", payload)
+        # and the honest payload still parses in full, so the refusal
+        # above is about the contradiction and not about the shape
+        facts = evidence("alpaca_paper", "open_orders",
+                         ALPACA_ORDERS).facts
+        assert facts["orders_total"] == 3
+
+    def test_a_long_parent_requires_sell_protection(self):
+        facts = evidence("alpaca_paper", "open_orders",
+                         ALPACA_ORDERS).facts
+        assert facts["orders"][0]["side"] == "buy"
+        assert all(o["side"] == "sell" for o in facts["orders"][1:])
+
+    def test_a_short_parent_requires_buy_protection(self):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"][0]["side"] = "sell"
+        payload["orders"][0]["position_intent"] = "sell_to_open"
+        for leg in payload["orders"][0]["legs"]:
+            leg["side"] = "buy"
+        facts = evidence("alpaca_paper", "open_orders", payload).facts
+        assert [o["role"] for o in facts["orders"]] == [
+            "entry", "protective_stop", "protective_take_profit"]
+        assert facts["orders"][0]["side"] == "sell"
+        assert all(o["side"] == "buy" for o in facts["orders"][1:])
+
+    def test_a_short_parent_with_sell_protection_refuses(self):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"][0]["side"] = "sell"
+        payload["orders"][0]["position_intent"] = "sell_to_open"
+        with pytest.raises(VenueEvidenceError,
+                           match="cannot close a parent opened on "
+                                 "side"):
+            evidence("alpaca_paper", "open_orders", payload)
+
+    @pytest.mark.parametrize("bad", [None, "", "long", "BUY", True, 1])
+    def test_an_unavailable_leg_side_refuses(self, bad):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"][0]["legs"][0]["side"] = bad
+        with pytest.raises(VenueEvidenceError, match="not one of"):
+            evidence("alpaca_paper", "open_orders", payload)
+
+    @pytest.mark.parametrize("leg_type,role", [
+        ("stop", "protective_stop"),
+        ("stop_limit", "protective_stop"),
+        ("limit", "protective_take_profit")])
+    def test_both_protective_types_are_reconciled(self, leg_type,
+                                                   role):
+        payload = json.loads(json.dumps(ALPACA_ORDERS))
+        payload["orders"][0]["legs"] = [
+            {"id": "single-leg", "side": "sell", "type": leg_type,
+             "qty": "10", "status": "held"}]
+        facts = evidence("alpaca_paper", "open_orders", payload).facts
+        assert facts["orders"][1]["role"] == role
+        payload["orders"][0]["legs"][0]["side"] = "buy"
+        with pytest.raises(VenueEvidenceError,
+                           match="cannot close a parent"):
+            evidence("alpaca_paper", "open_orders", payload)
