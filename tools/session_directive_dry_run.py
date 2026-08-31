@@ -87,6 +87,13 @@ class NoWriteVenueInterface:
     def order_send(self, *args, **kwargs):
         self._refuse("order_send")
 
+    # the EffectExecutor port protocol, refusing like everything else
+    def submit_decision(self, *args, **kwargs):
+        self._refuse("submit_decision")
+
+    def request_close(self, *args, **kwargs):
+        self._refuse("request_close")
+
 
 def load_capture(directory: Path, name: str) -> dict:
     path = directory / CAPTURE_FILES[name]
