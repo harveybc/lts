@@ -34,12 +34,14 @@ role cannot be established from the payload is AMBIGUOUS and refuses.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import inspect
 import json
 import math
 import os
 import re
+import stat as stat_module
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1141,10 +1143,107 @@ _RECORD_FIELDS = ("schema", "collector_source",
                   "monotonic_seq", "body_sha256", "route", "digest")
 _ACK_PENDING = b"PENDING"
 
+# E13: the durable uncertainty witness. Its content is written and
+# fsynced BEFORE the authorizing transition it guards, so on every
+# crash branch — including the one where a write whose fsync FAILED
+# reached storage anyway — the durable witness still names the
+# transition as in flight, and every fresh reader fails closed.
+_WITNESS_AUTHORIZING = b"authorizing"
+_WITNESS_RELEASING = b"releasing"
+_WITNESS_DONE = b"done"
+
 
 def _ledger_fsync_dir(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class SecureFileError(ReceiptLedgerError):
+    """A descriptor-bound object check failed: the path did not
+    resolve to the regular, owner-held, 0600 file the protocol
+    wrote. Substitution is refused, never followed."""
+
+
+def _secure_open(path: Path, flags: int, *, what: str) -> int:
+    """E13-3: open descriptor-first with O_NOFOLLOW and verify the
+    OBJECT from the fstat of the very descriptor that will be used —
+    regular file, this uid, exactly 0600. A path-time is_symlink()
+    followed by a second path resolution can be raced; a descriptor
+    cannot be substituted after the open."""
+    try:
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise SecureFileError(
+                f"{what}: symlink refused — descriptor-bound open "
+                "does not follow links") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat_module.S_ISREG(st.st_mode):
+            raise SecureFileError(
+                f"{what}: not a regular file — substituted object "
+                "refused")
+        if st.st_uid != os.getuid():
+            raise SecureFileError(
+                f"{what}: foreign owner uid {st.st_uid} refused")
+        mode = stat_module.S_IMODE(st.st_mode)
+        if mode != 0o600:
+            raise SecureFileError(
+                f"{what}: mode {oct(mode)} is not 0600 — refused")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def secure_read_bytes(path: Path, *, what: str) -> bytes:
+    fd = _secure_open(path, os.O_RDONLY, what=what)
+    try:
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def secure_rewrite_bytes(path: Path, data: bytes, *, what: str,
+                         fsync: bool = True) -> None:
+    """In-place monotone content update. The open carries NO O_TRUNC:
+    the object is verified from its descriptor FIRST and truncated
+    only after it proves to be the protocol's own file, so a
+    substituted object is never mutated."""
+    fd = _secure_open(path, os.O_WRONLY, what=what)
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, data)
+        if fsync:
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def secure_create_bytes(path: Path, data: bytes, *, what: str) -> None:
+    """Exclusive durable creation of a protocol file: O_EXCL and
+    O_NOFOLLOW, 0600 enforced on the descriptor, file fsync. The
+    caller owns the directory fsync."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                     os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except FileExistsError as exc:
+        raise SecureFileError(
+            f"{what}: already exists — exclusive creation "
+            "refused") from exc
+    try:
+        os.write(fd, data)
+        os.fchmod(fd, 0o600)
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -1201,15 +1300,29 @@ class ReceiptLedger:
         return directory
 
     # -- the monotone route lock ------------------------------------
+    # E13: release is guarded by a durable RELEASE WITNESS
+    # (register.lock.rw), written and fsynced to "releasing" BEFORE
+    # the lock may say "released" and to "done" only after "released"
+    # is durable. On the crash branch where a failed released-fsync
+    # reached storage anyway, the durable witness still says
+    # "releasing" and every claimant refuses. No exception path
+    # relies on an un-fsynced restorative write.
+
+    @staticmethod
+    def _witness_path(lock: Path) -> Path:
+        return lock.parent / "register.lock.rw"
+
     def _acquire_lock(self, directory: Path, route: str) -> Path:
         lock = directory / "register.lock"
-        if lock.is_symlink():
-            raise ReceiptLedgerError("symlinked register lock refused")
         try:
-            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         0o600)
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         except FileExistsError:
             return self._reclaim_lock(lock, route)
+        except OSError as exc:
+            raise ReceiptLedgerError(
+                f"route {route!r}: the registration lock could not "
+                f"be created ({exc}) — refused") from exc
         try:
             try:
                 os.write(fd, f"held:{os.getpid()}".encode())
@@ -1217,6 +1330,10 @@ class ReceiptLedger:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            secure_create_bytes(self._witness_path(lock),
+                                _WITNESS_DONE,
+                                what=f"route {route!r} release "
+                                     "witness")
             _ledger_fsync_dir(directory)
         except Exception as exc:
             raise ReceiptLedgerError(
@@ -1226,38 +1343,59 @@ class ReceiptLedger:
         return lock
 
     def _reclaim_lock(self, lock: Path, route: str) -> Path:
-        try:
-            content = lock.read_bytes().decode("utf-8",
-                                               errors="replace")
-        except Exception:
-            content = "<unreadable>"
+        def lock_reads() -> str:
+            try:
+                return secure_read_bytes(
+                    lock, what="register lock").decode(
+                        "utf-8", errors="replace")
+            except FileNotFoundError:
+                return "<absent>"
+            except SecureFileError as exc:
+                return f"<unverifiable: {exc}>"
+        content = lock_reads()
         if content != "released":
             raise ReceiptLedgerError(
                 f"route {route!r}: the registration lock reads "
-                f"{content[:24]!r}, not 'released' — a concurrent or "
+                f"{content[:80]!r}, not 'released' — a concurrent or "
                 "uncertain registration holds it")
+        witness = self._witness_path(lock)
+        try:
+            wit = secure_read_bytes(witness, what="release witness")
+        except FileNotFoundError as exc:
+            raise ReceiptLedgerError(
+                f"route {route!r}: the lock reads 'released' but no "
+                "release witness exists — an unwitnessed release "
+                "authorizes nothing") from exc
+        if wit != _WITNESS_DONE:
+            raise ReceiptLedgerError(
+                f"route {route!r}: the release witness reads "
+                f"{wit[:24]!r}, not 'done' — an uncertain release "
+                "holds the lock for operator disposition")
         reclaim = lock.with_suffix(".lock.reclaim")
-        if reclaim.is_symlink():
-            raise ReceiptLedgerError("symlinked reclaim lock refused")
         try:
             fd = os.open(reclaim, os.O_WRONLY | os.O_CREAT |
-                         os.O_EXCL, 0o600)
+                         os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600)
         except FileExistsError as exc:
+            # a persisting marker BLOCKS, never authorizes: deletion
+            # failure below leaves future claimants refusing here
+            # until an operator disposes
             raise ReceiptLedgerError(
                 f"route {route!r}: a competing reclaim is in "
                 "progress") from exc
         os.close(fd)
         try:
-            if lock.read_bytes() != b"released":
+            # revalidate the identity UNDER the election, from the
+            # descriptor-verified objects, before authority passes
+            if lock_reads() != "released" or secure_read_bytes(
+                    witness,
+                    what="release witness") != _WITNESS_DONE:
                 raise ReceiptLedgerError(
                     f"route {route!r}: the lock changed under the "
                     "reclaim — refused")
-            fd = os.open(lock, os.O_WRONLY | os.O_TRUNC)
-            try:
-                os.write(fd, f"held:{os.getpid()}".encode())
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            secure_rewrite_bytes(lock,
+                                 f"held:{os.getpid()}".encode(),
+                                 what="register lock")
         finally:
             try:
                 os.unlink(reclaim)
@@ -1266,21 +1404,26 @@ class ReceiptLedger:
         return lock
 
     def _release_lock(self, lock: Path, route: str) -> None:
+        witness = self._witness_path(lock)
         try:
-            for state in (b"releasing", b"released"):
-                fd = os.open(lock, os.O_WRONLY | os.O_TRUNC)
-                try:
-                    os.write(fd, state)
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
+            secure_rewrite_bytes(witness, _WITNESS_RELEASING,
+                                 what="release witness")
+            secure_rewrite_bytes(lock, b"releasing",
+                                 what="register lock")
+            secure_rewrite_bytes(lock, b"released",
+                                 what="register lock")
+            secure_rewrite_bytes(witness, _WITNESS_DONE,
+                                 what="release witness")
         except Exception as exc:
+            # DURABLE restoration: held is written AND fsynced. If
+            # even that fails, the release witness already says
+            # "releasing" durably — it was fsynced before the lock
+            # could say "released" — so every claimant on every
+            # crash branch still refuses.
             try:
-                fd = os.open(lock, os.O_WRONLY | os.O_TRUNC)
-                try:
-                    os.write(fd, f"held:{os.getpid()}".encode())
-                finally:
-                    os.close(fd)
+                secure_rewrite_bytes(lock,
+                                     f"held:{os.getpid()}".encode(),
+                                     what="register lock")
             except Exception:
                 pass
             raise ReceiptLedgerError(
@@ -1290,15 +1433,13 @@ class ReceiptLedger:
 
     # -- verified reads ---------------------------------------------
     def _verify_record(self, path: Path, route: str) -> dict:
-        if path.is_symlink():
-            raise ReceiptLedgerError(
-                f"{path.name}: symlinked record refused")
-        mode = os.stat(path).st_mode & 0o777
-        if mode != 0o600:
-            raise ReceiptLedgerError(
-                f"{path.name}: mode {oct(mode)} is not 0600")
+        # E13-3: descriptor-bound read — symlink refusal, regular
+        # file, owner and 0600 all verified from the fstat of the fd
+        # actually read, so no substitution between a path check and
+        # a second path resolution can be raced.
+        raw = secure_read_bytes(path, what=f"record {path.name}")
         try:
-            record = json.loads(path.read_text())
+            record = json.loads(raw.decode("utf-8"))
         except Exception as exc:
             raise ReceiptUncertainError(
                 f"{path.name}: unreadable record — "
@@ -1328,14 +1469,14 @@ class ReceiptLedger:
                 f"{path.name}: malformed or mismatched sequence "
                 f"{seq!r}")
         ack_path = path.with_suffix(".json.ack")
-        if ack_path.is_symlink():
-            raise ReceiptLedgerError(
-                f"{ack_path.name}: symlinked acknowledgement refused")
-        if not ack_path.is_file():
+        try:
+            ack = secure_read_bytes(
+                ack_path,
+                what=f"acknowledgement {ack_path.name}").strip()
+        except FileNotFoundError as exc:
             raise ReceiptUncertainError(
                 f"{path.name}: no acknowledgement — "
-                "REGISTRATION_UNCERTAIN, authorizes nothing")
-        ack = ack_path.read_bytes().strip()
+                "REGISTRATION_UNCERTAIN, authorizes nothing") from exc
         if ack == _ACK_PENDING:
             raise ReceiptUncertainError(
                 f"{path.name}: acknowledgement is PENDING — "
@@ -1344,6 +1485,25 @@ class ReceiptLedger:
             raise ReceiptUncertainError(
                 f"{path.name}: acknowledgement does not name this "
                 "record's digest — REGISTRATION_UNCERTAIN")
+        # E13: the acknowledgement witness must say the authorizing
+        # transition COMPLETED. On the crash branch where the digest
+        # write reached storage although its fsync failed, the
+        # durable witness still says "authorizing" and this record
+        # authorizes nothing.
+        witness_path = path.with_suffix(".json.aw")
+        try:
+            wit = secure_read_bytes(
+                witness_path,
+                what=f"ack witness {witness_path.name}").strip()
+        except FileNotFoundError as exc:
+            raise ReceiptUncertainError(
+                f"{path.name}: no acknowledgement witness — "
+                "REGISTRATION_UNCERTAIN, authorizes nothing") from exc
+        if wit != _WITNESS_DONE:
+            raise ReceiptUncertainError(
+                f"{path.name}: the acknowledgement witness reads "
+                f"{wit[:24]!r}, not 'done' — the authorizing "
+                "transition never completed, REGISTRATION_UNCERTAIN")
         return record
 
     def _read_route(self, directory: Path, route: str) -> dict:
@@ -1351,12 +1511,14 @@ class ReceiptLedger:
         for path in sorted(directory.glob("[0-9]*.json")):
             record = self._verify_record(path, route)
             records[record["monotonic_seq"]] = record
-        for ack in directory.glob("[0-9]*.json.ack"):
-            record_path = ack.with_suffix("")
+        for stray in list(directory.glob("[0-9]*.json.ack")) + \
+                list(directory.glob("[0-9]*.json.aw")):
+            record_path = stray.parent / (stray.name.rsplit(
+                ".", 1)[0].removesuffix(".json") + ".json")
             if not record_path.exists():
                 raise ReceiptUncertainError(
-                    f"{ack.name}: an acknowledgement without its "
-                    "record — REGISTRATION_UNCERTAIN")
+                    f"{stray.name}: an acknowledgement artefact "
+                    "without its record — REGISTRATION_UNCERTAIN")
         return records
 
     # -- registration ----------------------------------------------
@@ -1396,15 +1558,19 @@ class ReceiptLedger:
 
             path = directory / f"{seq:08d}.json"
             ack_path = path.with_suffix(".json.ack")
-            # durable INTENT before anything becomes visible
-            fd = os.open(ack_path, os.O_WRONLY | os.O_CREAT |
-                         os.O_EXCL, 0o600)
-            try:
-                os.write(fd, _ACK_PENDING)
-                os.fchmod(fd, 0o600)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            witness_path = path.with_suffix(".json.aw")
+            # durable INTENT before anything becomes visible: the
+            # PENDING acknowledgement AND the "authorizing" witness
+            # are both durable before the record can exist, so every
+            # later crash branch — the failed dir fsync, the digest
+            # write that reached storage despite its failed fsync —
+            # resolves as uncertain in a fresh process.
+            secure_create_bytes(ack_path, _ACK_PENDING,
+                                what=f"acknowledgement "
+                                     f"{ack_path.name}")
+            secure_create_bytes(witness_path, _WITNESS_AUTHORIZING,
+                                what=f"ack witness "
+                                     f"{witness_path.name}")
             _ledger_fsync_dir(directory)
             # the record, via the audited uncertain-write shape
             tmp = path.with_suffix(f".json.tmp.{os.getpid()}")
@@ -1426,28 +1592,42 @@ class ReceiptLedger:
             os.replace(tmp, path)
             _ledger_fsync_dir(directory)
             # MONOTONE acknowledgement, in place: only now does the
-            # record authorize anything. A failure RESTORES PENDING,
-            # so an unverified acknowledgement can never read as
-            # acknowledged in the live namespace either.
+            # record authorize anything. E13: the restoration is
+            # DURABLE — PENDING is written and fsynced. Even if that
+            # second durable write also fails, the "authorizing"
+            # witness fsynced before the digest write keeps every
+            # crash branch fail-closed, including the branch where
+            # the digest write reached storage.
             try:
-                fd = os.open(ack_path, os.O_WRONLY | os.O_TRUNC)
-                try:
-                    os.write(fd, payload["digest"].encode())
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
+                secure_rewrite_bytes(ack_path,
+                                     payload["digest"].encode(),
+                                     what="acknowledgement")
             except Exception as exc:
                 try:
-                    fd = os.open(ack_path, os.O_WRONLY | os.O_TRUNC)
-                    try:
-                        os.write(fd, _ACK_PENDING)
-                    finally:
-                        os.close(fd)
+                    secure_rewrite_bytes(ack_path, _ACK_PENDING,
+                                         what="acknowledgement")
                 except Exception:
-                    pass        # whatever remains is not the digest
+                    pass    # the durable witness still refuses
                 raise ReceiptUncertainError(
                     f"route {route!r}: the acknowledgement could not "
                     f"be made durable ({exc}) — "
+                    "REGISTRATION_UNCERTAIN") from exc
+            # the completion witness closes the authorizing
+            # transition; until it durably reads "done", every fresh
+            # reader classifies the record as uncertain
+            try:
+                secure_rewrite_bytes(witness_path, _WITNESS_DONE,
+                                     what="ack witness")
+            except Exception as exc:
+                try:
+                    secure_rewrite_bytes(witness_path,
+                                         _WITNESS_AUTHORIZING,
+                                         what="ack witness")
+                except Exception:
+                    pass    # durable content is still 'authorizing'
+                raise ReceiptUncertainError(
+                    f"route {route!r}: the acknowledgement witness "
+                    f"could not be made durable ({exc}) — "
                     "REGISTRATION_UNCERTAIN") from exc
             return payload
         finally:

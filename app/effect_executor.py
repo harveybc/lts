@@ -56,8 +56,9 @@ from app.live_flatten_custody import (
 from app.session_authority_adapter import (
     AuthorityUnavailable, VenueDirective, load_authority)
 from app.venue_direct_evidence import (
-    VenueDirectEvidence, VenueEvidenceError, VenueEvidencePolicy,
-    require_utc)
+    SecureFileError, VenueDirectEvidence, VenueEvidenceError,
+    VenueEvidencePolicy, require_utc, secure_create_bytes,
+    secure_read_bytes, secure_rewrite_bytes)
 
 FILE_MODE = 0o600
 DIR_MODE = 0o700
@@ -165,9 +166,15 @@ class EffectJournal:
         that cannot be trusted end to end proves nothing."""
         entries = []
         for path in sorted(self.root.glob("[0-9]*.json")):
-            _refuse_symlink(path, "journal record")
+            # E13-3: descriptor-bound verified read — no path-time
+            # check followed by a second raceable path resolution
             try:
-                record = json.loads(path.read_text())
+                record = json.loads(secure_read_bytes(
+                    path, what="journal record").decode("utf-8"))
+            except SecureFileError as exc:
+                raise ExecutorError(
+                    f"{path.name}: journal record refused: {exc}"
+                ) from exc
             except Exception as exc:
                 raise ExecutorError(
                     f"{path.name}: unreadable journal record: {exc}"
@@ -288,25 +295,28 @@ class EffectExecutor:
     def _lock_path(self) -> Path:
         return self.journal.root / "run.lock"
 
+    def _lock_witness_path(self) -> Path:
+        return self.journal.root / "run.lock.rw"
+
     @staticmethod
     def _write_lock_state(lock: Path, state: str, *,
                           fsync: bool = True) -> None:
-        fd = os.open(lock, os.O_WRONLY | os.O_TRUNC)
-        try:
-            os.write(fd, state.encode())
-            if fsync:
-                os.fsync(fd)
-        finally:
-            os.close(fd)
+        # E13-3: descriptor-verified in-place write — no O_TRUNC at
+        # open, no path re-resolution after the object is verified
+        secure_rewrite_bytes(Path(lock), state.encode(),
+                             what="run lock", fsync=fsync)
 
     def _acquire_run_lock(self):
         lock = self._lock_path()
-        _refuse_symlink(lock, "run lock")
         try:
-            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         FILE_MODE)
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         os.O_NOFOLLOW | os.O_CLOEXEC, FILE_MODE)
         except FileExistsError:
             return self._reclaim_run_lock(lock)
+        except OSError as exc:
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: the run lock could not be "
+                f"created ({exc}) — an operator disposes") from exc
         try:
             try:
                 os.write(fd, f"held:{os.getpid()}".encode())
@@ -314,6 +324,8 @@ class EffectExecutor:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            secure_create_bytes(self._lock_witness_path(), b"done",
+                                what="run lock release witness")
             _fsync_dir(lock.parent)
         except Exception as exc:
             raise PlanLockHeld(
@@ -323,47 +335,71 @@ class EffectExecutor:
                 "operator disposes") from exc
         return lock
 
-    def _reclaim_run_lock(self, lock: Path):
-        """Enter ONLY over the exact durable content \"released\".
-        The reclaim transition is elected by its own O_EXCL lock so
-        two claimants reading \"released\" cannot both rewrite it."""
+    def _read_lock_content(self, lock: Path) -> str:
         try:
-            content = lock.read_bytes().decode("utf-8",
-                                               errors="replace")
-        except Exception:
-            content = "<unreadable>"
+            return secure_read_bytes(lock, what="run lock").decode(
+                "utf-8", errors="replace")
+        except FileNotFoundError:
+            return "<absent>"
+        except SecureFileError as exc:
+            return f"<unverifiable: {exc}>"
+
+    def _reclaim_run_lock(self, lock: Path):
+        """Enter ONLY over the exact durable content \"released\"
+        CONFIRMED by a release witness reading \"done\". The reclaim
+        transition is elected by its own O_EXCL lock so two claimants
+        reading \"released\" cannot both rewrite it."""
+        content = self._read_lock_content(lock)
         if content != "released":
             raise PlanLockHeld(
                 f"plan {self.plan_id}: the run lock reads "
-                f"{content[:24]!r}, not 'released' — another claimant "
+                f"{content[:80]!r}, not 'released' — another claimant "
                 "holds it or its release is uncertain; an operator "
                 "disposes, never an automatic takeover")
+        witness = self._lock_witness_path()
+        try:
+            wit = secure_read_bytes(witness,
+                                    what="run lock release witness")
+        except FileNotFoundError as exc:
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: the lock reads 'released' but "
+                "no release witness exists — an unwitnessed release "
+                "authorizes nothing; an operator disposes") from exc
+        if wit != b"done":
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: the release witness reads "
+                f"{wit[:24]!r}, not 'done' — the release never "
+                "completed durably; an operator disposes, never an "
+                "automatic takeover")
         reclaim = lock.with_suffix(".lock.reclaim")
-        _refuse_symlink(reclaim, "reclaim lock")
         try:
             fd = os.open(reclaim, os.O_WRONLY | os.O_CREAT |
-                         os.O_EXCL, FILE_MODE)
+                         os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         FILE_MODE)
         except FileExistsError as exc:
+            # a persisting marker BLOCKS, never authorizes
             raise PlanLockHeld(
                 f"plan {self.plan_id}: a competing reclaim is in "
                 "progress") from exc
         os.close(fd)
         try:
-            if lock.read_bytes() != b"released":
+            # revalidate under the election, descriptor-first,
+            # before authority passes
+            if self._read_lock_content(lock) != "released" or \
+                    secure_read_bytes(
+                        witness,
+                        what="run lock release witness") != b"done":
                 raise PlanLockHeld(
                     f"plan {self.plan_id}: the lock changed under "
                     "the reclaim — refused")
             try:
                 self._write_lock_state(lock, f"held:{os.getpid()}")
             except Exception as exc:
-                try:
-                    self._write_lock_state(lock, "released",
-                                           fsync=False)
-                except Exception:
-                    pass        # non-released content refuses anyway
                 raise PlanLockHeld(
                     f"plan {self.plan_id}: the reclaim could not be "
-                    f"made durable ({exc}) — refused") from exc
+                    f"made durable ({exc}) — refused; whatever "
+                    "content remains is not 'released' or is "
+                    "unverifiable, and refuses") from exc
         finally:
             try:
                 os.unlink(reclaim)
@@ -372,19 +408,28 @@ class EffectExecutor:
         return lock
 
     def _release_run_lock(self, lock) -> None:
-        """Monotone release: releasing -> released, in place. Any
-        failure restores non-released content, so at every boundary
-        either the old lock remains authoritative or a durable
-        released state exists — the file is never absent."""
+        """Monotone WITNESSED release. The witness durably says
+        "releasing" BEFORE the lock may say "released" and "done"
+        only after "released" is durable, so on the crash branch
+        where a failed released-fsync reached storage anyway the
+        witness still refuses every claimant. E13: the failure path
+        restores "held" DURABLY — and if even that write cannot be
+        fsynced, the durable witness already refuses; no exception
+        path relies on an un-fsynced restorative write."""
+        lock = Path(lock)
+        witness = self._lock_witness_path()
         try:
+            secure_rewrite_bytes(witness, b"releasing",
+                                 what="run lock release witness")
             self._write_lock_state(lock, "releasing")
             self._write_lock_state(lock, "released")
+            secure_rewrite_bytes(witness, b"done",
+                                 what="run lock release witness")
         except Exception as exc:
             try:
-                self._write_lock_state(lock, f"held:{os.getpid()}",
-                                       fsync=False)
+                self._write_lock_state(lock, f"held:{os.getpid()}")
             except Exception:
-                pass            # whatever remains is not "released"
+                pass    # the durable witness still refuses
             raise ExecutorError(
                 f"plan {self.plan_id}: the lock release could not be "
                 f"made durable ({exc}) — the lock stays authoritative,"
@@ -410,11 +455,16 @@ class EffectExecutor:
 
     def _read_plan(self) -> dict:
         plan_path = self.journal.root / "plan.json"
-        _refuse_symlink(plan_path, "plan record")
-        if not plan_path.is_file():
+        try:
+            raw = secure_read_bytes(plan_path, what="plan record")
+        except FileNotFoundError as exc:
             raise ExecutorError(
-                f"plan {self.plan_id} was never persisted")
-        plan = json.loads(plan_path.read_text())
+                f"plan {self.plan_id} was never persisted") from exc
+        except SecureFileError as exc:
+            raise ExecutorError(
+                f"plan {self.plan_id}: plan record refused: "
+                f"{exc}") from exc
+        plan = json.loads(raw.decode("utf-8"))
         if plan.get("schema") != PLAN_SCHEMA:
             raise ExecutorError(
                 f"plan {self.plan_id}: schema "

@@ -2022,6 +2022,15 @@ class TestE11ReceiptLedgerAuthority:
 # E12: ledger durability and record integrity                        #
 # ================================================================== #
 
+def _expected_digest(receipt, route):
+    from app.venue_direct_evidence import (RECEIPT_RECORD_SCHEMA,
+                                           canonical_bytes,
+                                           sha256_hex)
+    payload = {"schema": RECEIPT_RECORD_SCHEMA, **receipt.as_dict(),
+               "route": route}
+    return sha256_hex(canonical_bytes(payload))
+
+
 class TestE12LedgerDurability:
 
     def _ledger(self, tmp_path, name="ledger"):
@@ -2119,21 +2128,23 @@ class TestE12LedgerDurability:
 
     def test_an_acknowledgement_failure_stays_pending(self, tmp_path,
                                                       monkeypatch):
+        """The fsync of the AUTHORIZING digest write fails — targeted
+        by content, not by ordinal, so the witness files added by E13
+        cannot silently retarget it."""
         import app.venue_direct_evidence as mod
         from app.venue_direct_evidence import (ReceiptLedger,
                                                ReceiptUncertainError)
         ledger = self._ledger(tmp_path)
         real_fsync = mod.os.fsync
-        state = {"records_seen": 0}
+        digest = _expected_digest(self._receipt(), "v|a|s")
 
         def failing(fd):
             import stat as stat_mod
-            if not stat_mod.S_ISDIR(mod.os.fstat(fd).st_mode):
-                state["records_seen"] += 1
-                # file fsyncs: 1 lock, 2 intent ack, 3 record tmp,
-                # 4 final ack
-                if state["records_seen"] == 4:
-                    raise OSError("ack fsync failed")
+            st = mod.os.fstat(fd)
+            if not stat_mod.S_ISDIR(st.st_mode):
+                with open(f"/proc/self/fd/{fd}", "rb") as handle:
+                    if handle.read() == digest.encode():
+                        raise OSError("ack fsync failed")
             return real_fsync(fd)
 
         monkeypatch.setattr(mod.os, "fsync", failing)
@@ -2325,3 +2336,444 @@ class TestE12LedgerDurability:
         registered = [r for r in results if r["result"] ==
                       "registered"]
         assert len(registered) == 1, results
+
+
+# ================================================================== #
+# E13: durable restoration and descriptor-bound objects              #
+# ================================================================== #
+
+import os
+
+
+def _forge(path, data):
+    """Model a crash branch: the given bytes ARE the post-crash
+    content of the file (a write whose fsync failed may still have
+    reached storage). Mode is kept at the protocol's 0600 so only
+    the modelled durability differs."""
+    path.write_bytes(data)
+    os.chmod(path, 0o600)
+
+
+class TestE13DurableRestoration:
+    """E13-1/E13-2 FROZEN: when the fsync of an authorizing write
+    failed, the restorative write was NOT fsynced. On the crash
+    branch where the failed write reached storage anyway, a fresh
+    process treated a REJECTED registration as authoritative and a
+    claimant entered over a REJECTED release. The durable witness —
+    written and fsynced BEFORE the authorizing transition — now
+    refuses every branch."""
+
+    def _ledger(self, tmp_path, name="ledger"):
+        from app.venue_direct_evidence import ReceiptLedger
+        return ReceiptLedger(tmp_path / name)
+
+    def _receipt(self, seq=1, body=b"body-1", **kw):
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        return receipt_for(body, seq=seq, **kw)
+
+    def _route_dir(self, ledger):
+        return next(d for d in ledger.root.iterdir() if d.is_dir())
+
+    @pytest.mark.parametrize("restore_also_fails", [False, True])
+    def test_ack_reached_storage_branch_is_uncertain(
+            self, tmp_path, monkeypatch, restore_also_fails):
+        """The digest write's fsync fails; the crash branch where
+        that write reached storage is materialised. The durable
+        'authorizing' witness refuses it in a fresh process — with
+        and without the restorative PENDING fsync failing too."""
+        import app.venue_direct_evidence as mod
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptUncertainError)
+        ledger = self._ledger(tmp_path)
+        digest = _expected_digest(self._receipt(), "v|a|s")
+        real_fsync = mod.os.fsync
+        armed = {"failed_digest": False}
+
+        def failing(fd):
+            import stat as stat_mod
+            if not stat_mod.S_ISDIR(mod.os.fstat(fd).st_mode):
+                with open(f"/proc/self/fd/{fd}", "rb") as handle:
+                    content = handle.read()
+                if content == digest.encode():
+                    armed["failed_digest"] = True
+                    raise OSError("ack digest fsync failed")
+                if restore_also_fails and armed["failed_digest"] \
+                        and content == b"PENDING":
+                    raise OSError("restorative fsync failed too")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(mod.os, "fsync", failing)
+        with pytest.raises(ReceiptUncertainError):
+            ledger.register(self._receipt(), route="v|a|s")
+        monkeypatch.undo()
+        route_dir = self._route_dir(ledger)
+        witness = route_dir / "00000001.json.aw"
+        assert witness.read_bytes() == b"authorizing"
+        # the crash branch: the failed digest write reached storage
+        _forge(route_dir / "00000001.json.ack", digest.encode())
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptUncertainError, match="witness"):
+            fresh.register(self._receipt(), route="v|a|s")
+        with pytest.raises(ReceiptUncertainError, match="witness"):
+            fresh.register(self._receipt(seq=9, body=b"b9"),
+                           route="v|a|s")
+
+    def test_completion_witness_fsync_failure_is_uncertain(
+            self, tmp_path, monkeypatch):
+        import app.venue_direct_evidence as mod
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptUncertainError)
+        ledger = self._ledger(tmp_path)
+        real_fsync = mod.os.fsync
+
+        def failing(fd):
+            import stat as stat_mod
+            if not stat_mod.S_ISDIR(mod.os.fstat(fd).st_mode):
+                name = os.readlink(f"/proc/self/fd/{fd}")
+                if name.endswith(".json.aw"):
+                    with open(f"/proc/self/fd/{fd}", "rb") as handle:
+                        if handle.read() == b"done":
+                            raise OSError("witness fsync failed")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(mod.os, "fsync", failing)
+        with pytest.raises(ReceiptUncertainError, match="witness"):
+            ledger.register(self._receipt(), route="v|a|s")
+        monkeypatch.undo()
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptUncertainError, match="witness"):
+            fresh.register(self._receipt(seq=9, body=b"b9"),
+                           route="v|a|s")
+
+    @pytest.mark.parametrize("restore_also_fails", [False, True])
+    def test_route_lock_release_reached_storage_branch_refuses(
+            self, tmp_path, monkeypatch, restore_also_fails):
+        """The released write's fsync fails; the crash branch where
+        'released' reached storage is materialised. The durable
+        'releasing' witness refuses every claimant."""
+        import app.venue_direct_evidence as mod
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        ledger = self._ledger(tmp_path)
+        real_fsync = mod.os.fsync
+        armed = {"failed_release": False}
+
+        def failing(fd):
+            import stat as stat_mod
+            if not stat_mod.S_ISDIR(mod.os.fstat(fd).st_mode):
+                with open(f"/proc/self/fd/{fd}", "rb") as handle:
+                    content = handle.read()
+                if content == b"released":
+                    armed["failed_release"] = True
+                    raise OSError("released fsync failed")
+                if restore_also_fails and armed["failed_release"] \
+                        and content.startswith(b"held:"):
+                    raise OSError("restorative fsync failed too")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(mod.os, "fsync", failing)
+        with pytest.raises(ReceiptLedgerError,
+                           match="release could not be made durable"):
+            ledger.register(self._receipt(), route="v|a|s")
+        monkeypatch.undo()
+        route_dir = self._route_dir(ledger)
+        assert (route_dir /
+                "register.lock.rw").read_bytes() == b"releasing"
+        # the crash branch: 'released' reached storage, the
+        # restorative 'held' did not
+        _forge(route_dir / "register.lock", b"released")
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptLedgerError,
+                           match="release witness"):
+            fresh.register(self._receipt(seq=9, body=b"b9"),
+                           route="v|a|s")
+
+    def test_run_lock_release_reached_storage_branch_refuses(
+            self, authority, tmp_path, monkeypatch):
+        """E13-2 FROZEN for the executor lock: previously the second
+        claimant ENTERED over this exact crash branch."""
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        real = EffectExecutor._write_lock_state
+
+        def failing(lock, state, *, fsync=True):
+            if state == "released":
+                raise OSError("released fsync failed")
+            return real(lock, state, fsync=fsync)
+
+        monkeypatch.setattr(EffectExecutor, "_write_lock_state",
+                            staticmethod(failing))
+        with pytest.raises(ExecutorError,
+                           match="release could not be made durable"):
+            executor.execute()
+        monkeypatch.undo()
+        lock = executor.journal.root / "run.lock"
+        witness = executor.journal.root / "run.lock.rw"
+        assert witness.read_bytes() == b"releasing"
+        # the crash branch: 'released' reached storage, the durable
+        # 'held' restoration did not
+        _forge(lock, b"released")
+        second = make_executor(authority, tmp_path, directive,
+                               FakePort())
+        with pytest.raises(PlanLockHeld, match="release witness"):
+            second.resume()
+
+    def test_run_lock_witness_gates_reclaim(self, authority,
+                                            tmp_path):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.execute()
+        lock = executor.journal.root / "run.lock"
+        witness = executor.journal.root / "run.lock.rw"
+        assert lock.read_bytes() == b"released"
+        assert witness.read_bytes() == b"done"
+        # an uncertain release refuses even over a 'released' lock
+        _forge(witness, b"releasing")
+        second = make_executor(authority, tmp_path, directive,
+                               FakePort())
+        with pytest.raises(PlanLockHeld, match="release witness"):
+            second._acquire_run_lock()
+        # a witnessed release admits the claimant again
+        _forge(witness, b"done")
+        lock_handle = second._acquire_run_lock()
+        second._release_run_lock(lock_handle)
+
+    def test_release_restoration_is_fsynced(self):
+        """The restorative writes carry a durable fsync: no
+        exception path may rely on an un-fsynced restorative
+        write."""
+        import inspect
+        from app.effect_executor import EffectExecutor as Exe
+        import app.venue_direct_evidence as mod
+        for source in (inspect.getsource(Exe._release_run_lock),
+                       inspect.getsource(
+                           mod.ReceiptLedger._release_lock),
+                       inspect.getsource(mod.ReceiptLedger.register)):
+            assert "fsync=False" not in source, (
+                "a restorative write relies on an un-fsynced write")
+
+
+class TestE13DescriptorBoundObjects:
+    """E13-3 FROZEN: is_symlink() was a path-time check followed by a
+    second path resolution — a substitution between them followed the
+    link, and acknowledgement and lock files were verified by content
+    only. Every security-sensitive file is now opened descriptor-
+    first with O_NOFOLLOW, and regular-file type, owner and 0600 are
+    verified from the fstat of the descriptor actually used."""
+
+    def _ledger(self, tmp_path, name="ledger"):
+        from app.venue_direct_evidence import ReceiptLedger
+        return ReceiptLedger(tmp_path / name)
+
+    def _receipt(self, seq=1, body=b"body-1", **kw):
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        return receipt_for(body, seq=seq, **kw)
+
+    def _route_dir(self, ledger):
+        return next(d for d in ledger.root.iterdir() if d.is_dir())
+
+    def _registered(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(), route="v|a|s")
+        return ledger, self._route_dir(ledger)
+
+    @pytest.mark.parametrize("target", [
+        "00000001.json", "00000001.json.ack", "00000001.json.aw",
+        "register.lock"])
+    def test_symlink_substitution_race_refuses(self, tmp_path,
+                                               monkeypatch, target):
+        """The race is modelled by disabling every path-time
+        is_symlink() check outright: the descriptor-bound open must
+        refuse the substituted object ON ITS OWN."""
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        ledger, route_dir = self._registered(tmp_path)
+        victim = route_dir / target
+        stash = tmp_path / f"stash_{target}"
+        stash.write_bytes(victim.read_bytes())
+        os.chmod(stash, 0o600)
+        victim.unlink()
+        victim.symlink_to(stash)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptLedgerError, match="symlink"):
+            fresh.register(self._receipt(seq=9, body=b"b9"),
+                           route="v|a|s")
+
+    def test_non_regular_ack_refuses(self, tmp_path):
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        ledger, route_dir = self._registered(tmp_path)
+        ack = route_dir / "00000001.json.ack"
+        ack.unlink()
+        ack.mkdir(mode=0o700)
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptLedgerError,
+                           match="not a regular file|Is a directory"):
+            fresh.register(self._receipt(seq=9, body=b"b9"),
+                           route="v|a|s")
+
+    @pytest.mark.parametrize("target", [
+        "00000001.json.ack", "00000001.json.aw", "register.lock"])
+    def test_wrong_mode_refuses(self, tmp_path, target):
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        ledger, route_dir = self._registered(tmp_path)
+        os.chmod(route_dir / target, 0o644)
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptLedgerError,
+                           match="not 0600|not 'released'"):
+            fresh.register(self._receipt(seq=9, body=b"b9"),
+                           route="v|a|s")
+
+    def test_foreign_owner_refuses(self, tmp_path, monkeypatch):
+        import app.venue_direct_evidence as mod
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        ledger, _route_dir = self._registered(tmp_path)
+        real_uid = os.getuid()
+        monkeypatch.setattr(mod.os, "getuid", lambda: real_uid + 1)
+        fresh = ReceiptLedger(ledger.root)
+        with pytest.raises(ReceiptLedgerError,
+                           match="foreign owner|not 'released'"):
+            fresh.register(self._receipt(seq=9, body=b"b9"),
+                           route="v|a|s")
+
+    def test_run_lock_symlink_refuses(self, authority, tmp_path,
+                                      monkeypatch):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.journal.root.mkdir(parents=True, exist_ok=True)
+        lock = executor.journal.root / "run.lock"
+        stash = tmp_path / "attacker_lock"
+        stash.write_bytes(b"released")
+        os.chmod(stash, 0o600)
+        lock.symlink_to(stash)
+        witness = executor.journal.root / "run.lock.rw"
+        witness.write_bytes(b"done")
+        os.chmod(witness, 0o600)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+        with pytest.raises(PlanLockHeld, match="not 'released'"):
+            executor._acquire_run_lock()
+
+    def test_unwitnessed_released_run_lock_refuses(self, authority,
+                                                   tmp_path):
+        """A lock that reads 'released' without any release witness
+        is an unwitnessed release and authorizes nothing."""
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.journal.root.mkdir(parents=True, exist_ok=True)
+        lock = executor.journal.root / "run.lock"
+        lock.write_bytes(b"released")
+        os.chmod(lock, 0o600)
+        with pytest.raises(PlanLockHeld, match="no release witness"):
+            executor._acquire_run_lock()
+
+    def test_two_processes_refuse_an_uncertain_route(self, tmp_path):
+        """Two REAL processes contend AFTER an uncertain boundary:
+        the acknowledgement witness durably reads 'authorizing'.
+        Both must refuse; neither may 'resolve' the uncertainty."""
+        import subprocess
+        import sys as _sys
+        import time as _time
+        ledger = self._ledger(tmp_path, name="proc_ledger")
+        ledger.register(self._receipt(), route="v|a|s")
+        route_dir = self._route_dir(ledger)
+        _forge(route_dir / "00000001.json.aw", b"authorizing")
+        repo = str(Path(__file__).resolve().parents[2])
+        barrier = tmp_path / "GO"
+        script = (
+            "import json, sys, time\n"
+            f"sys.path.insert(0, {repo!r})\n"
+            f"sys.path.insert(0, {repo!r} + '/tests')\n"
+            "from unit.test_wp3_venue_direct_evidence import "
+            "receipt_for\n"
+            "from app.venue_direct_evidence import (ReceiptLedger,\n"
+            "    ReceiptUncertainError, VenueEvidenceError)\n"
+            "from pathlib import Path\n"
+            "root, ready, barrier, tag = sys.argv[1:5]\n"
+            "ledger = ReceiptLedger(root)\n"
+            "Path(ready).write_text('ready')\n"
+            "while not Path(barrier).exists():\n"
+            "    time.sleep(0.001)\n"
+            "try:\n"
+            "    ledger.register(receipt_for(tag.encode(), seq=8),\n"
+            "                    route='v|a|s')\n"
+            "    print(json.dumps({'result': 'registered'}))\n"
+            "except ReceiptUncertainError:\n"
+            "    print(json.dumps({'result': 'uncertain'}))\n"
+            "except VenueEvidenceError as exc:\n"
+            "    print(json.dumps({'result': 'refused',\n"
+            "                      'kind': type(exc).__name__}))\n")
+        procs = []
+        for index in (0, 1):
+            ready = tmp_path / f"ready_{index}"
+            procs.append((subprocess.Popen(
+                [_sys.executable, "-c", script, str(ledger.root),
+                 str(ready), str(barrier), f"body-{index}"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True), ready))
+        try:
+            waited = 0.0
+            while waited < 90.0 and not all(
+                    r.exists() for _p, r in procs):
+                _time.sleep(0.02)
+                waited += 0.02
+            barrier.write_text("go")
+            outputs = [p.communicate(timeout=180) for p, _r in procs]
+        finally:
+            for p, _r in procs:
+                if p.poll() is None:
+                    p.kill()
+        results = [json.loads(o.strip().splitlines()[-1])
+                   for o, _e in outputs]
+        # NOTHING registers. A claimant that reaches the verified
+        # read classifies the route as uncertain; one that loses the
+        # lock race refuses on the held lock — both fail closed.
+        assert all(r["result"] in ("uncertain", "refused")
+                   for r in results), results
+        assert any(r["result"] == "uncertain" for r in results), \
+            results
+
+    def test_two_processes_refuse_an_uncertain_lock_release(
+            self, tmp_path):
+        """Both claimants refuse a lock whose release witness says
+        the release never completed."""
+        import subprocess
+        import sys as _sys
+        ledger = self._ledger(tmp_path, name="proc_ledger")
+        ledger.register(self._receipt(), route="v|a|s")
+        route_dir = self._route_dir(ledger)
+        _forge(route_dir / "register.lock", b"released")
+        _forge(route_dir / "register.lock.rw", b"releasing")
+        repo = str(Path(__file__).resolve().parents[2])
+        script = (
+            "import json, sys\n"
+            f"sys.path.insert(0, {repo!r})\n"
+            f"sys.path.insert(0, {repo!r} + '/tests')\n"
+            "from unit.test_wp3_venue_direct_evidence import "
+            "receipt_for\n"
+            "from app.venue_direct_evidence import (ReceiptLedger,\n"
+            "    ReceiptLedgerError)\n"
+            "try:\n"
+            "    ReceiptLedger(sys.argv[1]).register(\n"
+            "        receipt_for(b'later', seq=8), route='v|a|s')\n"
+            "    print(json.dumps({'result': 'registered'}))\n"
+            "except ReceiptLedgerError as exc:\n"
+            "    print(json.dumps({'result': 'refused',\n"
+            "        'witnessed': 'release witness' in str(exc)}))\n")
+        outputs = []
+        for _index in (0, 1):
+            proc = subprocess.run(
+                [_sys.executable, "-c", script, str(ledger.root)],
+                capture_output=True, text=True, timeout=180)
+            outputs.append(json.loads(
+                proc.stdout.strip().splitlines()[-1]))
+        assert all(o == {"result": "refused", "witnessed": True}
+                   for o in outputs), outputs
