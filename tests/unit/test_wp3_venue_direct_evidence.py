@@ -119,16 +119,28 @@ def policy(venue="alpaca_paper", symbol="SPY",
 ALPACA_FP = "7853afed1025c1ba"
 
 
+def receipt_for(raw, *, received=None, seq=1, body=None,
+                source="wp3_test_collector"):
+    from app.venue_direct_evidence import AcquisitionReceipt
+    return AcquisitionReceipt.build(
+        collector_source=source,
+        collector_code_identity="collector-code-0001",
+        received_at=received or OBSERVED, monotonic_seq=seq,
+        body=body if body is not None else raw)
+
+
 def evidence(venue, kind, payload, *, symbol="SPY",
              account=ALPACA_FP, source="alpaca_paper_rest_v2",
-             raw=None, transport=None):
+             raw=None, transport=None, receipt=None):
+    raw_bytes = raw if raw is not None else json.dumps(
+        payload).encode()
+    if kind == "terminal_orders" and receipt is None:
+        receipt = receipt_for(raw_bytes)
     return VenueDirectEvidence.parse(
         venue=venue, account_fingerprint=account, symbol=symbol,
         evidence_type=kind, schema_version="v1", source=source,
-        evidence_id=f"ev-{kind}",
-        raw_bytes=raw if raw is not None
-        else json.dumps(payload).encode(),
-        transport_observed_at=transport)
+        evidence_id=f"ev-{kind}", raw_bytes=raw_bytes,
+        transport_observed_at=transport, receipt=receipt)
 
 
 MT5_SOURCE = "mt5_bridge_snapshot_v1"

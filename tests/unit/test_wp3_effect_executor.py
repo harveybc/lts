@@ -176,11 +176,23 @@ def make_executor(authority, tmp_path, directive, port, *,
                 continue        # absence is never a terminal verdict
             if directive.venue == "mt5_demo":
                 rows.append({"ticket": identity, "symbol": "USDCAD",
-                             "state": _MT5_STATE[verdict]})
+                             "state": _MT5_STATE[verdict],
+                             "done_time": OBSERVED})
             else:
                 rows.append({"id": identity, "symbol": "SPY",
-                             "status": _ALPACA_STATUS[verdict]})
-        payload = {"observed_at": OBSERVED, "orders": rows}
+                             "status": _ALPACA_STATUS[verdict],
+                             "updated_at": OBSERVED})
+        if not rows:
+            # absence is not a verdict, and an empty body refuses at
+            # the parser — model it as evidence the gate will judge
+            # by the MISSING identities: a lone unrelated terminal row
+            rows = [{"ticket": "unrelated-1", "symbol": "USDCAD",
+                     "state": "ORDER_STATE_CANCELED",
+                     "done_time": OBSERVED}
+                    if directive.venue == "mt5_demo" else
+                    {"id": "unrelated-1", "symbol": "SPY",
+                     "status": "canceled", "updated_at": OBSERVED}]
+        payload = rows
         return evidence_fn(directive.venue, "terminal_orders",
                            payload) if evidence_fn is evidence \
             else evidence_fn("terminal_orders", payload)
@@ -194,6 +206,48 @@ def make_executor(authority, tmp_path, directive, port, *,
         fresh_positions=fresh_positions,
         terminal_orders=terminal_orders,
         custody=custody, clock=lambda: NOW)
+
+
+def mt5_ev(kind, payload):
+    return mt5_evidence(kind, payload)
+
+
+def mt5_directive(authority, *, state="FORCED_FLATTEN", command=1):
+    orders_ev = mt5_evidence("open_orders", MT5_ORDERS)
+    positions_ev = mt5_evidence("positions", MT5_POSITIONS)
+    return derive_directive(
+        authority,
+        policy=authority.session_exposure.validate_policy(
+            session_policy()),
+        state_block=block(state), venue="mt5_demo",
+        account_fingerprint="sanitizedfp01", symbol="USDCAD",
+        raw_model_output=float(command), mapped_command=command,
+        positions=positions_ev.facts, orders=orders_ev.facts,
+        provenance=positions_ev.provenance())
+
+
+def mt5_custody(authority, tmp_path):
+    return LiveFlattenCustody(
+        authority, tmp_path / "custody",
+        binding=VenueObligationBinding(
+            venue="mt5_demo", account_fingerprint="sanitizedfp01",
+            symbol="USDCAD", position_identity="100001",
+            evidence_policy_digest=mt5_policy().policy_digest,
+            calendar_identity="cal-venue-v1",
+            authority_code_identity=authority.code_identity),
+        episode_identity="ep-exec-1")
+
+
+def mt5_flatten_executor(authority, tmp_path, port, *,
+                         plan_id="plan-m1", world=None,
+                         positions_payload=None):
+    directive = mt5_directive(authority)
+    return directive, make_executor(
+        authority, tmp_path, directive, port, plan_id=plan_id,
+        world=world, custody=mt5_custody(authority, tmp_path),
+        venue_policy=mt5_policy(), evidence_fn=mt5_ev,
+        orders_payload=MT5_ORDERS,
+        positions_payload=positions_payload or MT5_POSITIONS)
 
 
 def alpaca_custody(authority, tmp_path):
@@ -786,10 +840,8 @@ class TestE2TypedTerminalEvidence:
         world = {"flat": False,
                  "terminal_override": lambda: evidence(
                      "alpaca_paper", "terminal_orders",
-                     {"observed_at": OBSERVED,
-                      "orders": [{"id": "parent-order-id",
-                                  "symbol": "SPY",
-                                  "status": "new"}]})}
+                     [{"id": "parent-order-id", "symbol": "SPY",
+                       "status": "new", "updated_at": OBSERVED}])}
         executor = make_executor(authority, tmp_path, directive, port,
                                  world=world)
         with pytest.raises(PlanStopped, match="not a TERMINAL"):
@@ -817,10 +869,9 @@ class TestE2TypedTerminalEvidence:
         world = {"flat": False,
                  "terminal_override": lambda: evidence(
                      "alpaca_paper", "terminal_orders",
-                     {"observed_at": stale,
-                      "orders": [{"id": "parent-order-id",
-                                  "symbol": "SPY",
-                                  "status": "canceled"}]})}
+                     [{"id": "parent-order-id", "symbol": "SPY",
+                       "status": "canceled",
+                       "updated_at": stale}])}
         executor = make_executor(authority, tmp_path, directive, port,
                                  world=world)
         with pytest.raises(PlanStopped, match="stale"):
@@ -877,48 +928,108 @@ class TestE3CloseContractAndReconcileFirst:
         assert contract["reduce_only"] is True
         assert contract["idempotency_key"] == "close-plan-1"
 
-    def test_a_changed_position_is_never_closed_by_replay(
+    def _crashed_mt5_close(self, authority, tmp_path, *, plan_id):
+        world = {"flat": False}
+        port = FakePort(world=world)
+        port.raise_on_close = RuntimeError("crash mid-close")
+        directive, executor = mt5_flatten_executor(
+            authority, tmp_path, port, plan_id=plan_id, world=world)
+        with pytest.raises(RuntimeError, match="crash mid-close"):
+            executor.execute()
+        assert port.close_calls == []
+        return directive, world, port
+
+    def test_an_alpaca_reissue_is_categorically_unresolved(
             self, authority, tmp_path):
+        """E7 FROZEN: Alpaca's asset_id names the asset, not the
+        instance. Even a position IDENTICAL in side, quantity and
+        price must never inherit an old close."""
         directive, custody, world, port = self._crashed_close(
-            authority, tmp_path, plan_id="plan-changed")
-        changed = json.loads(json.dumps(ALPACA_POSITIONS))
-        changed["positions"][0]["qty"] = "20"
+            authority, tmp_path, plan_id="plan-ident")
         resumed = make_executor(authority, tmp_path, directive, port,
-                                plan_id="plan-changed", world=world,
-                                custody=custody,
-                                positions_payload=changed)
+                                plan_id="plan-ident", world=world,
+                                custody=custody)
         outcome = resumed.resume()
         assert outcome["state"] == "unresolved"
-        assert "changed" in outcome["incident"]
+        assert "no position-instance identity" in outcome["incident"]
         assert port.close_calls == []
 
-    def test_the_same_position_reissues_with_the_same_key(
+    def test_an_alpaca_reopened_position_with_changed_price_too(
             self, authority, tmp_path):
+        """E7 FROZEN: the reopened-position shape that previously
+        INHERITED the old close (entry 480 vs 500) and completed."""
         directive, custody, world, port = self._crashed_close(
-            authority, tmp_path, plan_id="plan-same")
+            authority, tmp_path, plan_id="plan-reopen")
+        reopened = json.loads(json.dumps(ALPACA_POSITIONS))
+        reopened["positions"][0]["avg_entry_price"] = "480.00"
         resumed = make_executor(authority, tmp_path, directive, port,
-                                plan_id="plan-same", world=world,
-                                custody=custody)
+                                plan_id="plan-reopen", world=world,
+                                custody=custody,
+                                positions_payload=reopened)
+        outcome = resumed.resume()
+        assert outcome["state"] == "unresolved"
+        assert port.close_calls == []
+
+    def test_the_same_mt5_ticket_reissues_with_the_same_key(
+            self, authority, tmp_path):
+        """MT5's ticket IS a venue position-instance identity, so the
+        same ticket, side, units and entry price may retry with the
+        SAME idempotency key through a declaring port."""
+        directive, world, port = self._crashed_mt5_close(
+            authority, tmp_path, plan_id="plan-msame")
+        _d, resumed = mt5_flatten_executor(
+            authority, tmp_path, port, plan_id="plan-msame",
+            world=world)
         outcome = resumed.resume()
         assert outcome["state"] == "completed"
         assert len(port.close_calls) == 1
         assert port.close_calls[0]["idempotency_key"] == \
-            "close-plan-same"
+            "close-plan-msame"
+        assert port.close_calls[0]["identity_kind"] == \
+            "venue_position_instance"
         ack = resumed.journal.find("close_acknowledged")
         assert ack["payload"]["reissued_with_same_key"] is True
 
+    def test_a_reopened_mt5_ticket_never_inherits_the_close(
+            self, authority, tmp_path):
+        directive, world, port = self._crashed_mt5_close(
+            authority, tmp_path, plan_id="plan-mreopen")
+        reopened = json.loads(json.dumps(MT5_POSITIONS))
+        reopened["positions"][0]["ticket"] = "100999"
+        _d, resumed = mt5_flatten_executor(
+            authority, tmp_path, port, plan_id="plan-mreopen",
+            world=world, positions_payload=reopened)
+        outcome = resumed.resume()
+        assert outcome["state"] == "unresolved"
+        assert "reopened" in outcome["incident"] or \
+            "changed" in outcome["incident"]
+        assert port.close_calls == []
+
+    def test_a_changed_mt5_entry_price_never_reissues(self, authority,
+                                                      tmp_path):
+        directive, world, port = self._crashed_mt5_close(
+            authority, tmp_path, plan_id="plan-mprice")
+        changed = json.loads(json.dumps(MT5_POSITIONS))
+        changed["positions"][0]["price_open"] = 1.40
+        _d, resumed = mt5_flatten_executor(
+            authority, tmp_path, port, plan_id="plan-mprice",
+            world=world, positions_payload=changed)
+        outcome = resumed.resume()
+        assert outcome["state"] == "unresolved"
+        assert port.close_calls == []
+
     def test_a_port_without_the_contract_never_reissues(
             self, authority, tmp_path):
-        directive, custody, world, port = self._crashed_close(
+        directive, world, port = self._crashed_mt5_close(
             authority, tmp_path, plan_id="plan-noc")
 
         class NoContractPort(FakePort):
             close_contract = None
 
         blind = NoContractPort(world=world)
-        resumed = make_executor(authority, tmp_path, directive, blind,
-                                plan_id="plan-noc", world=world,
-                                custody=custody)
+        _d, resumed = mt5_flatten_executor(
+            authority, tmp_path, blind, plan_id="plan-noc",
+            world=world)
         outcome = resumed.resume()
         assert outcome["state"] == "unresolved"
         assert "does not prove same-key" in outcome["incident"]
@@ -1155,18 +1266,31 @@ class MarkerPort(FakePort):
 
 
 # journal_root is <tmp>/journal/<plan-id>; the builders expect <tmp>
+from unit.test_wp3_effect_executor import (mt5_custody,
+                                           mt5_directive, mt5_ev)
+from unit.test_wp3_venue_direct_evidence import (MT5_ORDERS,
+                                                 MT5_POSITIONS,
+                                                 mt5_policy)
 tmp = Path(journal_root).parents[1]
 world = {{"flat": False}}
-if boundary == "close":
+port = MarkerPort(world=world)
+if boundary == "close_mt5":
+    directive = mt5_directive(authority)
+    executor = make_executor(
+        authority, tmp, directive, port, world=world,
+        custody=mt5_custody(authority, tmp),
+        venue_policy=mt5_policy(), evidence_fn=mt5_ev,
+        orders_payload=MT5_ORDERS, positions_payload=MT5_POSITIONS)
+elif boundary == "close_alpaca":
     directive = alpaca_directive(authority, state="FORCED_FLATTEN",
                                  command=1)
-    custody = alpaca_custody(authority, tmp)
+    executor = make_executor(authority, tmp, directive, port,
+                             world=world,
+                             custody=alpaca_custody(authority, tmp))
 else:
     directive = alpaca_directive(authority)
-    custody = None
-port = MarkerPort(world=world)
-executor = make_executor(authority, tmp, directive, port,
-                         world=world, custody=custody)
+    executor = make_executor(authority, tmp, directive, port,
+                             world=world)
 
 Path(ready).write_text("ready")
 while not Path(barrier).exists():
@@ -1185,14 +1309,6 @@ except PlanStopped as exc:
 class TestE4TwoRealProcesses:
 
     def _crash_at(self, authority, tmp_path, boundary):
-        if boundary == "close":
-            directive = alpaca_directive(authority,
-                                         state="FORCED_FLATTEN",
-                                         command=1)
-            custody = alpaca_custody(authority, tmp_path)
-        else:
-            directive = alpaca_directive(authority)
-            custody = None
         world = {"flat": False}
         port = FakePort(world=world)
         if boundary == "submit":
@@ -1201,8 +1317,21 @@ class TestE4TwoRealProcesses:
             port.raise_on_cancel = RuntimeError("crash")
         else:
             port.raise_on_close = RuntimeError("crash")
-        executor = make_executor(authority, tmp_path, directive, port,
-                                 world=world, custody=custody)
+        if boundary == "close_mt5":
+            _d, executor = mt5_flatten_executor(
+                authority, tmp_path, port, plan_id="plan-1",
+                world=world)
+        elif boundary == "close_alpaca":
+            directive = alpaca_directive(authority,
+                                         state="FORCED_FLATTEN",
+                                         command=1)
+            executor = make_executor(
+                authority, tmp_path, directive, port, world=world,
+                custody=alpaca_custody(authority, tmp_path))
+        else:
+            directive = alpaca_directive(authority)
+            executor = make_executor(authority, tmp_path, directive,
+                                     port, world=world)
         with pytest.raises(RuntimeError):
             executor.execute()
         return executor.journal.root
@@ -1213,8 +1342,10 @@ class TestE4TwoRealProcesses:
         # reduce-only cancel: the ONE winner re-issues it once and
         # then legitimately completes the plan with one decision
         ("cancel", {"cancel": 1, "submit": 1}),
-        # same position, same key: one close, and the winner confirms
-        ("close", {"close": 1}),
+        # MT5 ticket = instance identity: exactly one close reissue
+        ("close_mt5", {"close": 1}),
+        # Alpaca has NO instance identity: nobody reissues anything
+        ("close_alpaca", {}),
     ])
     def test_two_processes_resume_one_effect_at_most(
             self, authority, tmp_path, boundary, expected_effects):
@@ -1267,3 +1398,244 @@ class TestE4TwoRealProcesses:
         assert "refused" in [r["result"] for r in results], (
             "the lock must have refused exactly one claimant",
             results)
+
+
+# ================================================================== #
+# E6: the lock is DIRECTORY-durable and uncertainty fails closed     #
+# ================================================================== #
+
+class TestE6LockDurability:
+
+    def test_acquire_and_release_fsync_the_parent_directory(
+            self, authority, tmp_path, monkeypatch):
+        import app.effect_executor as mod
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        synced = []
+        real = mod._fsync_dir
+
+        def counting(path):
+            synced.append(Path(path))
+            return real(path)
+
+        monkeypatch.setattr(mod, "_fsync_dir", counting)
+        executor.execute()
+        journal_root = executor.journal.root
+        # at least one parent fsync for the acquire and one for the
+        # release, beyond the journal-record fsyncs
+        assert synced.count(journal_root) >= 2
+
+    def test_a_failing_file_fsync_on_acquire_blocks_execution(
+            self, authority, tmp_path, monkeypatch):
+        import app.effect_executor as mod
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        executor = make_executor(authority, tmp_path, directive, port)
+        real = mod.os.fsync
+
+        def failing(fd):
+            raise OSError("simulated lock file fsync failure")
+
+        monkeypatch.setattr(mod.os, "fsync", failing)
+        with pytest.raises(PlanLockHeld,
+                           match="could not be made durable"):
+            executor.execute()
+        monkeypatch.setattr(mod.os, "fsync", real)
+        assert port.cancel_calls == []
+        assert port.submit_calls == []
+        # the uncertain lock stays and a future claimant refuses
+        with pytest.raises(PlanLockHeld):
+            make_executor(authority, tmp_path, directive,
+                          FakePort()).execute()
+
+    def test_a_failing_directory_fsync_on_acquire_blocks_execution(
+            self, authority, tmp_path, monkeypatch):
+        import app.effect_executor as mod
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        executor = make_executor(authority, tmp_path, directive, port)
+
+        def failing_dir(path):
+            raise OSError("simulated lock dir fsync failure")
+
+        monkeypatch.setattr(mod, "_fsync_dir", failing_dir)
+        with pytest.raises(PlanLockHeld,
+                           match="could not be made durable"):
+            executor.execute()
+        monkeypatch.undo()
+        assert port.cancel_calls == []
+
+    def test_an_uncertain_release_is_operator_disposition_safe(
+            self, authority, tmp_path, monkeypatch):
+        import app.effect_executor as mod
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        executor = make_executor(authority, tmp_path, directive, port)
+        real_unlink = mod.os.unlink
+        state = {"armed": False}
+
+        def failing_unlink(path):
+            if state["armed"] and str(path).endswith("run.lock"):
+                raise OSError("simulated unlink failure")
+            return real_unlink(path)
+
+        monkeypatch.setattr(mod.os, "unlink", failing_unlink)
+        state["armed"] = True
+        with pytest.raises(ExecutorError,
+                           match="release could not be made durable"):
+            executor.execute()
+        monkeypatch.undo()
+        # the effects DID run exactly once before the release failed
+        assert port.submit_calls == [0]
+        # the surviving lock refuses the next claimant: fail closed
+        with pytest.raises(PlanLockHeld):
+            make_executor(authority, tmp_path, directive,
+                          FakePort()).resume()
+
+    def test_a_fresh_process_recovers_after_a_clean_release(
+            self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.execute()
+        assert not (executor.journal.root / "run.lock").exists()
+        reborn = make_executor(authority, tmp_path, directive,
+                               FakePort())
+        assert reborn.resume() == {"state": "completed",
+                                   "resumed": True}
+
+
+# ================================================================== #
+# E8: freshness comes from ORIGINAL venue bytes, receipt is bound    #
+# ================================================================== #
+
+class TestE8VenueBytesAndReceipt:
+
+    ROWS = [{"id": "parent-order-id", "symbol": "SPY",
+             "status": "canceled", "updated_at": OBSERVED}]
+
+    def test_a_replayed_body_with_a_fresh_receipt_is_stale(self):
+        """FROZEN COUNTEREXAMPLE. A body with no venue timestamp
+        inside a freshly stamped local wrapper verified as fresh."""
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        old_stamp = (NOW - timedelta(days=365)).isoformat()
+        replayed = [{"id": "parent-order-id", "symbol": "SPY",
+                     "status": "canceled", "updated_at": old_stamp}]
+        raw = json.dumps(replayed).encode()
+        item = evidence("alpaca_paper", "terminal_orders", replayed,
+                        receipt=receipt_for(raw, received=NOW
+                                            .isoformat()))
+        with pytest.raises(VenueEvidenceError, match="stale"):
+            item.verify(policy(), now=NOW)
+
+    def test_the_old_wrapper_shape_is_refused_outright(self):
+        with pytest.raises(VenueEvidenceError,
+                           match="ARRAY of order objects"):
+            evidence("alpaca_paper", "terminal_orders",
+                     {"observed_at": OBSERVED, "orders": self.ROWS})
+
+    def test_a_missing_receipt_refuses(self):
+        from app.venue_direct_evidence import VenueDirectEvidence
+        with pytest.raises(VenueEvidenceError,
+                           match="requires a typed "
+                                 "AcquisitionReceipt"):
+            VenueDirectEvidence.parse(
+                venue="alpaca_paper", account_fingerprint=ALPACA_FP,
+                symbol="SPY", evidence_type="terminal_orders",
+                schema_version="v1", source="alpaca_paper_rest_v2",
+                evidence_id="ev-t",
+                raw_bytes=json.dumps(self.ROWS).encode())
+
+    def test_body_envelope_substitution_refuses(self):
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        other = json.dumps([{"id": "another", "symbol": "SPY",
+                             "status": "canceled",
+                             "updated_at": OBSERVED}]).encode()
+        with pytest.raises(VenueEvidenceError,
+                           match="does not bind these bytes"):
+            evidence("alpaca_paper", "terminal_orders", self.ROWS,
+                     receipt=receipt_for(other))
+
+    def test_a_future_receipt_refuses(self):
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        raw = json.dumps(self.ROWS).encode()
+        item = evidence(
+            "alpaca_paper", "terminal_orders", self.ROWS,
+            receipt=receipt_for(raw, received=(
+                NOW + timedelta(seconds=90)).isoformat()))
+        with pytest.raises(VenueEvidenceError,
+                           match="in the future"):
+            item.verify(policy(), now=NOW)
+
+    def test_a_receipt_predating_the_event_refuses(self):
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        raw = json.dumps(self.ROWS).encode()
+        item = evidence(
+            "alpaca_paper", "terminal_orders", self.ROWS,
+            receipt=receipt_for(raw, received=(
+                NOW - timedelta(seconds=60)).isoformat()))
+        with pytest.raises(VenueEvidenceError,
+                           match="predates the venue event"):
+            item.verify(policy(), now=NOW)
+
+    def test_a_stale_receipt_refuses(self):
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        old = (NOW - timedelta(seconds=600)).isoformat()
+        rows = [{"id": "parent-order-id", "symbol": "SPY",
+                 "status": "canceled", "updated_at": old}]
+        raw = json.dumps(rows).encode()
+        item = evidence("alpaca_paper", "terminal_orders", rows,
+                        receipt=receipt_for(raw, received=old))
+        with pytest.raises(VenueEvidenceError, match="stale"):
+            item.verify(policy(), now=NOW)
+
+    def test_duplicate_keys_in_the_venue_body_refuse(self):
+        raw = (b'[{"id":"a","id":"a","symbol":"SPY",'
+               b'"status":"canceled","updated_at":"' +
+               OBSERVED.encode() + b'"}]')
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        with pytest.raises(VenueEvidenceError, match="duplicate key"):
+            evidence("alpaca_paper", "terminal_orders", None,
+                     raw=raw, receipt=receipt_for(raw))
+
+    def test_an_empty_body_carries_no_verdict(self):
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        raw = b"[]"
+        with pytest.raises(VenueEvidenceError,
+                           match="absence is never a terminal "
+                                 "verdict"):
+            evidence("alpaca_paper", "terminal_orders", None,
+                     raw=raw, receipt=receipt_for(raw))
+
+    def test_mt5_rows_carry_the_venue_done_time(self):
+        rows = [{"ticket": "200001", "symbol": "USDCAD",
+                 "state": "ORDER_STATE_CANCELED",
+                 "done_time": OBSERVED}]
+        item = mt5_evidence("terminal_orders", rows)
+        assert dict(item.facts["verdicts"])["200001"] == "cancelled"
+        item.verify(mt5_policy(), now=NOW)
+        missing = [{"ticket": "200001", "symbol": "USDCAD",
+                    "state": "ORDER_STATE_CANCELED"}]
+        with pytest.raises(VenueEvidenceError, match="missing fields"):
+            mt5_evidence("terminal_orders", missing)
+
+    def test_the_receipt_travels_in_the_provenance(self, authority,
+                                                   tmp_path):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.execute()
+        record = executor.journal.find("cancellation_outcomes")
+        receipt = record["payload"]["provenance"]["receipt"]
+        assert receipt["collector_source"] == "wp3_test_collector"
+        assert receipt["collector_code_identity"]
+        assert receipt["monotonic_seq"] >= 0
+        assert len(receipt["body_sha256"]) == 64

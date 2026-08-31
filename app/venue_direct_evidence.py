@@ -394,6 +394,11 @@ def _parse_alpaca_positions_v1(payload: Any) -> dict:
         identities.add(identity)
         parsed.append({
             "position_identity": identity,
+            # E7: Alpaca's asset_id names the ASSET, not the position
+            # instance — a closed and reopened position carries the
+            # SAME value. Stated here so no consumer can mistake it
+            # for an instance identity.
+            "identity_kind": "asset_identity_only",
             "symbol": require_text(f"position[{index}].symbol",
                                    row["symbol"]),
             "side": side,
@@ -631,20 +636,29 @@ _MT5_TERMINAL_STATE_VERDICT = {
 
 def _parse_terminal_rows(payload: Any, *, what: str,
                          identity_field: str, status_field: str,
+                         event_time_field: str,
                          verdict_map: Mapping[str, str]) -> dict:
-    if not isinstance(payload, dict):
-        raise VenueEvidenceError(f"{what} must be an object")
-    require_fields(what, payload, ("orders", "observed_at"))
-    rows = payload["orders"]
-    if not isinstance(rows, list):
-        raise VenueEvidenceError(f"{what}: orders must be a list")
+    """E8: the payload is the venue's ARRAY of order objects — no
+    wrapper and no caller-inserted timestamp. Freshness derives from
+    the VENUE'S OWN event timestamps on each row; a locally generated
+    receipt lives in the acquisition envelope, never in here."""
+    if not isinstance(payload, list):
+        raise VenueEvidenceError(
+            f"{what}: the venue body is an ARRAY of order objects; a "
+            "wrapper object is a local construction, not venue bytes")
+    if not payload:
+        raise VenueEvidenceError(
+            f"{what}: an empty terminal body carries no verdict — "
+            "absence is never a terminal verdict")
     verdicts: dict = {}
     symbols = set()
-    for index, row in enumerate(rows):
+    latest = None
+    for index, row in enumerate(payload):
         if not isinstance(row, dict):
             raise VenueEvidenceError(f"{what}[{index}] not an object")
         require_fields(f"{what}[{index}]", row,
-                       (identity_field, "symbol", status_field))
+                       (identity_field, "symbol", status_field,
+                        event_time_field))
         identity = require_text(f"{what}[{index}].{identity_field}",
                                 row[identity_field])
         if identity in verdicts:
@@ -659,15 +673,16 @@ def _parse_terminal_rows(payload: Any, *, what: str,
                 f"{what}[{index}]: status {status!r} is not a "
                 "TERMINAL status this parser models — a non-terminal "
                 "or unknown status can never be a verdict")
+        stamp = require_utc(f"{what}[{index}].{event_time_field}",
+                            row[event_time_field])
+        latest = stamp if latest is None or stamp > latest else latest
         verdicts[identity] = verdict
         symbols.add(require_text(f"{what}[{index}].symbol",
                                  row["symbol"]))
     return {"verdicts": tuple(sorted(verdicts.items())),
             "orders_total": len(verdicts),
             "internal_symbols": tuple(sorted(symbols)),
-            "observed_at": require_utc(
-                f"{what}.observed_at",
-                payload["observed_at"]).isoformat()}
+            "observed_at": latest.isoformat()}
 
 
 def _parse_alpaca_terminal_orders_v1(payload: Any) -> dict:
@@ -675,7 +690,7 @@ def _parse_alpaca_terminal_orders_v1(payload: Any) -> dict:
     per identity: the venue's own terminal ``status`` decides."""
     return _parse_terminal_rows(
         payload, what="alpaca.terminal_orders", identity_field="id",
-        status_field="status",
+        status_field="status", event_time_field="updated_at",
         verdict_map=_ALPACA_TERMINAL_STATUS_VERDICT)
 
 
@@ -684,7 +699,7 @@ def _parse_mt5_terminal_orders_v1(payload: Any) -> dict:
     venue's own terminal ``state`` decides."""
     return _parse_terminal_rows(
         payload, what="mt5.terminal_orders", identity_field="ticket",
-        status_field="state",
+        status_field="state", event_time_field="done_time",
         verdict_map=_MT5_TERMINAL_STATE_VERDICT)
 
 
@@ -762,6 +777,9 @@ def _parse_mt5_positions_v1(payload: Any) -> dict:
         identities.add(identity)
         parsed.append({
             "position_identity": identity,
+            # the MT5 ticket IS a position-instance identity: a
+            # reopened position receives a new ticket
+            "identity_kind": "venue_position_instance",
             "symbol": require_text(f"position[{index}].symbol",
                                    row["symbol"]),
             "side": side,
@@ -943,21 +961,21 @@ SEALED_PARSER_IDENTITIES: Mapping[tuple, str] = MappingProxyType({
     ("alpaca_paper", "account_session", "v1"):
         "91fa22c79095caddbf82ada5f525ab1f",
     ("alpaca_paper", "positions", "v1"):
-        "f3c5b6659bf88c65554706cd6e6bee9a",
+        "4bb954bb7064dcd64133247c636bc991",
     ("alpaca_paper", "open_orders", "v1"):
         "3788ff42f8e06d4fb64ca9b1b7f7ebec",
     ("mt5_demo", "account_session", "v1"):
         "2fea3126c04002638e45d77cac493398",
     ("mt5_demo", "positions", "v1"):
-        "6759e57dd2f194e5736801fd91e5f5ab",
+        "1a40f36b6980157c700df0b5fd87aa58",
     ("mt5_demo", "open_orders", "v1"):
         "34e0be893f2e43eac00a06b6a50a3301",
     ("mt5_demo", "market_clock", "v1"):
         "a2da56287687f89dda0c144710511b82",
     ("alpaca_paper", "terminal_orders", "v1"):
-        "9d5d44929add9a486cc967310e3a2c6d",
+        "f6c25265c5ed070e372d5888f1d5f8d1",
     ("mt5_demo", "terminal_orders", "v1"):
-        "429cd563b1efcc6ab6994bd05e9471ed",
+        "96cca1f60e270c7e8bb718124a0d1676",
 })
 
 
@@ -982,6 +1000,70 @@ def resolve_parser(key: tuple):
 
 
 # ---------------------------------------------------------------- #
+# the acquisition receipt (E8)                                      #
+# ---------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class AcquisitionReceipt:
+    """Trusted LOCAL acquisition metadata, kept OUTSIDE the venue
+    payload. The receipt binds the exact body bytes it was issued
+    for, names the collector and its code identity, and carries a
+    monotonic acquisition ordinal. Placing a local timestamp inside
+    the purported venue payload is exactly the confusion that let a
+    replayed body verify as fresh."""
+
+    collector_source: str
+    collector_code_identity: str
+    received_at: datetime
+    monotonic_seq: int
+    body_sha256: str
+
+    def __post_init__(self):
+        require_text("collector_source", self.collector_source)
+        require_text("collector_code_identity",
+                     self.collector_code_identity)
+        if not isinstance(self.received_at, datetime) or \
+                self.received_at.tzinfo is None:
+            raise VenueEvidenceError(
+                "received_at must be a timezone-aware datetime")
+        if isinstance(self.monotonic_seq, bool) or not isinstance(
+                self.monotonic_seq, int) or self.monotonic_seq < 0:
+            raise VenueEvidenceError(
+                f"monotonic_seq must be a nonnegative int, got "
+                f"{self.monotonic_seq!r}")
+        if not isinstance(self.body_sha256, str) or \
+                len(self.body_sha256) != 64:
+            raise VenueEvidenceError(
+                "body_sha256 must be the 64-hex digest of the exact "
+                "venue bytes this receipt was issued for")
+
+    @staticmethod
+    def build(*, collector_source: str,
+              collector_code_identity: str, received_at: Any,
+              monotonic_seq: int, body: bytes
+              ) -> "AcquisitionReceipt":
+        return AcquisitionReceipt(
+            collector_source=collector_source,
+            collector_code_identity=collector_code_identity,
+            received_at=require_utc("received_at", received_at),
+            monotonic_seq=monotonic_seq,
+            body_sha256=sha256_hex(bytes(body)))
+
+    def as_dict(self) -> dict:
+        return {"collector_source": self.collector_source,
+                "collector_code_identity":
+                    self.collector_code_identity,
+                "received_at": self.received_at.isoformat(),
+                "monotonic_seq": self.monotonic_seq,
+                "body_sha256": self.body_sha256}
+
+
+# evidence types whose payload is a venue body that MUST arrive with
+# an acquisition receipt
+RECEIPT_REQUIRED = ("terminal_orders",)
+
+
+# ---------------------------------------------------------------- #
 # the evidence envelope                                             #
 # ---------------------------------------------------------------- #
 
@@ -998,6 +1080,7 @@ class VenueDirectEvidence:
     raw_sha256: str
     payload_sha256: str
     parser_digest: str
+    receipt: Optional[AcquisitionReceipt] = None
     _facts: tuple = field(default=(), repr=False)
 
     @property
@@ -1015,7 +1098,8 @@ class VenueDirectEvidence:
     def parse(*, venue: str, account_fingerprint: str, symbol: str,
               evidence_type: str, schema_version: str, source: str,
               evidence_id: str, raw_bytes: bytes,
-              transport_observed_at: Any = None
+              transport_observed_at: Any = None,
+              receipt: Optional[AcquisitionReceipt] = None
               ) -> "VenueDirectEvidence":
         """C1: freshness comes from the BYTES.
 
@@ -1038,6 +1122,17 @@ class VenueDirectEvidence:
             raise VenueEvidenceError(
                 f"source {source!r} is not venue-direct evidence and "
                 "is refused by name")
+        if evidence_type in RECEIPT_REQUIRED:
+            if not isinstance(receipt, AcquisitionReceipt):
+                raise VenueEvidenceError(
+                    f"{evidence_type} evidence requires a typed "
+                    "AcquisitionReceipt — a venue body without an "
+                    "acquisition envelope has no trusted receipt "
+                    "time")
+            if receipt.body_sha256 != sha256_hex(bytes(raw_bytes)):
+                raise VenueEvidenceError(
+                    "the acquisition receipt does not bind these "
+                    "bytes — body/envelope substitution refused")
         decoded = decode_payload_bytes(
             raw_bytes, what=f"{venue}.{evidence_type}")
         if isinstance(decoded, dict) and "venue_direct" in decoded:
@@ -1070,7 +1165,7 @@ class VenueDirectEvidence:
             evidence_id=evidence_id, observed_at=stamp,
             raw_sha256=sha256_hex(bytes(raw_bytes)),
             payload_sha256=sha256_hex(canonical),
-            parser_digest=identity,
+            parser_digest=identity, receipt=receipt,
             _facts=tuple(sorted(facts.items())))
 
     def verify(self, policy: VenueEvidencePolicy, *,
@@ -1102,6 +1197,29 @@ class VenueDirectEvidence:
             raise VenueEvidenceError(
                 f"source {self.source!r} is not in the policy's "
                 f"allowlist {list(policy.allowed_sources)}")
+        if self.evidence_type in RECEIPT_REQUIRED:
+            receipt = self.receipt
+            if receipt is None:
+                raise VenueEvidenceError(
+                    "the acquisition receipt is missing")
+            drift = (receipt.received_at - moment).total_seconds()
+            if drift > 0.0:
+                raise VenueEvidenceError(
+                    f"the receipt is stamped {drift:.3f}s in the "
+                    "future")
+            if receipt.received_at < self.observed_at:
+                raise VenueEvidenceError(
+                    "the receipt predates the venue event it carries "
+                    "— an event cannot be received before it "
+                    "happened")
+            receipt_age = (moment -
+                           receipt.received_at).total_seconds()
+            if receipt_age > policy.max_age_seconds:
+                raise VenueEvidenceError(
+                    f"the acquisition receipt is {receipt_age:.3f}s "
+                    f"old and the policy allows "
+                    f"{policy.max_age_seconds:.3f}s — a stale "
+                    "receipt is refused")
         age = (moment - self.observed_at).total_seconds()
         if age < 0.0:
             raise VenueEvidenceError(
@@ -1152,6 +1270,8 @@ class VenueDirectEvidence:
             "payload_sha256": self.payload_sha256,
             "parser_digest": self.parser_digest,
             "venue_direct": True,
+            "receipt": (None if self.receipt is None
+                        else self.receipt.as_dict()),
         }
 
 

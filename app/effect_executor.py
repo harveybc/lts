@@ -272,6 +272,13 @@ class EffectExecutor:
 
     # -- the per-plan run lock (E4) --------------------------------
     def _acquire_run_lock(self):
+        """E6: the lock is DIRECTORY-durable. The file fsync alone
+        leaves the directory entry volatile: after a crash/reboot the
+        entry could vanish although the effect transaction had begun,
+        and another process would enter. Any UNCERTAIN acquire — a
+        failing file fsync or a failing parent fsync — blocks
+        execution and leaves the lock in place, so a future claimant
+        refuses and an operator disposes."""
         lock = self.journal.root / "run.lock"
         _refuse_symlink(lock, "run lock")
         try:
@@ -285,18 +292,36 @@ class EffectExecutor:
                 "process is an operator disposition, never an "
                 "automatic takeover") from exc
         try:
-            os.write(fd, str(os.getpid()).encode())
-            os.fchmod(fd, FILE_MODE)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+                os.fchmod(fd, FILE_MODE)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            _fsync_dir(lock.parent)
+        except Exception as exc:
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: the lock acquisition could "
+                f"not be made durable ({exc}) — an uncertain acquire "
+                "blocks execution, the lock stays in place, and an "
+                "operator disposes") from exc
         return lock
 
     def _release_run_lock(self, lock) -> None:
+        """The release is directory-durable too. An uncertain release
+        leaves the lock standing: a future claimant refuses and an
+        operator disposes — never a silent second entrant."""
         try:
             os.unlink(lock)
+            _fsync_dir(lock.parent)
         except FileNotFoundError:
             pass
+        except Exception as exc:
+            raise ExecutorError(
+                f"plan {self.plan_id}: the lock release could not be "
+                f"made durable ({exc}) — the lock may persist, a "
+                "future claimant will refuse, and an operator must "
+                "dispose") from exc
 
     # -- plan persistence ------------------------------------------
     def _persist_plan(self) -> dict:
@@ -556,9 +581,16 @@ class EffectExecutor:
         row = rows[0]
         return {
             "position_identity": row["position_identity"],
+            # E7: the KIND decides whether replay equality can ever
+            # be trusted. Alpaca's asset_id names the ASSET, not the
+            # instance; only a venue position-instance identity (the
+            # MT5 ticket) supports a same-position claim.
+            "identity_kind": row.get("identity_kind",
+                                     "asset_identity_only"),
             "side": row["side"],
             "units": abs(float(row["signed_quantity"])),
             "signed_quantity": float(row["signed_quantity"]),
+            "entry_price": float(row["entry_price"]),
             "reduce_only": True,
             "idempotency_key": f"close-{self.plan_id}",
         }
@@ -628,19 +660,39 @@ class EffectExecutor:
                         "an unacknowledged close has no persisted "
                         "contract; sameness cannot be verified and it "
                         "is not re-issued", obligation_id)
+                # E7: without a venue position-INSTANCE identity,
+                # equality of asset, side, quantity and even price
+                # proves nothing: a coincidentally identical REOPENED
+                # position must never inherit an old close.
+                if contract.get("identity_kind") != \
+                        "venue_position_instance":
+                    return self._unresolved(
+                        "close_unresolved",
+                        "the venue supplies no position-instance "
+                        "identity for this position; an "
+                        "unacknowledged close cannot be proven to "
+                        "target the same instance and is not "
+                        "re-issued — operator disposition required",
+                        obligation_id)
                 same = (
                     len(rows) == 1
+                    and rows[0].get("identity_kind") ==
+                    "venue_position_instance"
                     and rows[0]["position_identity"] ==
                     contract["position_identity"]
                     and rows[0]["side"] == contract["side"]
                     and abs(abs(float(rows[0]["signed_quantity"]))
-                            - float(contract["units"])) <= 1e-9)
+                            - float(contract["units"])) <= 1e-9
+                    and abs(float(rows[0]["entry_price"])
+                            - float(contract["entry_price"]))
+                    <= 1e-9)
                 if not same:
                     return self._unresolved(
                         "close_unresolved",
-                        "the position changed or multiplied since the "
-                        "close was requested — a changed state is "
-                        "never closed by replay", obligation_id)
+                        "the position changed, multiplied or was "
+                        "reopened since the close was requested — a "
+                        "changed state is never closed by replay",
+                        obligation_id)
                 if getattr(self.port, "close_contract", None) != \
                         "same_key_idempotent_reduce_only":
                     return self._unresolved(
