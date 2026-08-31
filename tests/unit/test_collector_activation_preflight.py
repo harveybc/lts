@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from tools.collector_activation_preflight import (
     _canonical_digest, evaluate)
 
+
 NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
 FP_A = "a" * 16
 FP_S = "b" * 16
@@ -75,13 +76,24 @@ def real_kit(tmp_path):
     manifest["seal_sha256"] = _canonical_digest(manifest)
     diff = root / "ea_session_publication.diff"
     diff.write_bytes(b"+ publish sessions only")
-    review = {
+    # C16: the review is a SEALED ACTA artifact on disk; a textual
+    # reference does not authorize
+    acta_body = {
         "differs_only_by": "session_evidence_publication",
-        "reviewed_by": {"identity": "auditor",
-                        "review_reference": "audit-doc-ref"},
+        "reviewer_identity": "musashi",
+        "review_reference": "audit-doc-ref",
         "diff_path": diff.name,
         "diff_sha256": hashlib.sha256(
             diff.read_bytes()).hexdigest()}
+    acta_body["seal_sha256"] = _canonical_digest(
+        {k: v for k, v in acta_body.items()
+         if k != "seal_sha256"})
+    acta = root / "review_acta.json"
+    acta.write_text(json.dumps(acta_body, sort_keys=True))
+    review = {
+        "acta_path": acta.name,
+        "acta_sha256": hashlib.sha256(
+            acta.read_bytes()).hexdigest()}
     script = root / "rollback.sh.txt"
     script.write_bytes(b"restore the digest-bound backups")
     rollback = {
@@ -90,6 +102,9 @@ def real_kit(tmp_path):
         "script_sha256": hashlib.sha256(
             script.read_bytes()).hexdigest(),
         "backup_manifest_sha256": manifest["seal_sha256"]}
+    import os as os_mod
+    for path in root.iterdir():
+        os_mod.chmod(path, 0o600)
     return {"heartbeat": heartbeat(),
             "backup_manifest": manifest, "backup_root": root,
             "ea_diff_review": review,
@@ -102,6 +117,7 @@ def run_kit(kit, snap=None):
                     expected_server_fingerprint=FP_S,
                     expected_symbol="ETHUSD",
                     expected_terminal_build=BUILD,
+                    expected_reviewer_identity="musashi",
                     now=NOW, **kit)
 
 
@@ -131,12 +147,16 @@ class TestFrozenCounterexample:
                 "differs_only_by": "session_evidence_publication",
                 "reviewed_by": "me, trust me"},
             rollback_evidence={"tested": True, "order_effects": 0},
+            expected_reviewer_identity="musashi",
             now=NOW)
         assert result["verdict"] == "COORDINATED_WINDOW_REQUIRED"
         text = json.dumps(result["failures"])
         assert "no heartbeat" in text
         assert "SEALED" in text
-        assert "binds nothing" in text or "hashes nothing" in text
+        assert "acta" in text, (
+            "the invented textual review must fail the acta "
+            "requirement")
+        assert "not bound to the sealed backup manifest" in text
 
 
 class TestGoRequiresRealArtifacts:
@@ -155,13 +175,15 @@ class TestGoRequiresRealArtifacts:
         body["seal_sha256"] = _canonical_digest(
             {"artifacts": body["artifacts"]})
         result = run(tmp_path, backup_manifest=body)
-        assert any("hashes nothing" in f
+        assert any("does not exist under the root" in f
                    for f in result["failures"])
 
     def test_a_tampered_artifact_refuses(self, tmp_path):
         kit = real_kit(tmp_path)
-        (kit["backup_root"] / "ea_source.bin").write_bytes(
-            b"tampered")
+        target = kit["backup_root"] / "ea_source.bin"
+        target.write_bytes(b"tampered")
+        import os as os_mod
+        os_mod.chmod(target, 0o600)
         result = run_kit(kit)
         assert any("invented or stale" in f
                    for f in result["failures"])
@@ -231,20 +253,55 @@ class TestHeartbeatBinding:
 
 class TestReviewAndRollbackBinding:
 
-    def test_bare_reviewer_name_refuses(self, tmp_path):
+    def test_textual_reference_does_not_authorize(self, tmp_path):
+        result = run(tmp_path, ea_diff_review={
+            "reviewed_by": "me, trust me",
+            "differs_only_by": "session_evidence_publication"})
+        assert any("acta" in f for f in result["failures"])
+
+    def test_wrong_reviewer_identity_refuses(self, tmp_path):
+        """The expected identity is FIXED by the order; an acta
+        signed by anyone else refuses."""
         kit = real_kit(tmp_path)
-        review = dict(kit["ea_diff_review"],
-                      reviewed_by="me, trust me")
-        result = run(tmp_path, ea_diff_review=review)
-        assert any("binds nothing" in f
+        acta = kit["backup_root"] / "review_acta.json"
+        body = json.loads(acta.read_text())
+        body.pop("seal_sha256")
+        body["reviewer_identity"] = "someone_else"
+        body["seal_sha256"] = _canonical_digest(body)
+        acta.write_text(json.dumps(body, sort_keys=True))
+        import os as os_mod
+        os_mod.chmod(acta, 0o600)
+        kit["ea_diff_review"] = {
+            "acta_path": acta.name,
+            "acta_sha256": hashlib.sha256(
+                acta.read_bytes()).hexdigest()}
+        result = run_kit(kit)
+        assert any("not the identity fixed by the order" in f
                    for f in result["failures"])
+
+    def test_unsealed_acta_refuses(self, tmp_path):
+        kit = real_kit(tmp_path)
+        acta = kit["backup_root"] / "review_acta.json"
+        body = json.loads(acta.read_text())
+        body.pop("seal_sha256")
+        acta.write_text(json.dumps(body, sort_keys=True))
+        import os as os_mod
+        os_mod.chmod(acta, 0o600)
+        kit["ea_diff_review"] = {
+            "acta_path": acta.name,
+            "acta_sha256": hashlib.sha256(
+                acta.read_bytes()).hexdigest()}
+        result = run_kit(kit)
+        assert any("SEALED" in f for f in result["failures"])
 
     def test_diff_content_mismatch_refuses(self, tmp_path):
         kit = real_kit(tmp_path)
-        (kit["backup_root"] /
-         "ea_session_publication.diff").write_bytes(b"other diff")
+        diff = kit["backup_root"] / "ea_session_publication.diff"
+        diff.write_bytes(b"other diff")
+        import os as os_mod
+        os_mod.chmod(diff, 0o600)
         result = run_kit(kit)
-        assert any("does not hash to the reviewed digest" in f
+        assert any("EXACT digest the sealed acta names" in f
                    for f in result["failures"])
 
     def test_rollback_unbound_to_the_manifest_refuses(self,
@@ -258,8 +315,10 @@ class TestReviewAndRollbackBinding:
 
     def test_rollback_script_mismatch_refuses(self, tmp_path):
         kit = real_kit(tmp_path)
-        (kit["backup_root"] / "rollback.sh.txt").write_bytes(
-            b"changed")
+        script = kit["backup_root"] / "rollback.sh.txt"
+        script.write_bytes(b"changed")
+        import os as os_mod
+        os_mod.chmod(script, 0o600)
         result = run_kit(kit)
         assert any("does not hash to its declared digest" in f
                    for f in result["failures"])
@@ -297,3 +356,82 @@ class TestBlockingInvariants:
         for surface in ("OrderSend", "requests.", "urllib",
                         "socket", "subprocess"):
             assert surface not in cleaned, surface
+
+
+class TestC16PathAndDescriptorDiscipline:
+
+    def test_escaping_paths_refuse(self, tmp_path):
+        from tools.collector_activation_preflight import (
+            ArtifactPathError, _contained_path)
+        import pytest as pt
+        root = tmp_path / "root"
+        root.mkdir()
+        (tmp_path / "outside.bin").write_bytes(b"x")
+        for bad in ("/etc/hosts", "../outside.bin",
+                    "a/../../outside.bin", "a/./b", ""):
+            with pt.raises(ArtifactPathError):
+                _contained_path(root, bad)
+
+    def test_symlinked_root_refuses(self, tmp_path):
+        from tools.collector_activation_preflight import (
+            ArtifactPathError, _contained_path)
+        import os as os_mod
+        import pytest as pt
+        real = tmp_path / "real"
+        real.mkdir()
+        (real / "a.bin").write_bytes(b"x")
+        link = tmp_path / "link"
+        os_mod.symlink(real, link)
+        with pt.raises(ArtifactPathError, match="non-symlink"):
+            _contained_path(link, "a.bin")
+
+    def test_symlinked_artifact_refuses_descriptor_first(
+            self, tmp_path):
+        from tools.collector_activation_preflight import (
+            ArtifactPathError, _sha256_descriptor_first)
+        import os as os_mod
+        import pytest as pt
+        root = tmp_path / "root"
+        root.mkdir()
+        target = root / "real.bin"
+        target.write_bytes(b"x")
+        os_mod.chmod(target, 0o600)
+        os_mod.symlink(target, root / "alias.bin")
+        with pt.raises(ArtifactPathError):
+            _sha256_descriptor_first(root, "alias.bin")
+
+    def test_loose_mode_refuses(self, tmp_path):
+        from tools.collector_activation_preflight import (
+            ArtifactPathError, _sha256_descriptor_first)
+        import os as os_mod
+        import pytest as pt
+        root = tmp_path / "root"
+        root.mkdir()
+        target = root / "a.bin"
+        target.write_bytes(b"x")
+        os_mod.chmod(target, 0o666)
+        with pt.raises(ArtifactPathError,
+                       match="group/other-writable"):
+            _sha256_descriptor_first(root, "a.bin")
+
+    def test_escaping_artifact_in_manifest_is_named(self, tmp_path):
+        kit = real_kit(tmp_path)
+        (tmp_path / "outside.bin").write_bytes(b"x")
+        body = {"artifacts": kit["backup_manifest"]["artifacts"][:2]
+                + [{"name": "bridge_config",
+                    "path": "../outside.bin",
+                    "sha256": hashlib.sha256(b"x").hexdigest()}]}
+        body["seal_sha256"] = _canonical_digest(body)
+        result = run(tmp_path, backup_manifest=body)
+        assert any("not a normalized contained relative path" in f
+                   for f in result["failures"])
+
+    def test_trade_allowed_is_deliberately_not_required(
+            self, tmp_path):
+        """C16 DECISION: the collector is read-only and runs under
+        least privilege — a heartbeat with trade_allowed=False must
+        still satisfy P5."""
+        result = run(tmp_path,
+                     heartbeat=heartbeat(trade_allowed=False))
+        assert result["verdict"] == "GO_READ_ONLY_COLLECTOR_ONLY"
+        assert result["failures"] == []

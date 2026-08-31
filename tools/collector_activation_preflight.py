@@ -27,7 +27,9 @@ Preconditions (ALL must hold):
 4. rollback: tested, zero order effects, script present and
    hash-matching, bound to the backup manifest seal;
 5. fresh strict HeartbeatPayload: connected, bound account AND
-   server fingerprints, expected terminal build;
+   server fingerprints, expected terminal build
+   (trade_allowed is DELIBERATELY not required: the collector is
+   read-only and runs under least privilege);
 6. no order/close/cancel API in the collector path (structural).
 
 Any open position or pending order answers
@@ -53,8 +55,84 @@ REQUIRED_BACKUP_ARTIFACTS = ("ea_source", "ea_compiled",
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+class ArtifactPathError(ValueError):
+    """C16: a path outside the canonical root, a symlink, an
+    irregular file, a foreign owner or a loose mode refuses."""
+
+
+def _contained_path(root: Path, rel: str) -> Path:
+    """C16: only NORMALIZED relative paths contained under a
+    canonical, non-symlink root are acceptable — absolute paths,
+    parent escapes and denormalized forms refuse before any open."""
+    import os as _os
+    if not isinstance(rel, str) or not rel:
+        raise ArtifactPathError("empty artifact path")
+    if _os.path.isabs(rel):
+        raise ArtifactPathError(f"absolute path refused: {rel!r}")
+    normalized = _os.path.normpath(rel)
+    if normalized != rel or normalized.startswith("..") or \
+            ".." in Path(normalized).parts:
+        raise ArtifactPathError(
+            f"path {rel!r} is not a normalized contained relative "
+            "path")
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise ArtifactPathError(
+            "the backup root must be a real, non-symlink directory")
+    resolved_root = root.resolve(strict=True)
+    candidate = (root / normalized)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        raise ArtifactPathError(
+            f"artifact {rel!r} does not exist under the root")
+    if resolved_root not in resolved.parents and \
+            resolved != resolved_root:
+        raise ArtifactPathError(
+            f"artifact {rel!r} escapes the canonical root")
+    return candidate
+
+
+def _sha256_descriptor_first(root: Path, rel: str) -> str:
+    """C16: the artifact is opened descriptor-first with O_NOFOLLOW,
+    verified REGULAR, owned by this uid and not group/other-writable
+    from the fstat of that very descriptor, and hashed FROM the
+    descriptor — no second path resolution can substitute it."""
+    import errno as _errno
+    import os as _os
+    import stat as _stat
+    path = _contained_path(root, rel)
+    try:
+        fd = _os.open(path, _os.O_RDONLY | _os.O_NOFOLLOW |
+                      _os.O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno in (_errno.ELOOP, _errno.EMLINK):
+            raise ArtifactPathError(
+                f"{rel!r}: symlink refused — descriptor-bound open "
+                "does not follow links") from exc
+        raise ArtifactPathError(
+            f"{rel!r}: cannot open ({exc})") from exc
+    try:
+        st = _os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise ArtifactPathError(
+                f"{rel!r}: not a regular file")
+        if st.st_uid != _os.getuid():
+            raise ArtifactPathError(
+                f"{rel!r}: foreign owner uid {st.st_uid} refused")
+        if _stat.S_IMODE(st.st_mode) & 0o022:
+            raise ArtifactPathError(
+                f"{rel!r}: group/other-writable mode "
+                f"{oct(_stat.S_IMODE(st.st_mode))} refused")
+        digest = hashlib.sha256()
+        while True:
+            chunk = _os.read(fd, 65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        _os.close(fd)
 
 
 def _canonical_digest(payload) -> str:
@@ -98,12 +176,11 @@ def _verify_artifact(entry, root: Path, failures: list,
         failures.append(f"{label}:{name}: no artifact path — a "
                         "digest that hashes NOTHING binds nothing")
         return
-    path = (root / rel).resolve()
-    if not path.is_file():
-        failures.append(f"{label}:{name}: artifact file missing — "
-                        "the digest hashes nothing")
+    try:
+        actual = _sha256_descriptor_first(root, rel)
+    except ArtifactPathError as exc:
+        failures.append(f"{label}:{name}: {exc}")
         return
-    actual = _sha256_file(path)
     if actual != declared:
         failures.append(f"{label}:{name}: file hashes "
                         f"{actual[:12]}… but the manifest declares "
@@ -114,6 +191,7 @@ def evaluate(snapshot: dict, *, expected_account_fingerprint: str,
              expected_server_fingerprint: str,
              expected_symbol: str,
              expected_terminal_build: int,
+             expected_reviewer_identity: str,
              heartbeat: dict | None,
              backup_manifest: dict | None,
              backup_root: Path | str | None,
@@ -183,6 +261,14 @@ def evaluate(snapshot: dict, *, expected_account_fingerprint: str,
                             "the heartbeat")
         if not beat.connected:
             failures.append("P5: the terminal is not connected")
+        # C16 DECISION, explicit: trade_allowed is NOT a collector
+        # requirement. The collector is read-only and must operate
+        # under LEAST privilege — requiring trading permission for
+        # a component that must never trade would demand more
+        # authority than the task needs, so the judge deliberately
+        # ignores the field and the precondition text makes no such
+        # claim. (The heartbeat schema still carries it for other
+        # consumers.)
         if beat.terminal_build != int(expected_terminal_build):
             failures.append(
                 f"P5: terminal build {beat.terminal_build} is not "
@@ -223,36 +309,73 @@ def evaluate(snapshot: dict, *, expected_account_fingerprint: str,
                         f"P2: required artifacts missing from the "
                         f"backup manifest: {missing}")
 
-    # -- P3: reviewed EA diff, identity + content digest -----------
+    # -- P3 (C16): the review is a REAL SEALED ACTA artifact -------
+    # A textual reference must not authorize: the acta is a file
+    # whose digest the caller declares, whose seal verifies, whose
+    # reviewer identity must equal the identity FIXED BY THE ORDER,
+    # and which itself names the exact diff digest.
     if not ea_diff_review:
         failures.append("P3: no EA diff review")
     else:
-        if ea_diff_review.get("differs_only_by") != \
-                "session_evidence_publication":
-            failures.append("P3: the review does not state the EA "
-                            "differs only by session-evidence "
-                            "publication")
-        reviewer = ea_diff_review.get("reviewed_by")
-        if not isinstance(reviewer, dict) or \
-                not reviewer.get("identity") or \
-                not reviewer.get("review_reference"):
-            failures.append(
-                "P3: reviewer identity must carry both an identity "
-                "and a review reference — a bare self-declared "
-                "name binds nothing")
-        declared = ea_diff_review.get("diff_sha256")
-        rel = ea_diff_review.get("diff_path")
-        if not isinstance(declared, str) or \
-                not _HEX64.match(declared or ""):
-            failures.append("P3: diff digest is not canonical "
+        acta_rel = ea_diff_review.get("acta_path")
+        acta_declared = ea_diff_review.get("acta_sha256")
+        acta = None
+        if not isinstance(acta_declared, str) or \
+                not _HEX64.match(acta_declared or ""):
+            failures.append("P3: acta digest is not canonical "
                             "64-hex")
-        elif root is None or not rel or \
-                not (Path(root) / rel).is_file():
-            failures.append("P3: the reviewed diff file is missing "
-                            "— the digest hashes nothing")
-        elif _sha256_file(Path(root) / rel) != declared:
-            failures.append("P3: the diff file does not hash to "
-                            "the reviewed digest")
+        elif root is None or not acta_rel:
+            failures.append("P3: no acta artifact — a textual "
+                            "reference does not authorize")
+        else:
+            try:
+                actual = _sha256_descriptor_first(root, acta_rel)
+            except ArtifactPathError as exc:
+                failures.append(f"P3: acta: {exc}")
+                actual = None
+            if actual is not None and actual != acta_declared:
+                failures.append("P3: the acta file does not hash "
+                                "to its declared digest")
+            elif actual is not None:
+                try:
+                    acta = json.loads(
+                        (Path(root) / acta_rel).read_text())
+                except Exception as exc:
+                    failures.append(f"P3: acta unreadable: {exc}")
+        if acta is not None:
+            if not _verify_sealed_manifest(acta, failures,
+                                           "P3 acta"):
+                acta = None
+        if acta is not None:
+            if acta.get("differs_only_by") != \
+                    "session_evidence_publication":
+                failures.append(
+                    "P3: the acta does not state the EA differs "
+                    "only by session-evidence publication")
+            if acta.get("reviewer_identity") != \
+                    expected_reviewer_identity:
+                failures.append(
+                    "P3: the acta's reviewer identity "
+                    f"{acta.get('reviewer_identity')!r} is not the "
+                    "identity fixed by the order")
+            diff_declared = acta.get("diff_sha256")
+            diff_rel = acta.get("diff_path")
+            if not isinstance(diff_declared, str) or \
+                    not _HEX64.match(diff_declared or ""):
+                failures.append("P3: the acta's diff digest is not "
+                                "canonical 64-hex")
+            else:
+                try:
+                    diff_actual = _sha256_descriptor_first(
+                        root, diff_rel)
+                except ArtifactPathError as exc:
+                    failures.append(f"P3: diff: {exc}")
+                    diff_actual = None
+                if diff_actual is not None and \
+                        diff_actual != diff_declared:
+                    failures.append(
+                        "P3: the diff file does not hash to the "
+                        "EXACT digest the sealed acta names")
 
     # -- P4: rollback digest-bound and tested ----------------------
     if not rollback_evidence:
@@ -268,13 +391,18 @@ def evaluate(snapshot: dict, *, expected_account_fingerprint: str,
                 not _HEX64.match(declared or ""):
             failures.append("P4: rollback script digest is not "
                             "canonical 64-hex")
-        elif root is None or not rel or \
-                not (Path(root) / rel).is_file():
+        elif root is None or not rel:
             failures.append("P4: the rollback script is missing — "
                             "the digest hashes nothing")
-        elif _sha256_file(Path(root) / rel) != declared:
-            failures.append("P4: the rollback script does not hash "
-                            "to its declared digest")
+        else:
+            try:
+                actual = _sha256_descriptor_first(root, rel)
+                if actual != declared:
+                    failures.append(
+                        "P4: the rollback script does not hash to "
+                        "its declared digest")
+            except ArtifactPathError as exc:
+                failures.append(f"P4: rollback script: {exc}")
         bound = rollback_evidence.get("backup_manifest_sha256")
         if manifest_seal is None or bound != manifest_seal:
             failures.append(
@@ -316,6 +444,8 @@ def main(argv=None) -> int:
     parser.add_argument("--expected-symbol", required=True)
     parser.add_argument("--expected-terminal-build", required=True,
                         type=int)
+    parser.add_argument("--expected-reviewer-identity",
+                        required=True)
     parser.add_argument("--backup-manifest", required=True,
                         type=Path)
     parser.add_argument("--backup-root", required=True, type=Path)
@@ -332,6 +462,8 @@ def main(argv=None) -> int:
             args.expected_server_fingerprint),
         expected_symbol=args.expected_symbol,
         expected_terminal_build=args.expected_terminal_build,
+        expected_reviewer_identity=(
+            args.expected_reviewer_identity),
         heartbeat=json.loads(args.heartbeat.read_text()),
         backup_manifest=json.loads(
             args.backup_manifest.read_text()),
