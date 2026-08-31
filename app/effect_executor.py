@@ -77,6 +77,16 @@ class PlanStopped(ExecutorError):
     """The plan stopped at a gate; nothing dependent was executed."""
 
 
+class PlanLockHeld(ExecutorError):
+    """Another claimant holds the run lock for this plan. The lock
+    covers the whole reconcile-through-acknowledgement transaction,
+    because per-record exclusivity alone lets two resumes both
+    observe an unacknowledged effect and both issue it."""
+
+
+PLAN_SCHEMA = "lts.effect_executor.plan.v1"
+
+
 # ---------------------------------------------------------------- #
 # durable, digest-chained journal                                   #
 # ---------------------------------------------------------------- #
@@ -232,7 +242,7 @@ class EffectExecutor:
                  port: Any,
                  fresh_orders: Callable[[], VenueDirectEvidence],
                  fresh_positions: Callable[[], VenueDirectEvidence],
-                 outcomes: Callable[[], Mapping[str, str]],
+                 terminal_orders: Callable[[], VenueDirectEvidence],
                  custody: Optional[LiveFlattenCustody] = None,
                  clock: Callable[[], datetime] = lambda:
                  datetime.now(timezone.utc)):
@@ -255,15 +265,44 @@ class EffectExecutor:
         self.port = port
         self.fresh_orders = fresh_orders
         self.fresh_positions = fresh_positions
-        self.outcomes = outcomes
+        self.terminal_orders = terminal_orders
         self.custody = custody
         self.clock = clock
         self.journal = EffectJournal(Path(journal_root) / plan_id)
+
+    # -- the per-plan run lock (E4) --------------------------------
+    def _acquire_run_lock(self):
+        lock = self.journal.root / "run.lock"
+        _refuse_symlink(lock, "run lock")
+        try:
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         FILE_MODE)
+        except FileExistsError as exc:
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: another claimant holds the run "
+                "lock — the reconcile-through-acknowledgement "
+                "transaction is exclusive, and a lock left by a dead "
+                "process is an operator disposition, never an "
+                "automatic takeover") from exc
+        try:
+            os.write(fd, str(os.getpid()).encode())
+            os.fchmod(fd, FILE_MODE)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return lock
+
+    def _release_run_lock(self, lock) -> None:
+        try:
+            os.unlink(lock)
+        except FileNotFoundError:
+            pass
 
     # -- plan persistence ------------------------------------------
     def _persist_plan(self) -> dict:
         plan_path = self.journal.root / "plan.json"
         payload = {
+            "schema": PLAN_SCHEMA,
             "plan_id": self.plan_id,
             "directive_digest": directive_digest(self.directive),
             "directive": self.directive.as_dict(),
@@ -271,10 +310,9 @@ class EffectExecutor:
             "authority_code_identity": self.expected_code_identity,
             "effects": list(self.directive.effects),
         }
-        try:
-            _durable_exclusive(plan_path, payload)
-        except PlanAlreadyClaimed:
-            raise
+        payload["digest"] = _sha(_canonical(
+            {k: v for k, v in payload.items() if k != "digest"}))
+        _durable_exclusive(plan_path, payload)
         return payload
 
     def _read_plan(self) -> dict:
@@ -283,7 +321,18 @@ class EffectExecutor:
         if not plan_path.is_file():
             raise ExecutorError(
                 f"plan {self.plan_id} was never persisted")
-        return json.loads(plan_path.read_text())
+        plan = json.loads(plan_path.read_text())
+        if plan.get("schema") != PLAN_SCHEMA:
+            raise ExecutorError(
+                f"plan {self.plan_id}: schema "
+                f"{plan.get('schema')!r} is not {PLAN_SCHEMA!r}")
+        body = {k: v for k, v in plan.items() if k != "digest"}
+        if plan.get("digest") != _sha(_canonical(body)):
+            raise ExecutorError(
+                f"plan {self.plan_id}: plan digest mismatch — the "
+                "persisted plan was altered and nothing may run "
+                "against it")
+        return plan
 
     # -- gates ------------------------------------------------------
     def _stop(self, reason: str) -> None:
@@ -321,47 +370,95 @@ class EffectExecutor:
         wanted = tuple(self.directive.cancel_order_identities)
         if not wanted:
             return ()
-        try:
-            evidence = self.fresh_orders()
-            evidence.verify(self.policy, now=self.clock())
-        except VenueEvidenceError as exc:
-            self._stop(f"stale or invalid order evidence before "
-                       f"cancellation: {exc}")
+        if len(set(wanted)) != len(wanted):
+            self._stop("duplicate cancellation identities in the "
+                       "directive")
+        # presence is a PRE-CANCELLATION check: an identity whose
+        # cancellation the venue already acknowledged is absent from
+        # the book precisely BECAUSE it was cancelled, and the typed
+        # terminal evidence — not this check — judges its outcome
+        pending = tuple(
+            identity for identity in wanted
+            if self.journal.find("cancel_acknowledged",
+                                 identity) is None)
+        if not pending:
+            return wanted
+        evidence = self._fresh(self.fresh_orders, "open_orders",
+                               what="order evidence before "
+                               "cancellation")
         by_identity = {row["order_identity"]: row
                        for row in evidence.facts.get("orders", ())}
-        for identity in wanted:
+        for identity in pending:
             row = by_identity.get(identity)
-            if row is not None and row.get("role") != "entry":
+            if row is None:
+                self._stop(
+                    f"identity {identity!r} is ABSENT from the fresh "
+                    "order book — cancelling an object the venue does "
+                    "not show is refused, and absence is never a "
+                    "verdict")
+            if row.get("role") != "entry":
                 self._stop(
                     f"identity {identity!r} is {row.get('role')!r} in "
                     "the live order book — a protective identity is "
                     "never submitted for cancellation")
         return wanted
 
+    def _fresh(self, provider, expected_type: str, *, what: str):
+        """Typed, policy-verified, RIGHT-KIND evidence or a stop."""
+        try:
+            evidence = provider()
+        except VenueEvidenceError as exc:
+            self._stop(f"invalid {what}: {exc}")
+        if not isinstance(evidence, VenueDirectEvidence):
+            raise ExecutorError(
+                f"{what} must be VenueDirectEvidence, got "
+                f"{type(evidence).__name__} — a bare mapping is an "
+                "assertion, not evidence")
+        if evidence.evidence_type != expected_type:
+            self._stop(
+                f"{what} carries evidence type "
+                f"{evidence.evidence_type!r}, not "
+                f"{expected_type!r} — the wrong kind of evidence "
+                "proves nothing here")
+        try:
+            evidence.verify(self.policy, now=self.clock())
+        except VenueEvidenceError as exc:
+            self._stop(f"stale or invalid {what}: {exc}")
+        return evidence
+
     # -- execution --------------------------------------------------
     def execute(self) -> dict:
         """Run the plan from the beginning. A second call for the
-        same plan id refuses with PlanAlreadyClaimed: use resume()."""
-        self._persist_plan()
-        self.journal.append_once("planned", payload={
-            "effects": list(self.directive.effects)})
-        return self._run()
+        same plan id refuses with PlanAlreadyClaimed: use resume().
+        The run lock covers the whole transaction."""
+        lock = self._acquire_run_lock()
+        try:
+            self._persist_plan()
+            self.journal.append_once("planned", payload={
+                "effects": list(self.directive.effects)})
+            return self._run()
+        finally:
+            self._release_run_lock(lock)
 
     def resume(self) -> dict:
         """Continue after a crash. Reads the verified chain, never
         re-issues an acknowledged venue call, and never mints a
         sibling custody obligation."""
-        self._read_plan()
-        chain = self.journal.records()
-        if not chain:
-            self.journal.append_once("planned", payload={
-                "effects": list(self.directive.effects)})
-        if self.journal.find("plan_completed") is not None:
-            return {"state": "completed", "resumed": True}
-        stopped = self.journal.find("plan_stopped")
-        if stopped is not None:
-            raise PlanStopped(stopped["payload"]["reason"])
-        return self._run()
+        lock = self._acquire_run_lock()
+        try:
+            self._read_plan()
+            chain = self.journal.records()
+            if not chain:
+                self.journal.append_once("planned", payload={
+                    "effects": list(self.directive.effects)})
+            if self.journal.find("plan_completed") is not None:
+                return {"state": "completed", "resumed": True}
+            stopped = self.journal.find("plan_stopped")
+            if stopped is not None:
+                raise PlanStopped(stopped["payload"]["reason"])
+            return self._run()
+        finally:
+            self._release_run_lock(lock)
 
     def _run(self) -> dict:
         effects = list(self.directive.effects)
@@ -378,9 +475,17 @@ class EffectExecutor:
                         "cancel_acknowledged", key=identity,
                         payload={"ack": dict(ack or {})})
 
-            outcomes = dict(self.outcomes())
-            self.journal.append_once("cancellation_outcomes",
-                                     payload={"outcomes": outcomes})
+            evidence = self._fresh(self.terminal_orders,
+                                   "terminal_orders",
+                                   what="terminal-order evidence")
+            verdicts = dict(evidence.facts.get("verdicts", ()))
+            outcomes = {identity: verdicts[identity]
+                        for identity in identities
+                        if identity in verdicts}
+            self.journal.append_once(
+                "cancellation_outcomes",
+                payload={"outcomes": outcomes,
+                         "provenance": evidence.provenance()})
             verdict = self.directive.permits_dependent_effects(
                 outcomes)
             self.journal.append_once("gate_verdict", payload=verdict)
@@ -428,6 +533,43 @@ class EffectExecutor:
     def _obligation_id(self) -> str:
         return f"flatten-{self.plan_id}"
 
+    def _ordinal(self) -> int:
+        """A durable, MONOTONE executor event ordinal: the length of
+        the verified journal chain at the moment of the transition.
+        The journal only appends, so the ordinal only grows; a
+        constant zero is not live provenance and this is."""
+        return len(self.journal.records())
+
+    def _close_contract(self) -> dict:
+        """E3: the close binds THE position — identity, side, units,
+        reduce-only, and a durable idempotency key derived from the
+        plan. A generic 'close whatever is there' is never issued."""
+        evidence = self._fresh(self.fresh_positions, "positions",
+                               what="position evidence before the "
+                               "close")
+        rows = tuple(evidence.facts.get("positions", ()))
+        if len(rows) != 1:
+            self._stop(
+                f"the close requires exactly ONE open position for "
+                f"{self.policy.symbol!r}; the venue shows {len(rows)} "
+                "— ambiguous exposure is never closed blind")
+        row = rows[0]
+        return {
+            "position_identity": row["position_identity"],
+            "side": row["side"],
+            "units": abs(float(row["signed_quantity"])),
+            "signed_quantity": float(row["signed_quantity"]),
+            "reduce_only": True,
+            "idempotency_key": f"close-{self.plan_id}",
+        }
+
+    def _unresolved(self, kind: str, reason: str,
+                    obligation_id: str) -> dict:
+        self.journal.append_once(kind, key=obligation_id,
+                                 payload={"incident": reason})
+        return {"state": "unresolved",
+                "obligation_id": obligation_id, "incident": reason}
+
     def _run_forced_flatten(self) -> dict:
         if self.custody is None:
             self._stop("a forced flatten requires the accepted live "
@@ -435,50 +577,116 @@ class EffectExecutor:
         self._recheck_identities()
         obligation_id = self._obligation_id()
 
-        # the obligation is opened BEFORE the close is requested, and
-        # its identity derives from the plan, so a resumed plan finds
-        # its own obligation instead of minting a sibling
-        if self.journal.find("custody_opened") is None:
-            try:
-                signed = sum(
-                    float(row["signed_quantity"]) for row in
-                    self.fresh_positions().verify(
-                        self.policy, now=self.clock()
-                    ).facts.get("positions", ()))
-            except VenueEvidenceError as exc:
-                self._stop(f"stale or invalid position evidence "
-                           f"before the close: {exc}")
-            try:
-                self.custody.open(obligation_id,
-                                  signed_exposure=signed,
-                                  requested_at_bar=0)
-            except Exception as exc:
-                # already claimed by a previous run of THIS plan is
-                # idempotent; anything else refuses
-                if "already claimed" not in str(exc):
-                    raise
+        # E5: TYPED custody idempotency — the record is read, never
+        # an exception message matched. The obligation is opened
+        # BEFORE the close is requested, and its identity derives
+        # from the plan, so a resumed plan finds its own obligation
+        # instead of minting a sibling.
+        existing = self.custody.exists(obligation_id)
+        if existing is None:
+            contract = self._close_contract()
+            self.custody.open(
+                obligation_id,
+                signed_exposure=contract["signed_quantity"],
+                requested_at_bar=self._ordinal())
             self.journal.append_once(
-                "custody_opened", key=obligation_id)
+                "custody_opened", key=obligation_id,
+                payload={"close_contract": contract})
+        else:
+            differing = self.custody.binding.matches(existing)
+            if differing:
+                self._stop(
+                    f"the recovered obligation disagrees on "
+                    f"{list(differing)} — this plan may not act on "
+                    "someone else's obligation")
+            self.journal.append_once("custody_opened",
+                                     key=obligation_id)
 
-        # A close, unlike a decision, is reduce-only and its success
-        # is judged solely by direct zero/zero evidence below, so an
-        # unacknowledged request may be re-issued safely.
-        self.journal.append_once("close_requested",
-                                 key=obligation_id)
-        if self.journal.find("close_acknowledged",
-                             obligation_id) is None:
-            ack = self.port.request_close()
+        requested = self.journal.find("close_requested",
+                                      obligation_id)
+        acked = self.journal.find("close_acknowledged",
+                                  obligation_id)
+
+        if acked is None and requested is not None:
+            # E3: an unacknowledged close is RECONCILED first, never
+            # blindly re-issued.
+            positions = self._fresh(
+                self.fresh_positions, "positions",
+                what="position evidence for close reconciliation")
+            rows = tuple(positions.facts.get("positions", ()))
+            if not rows:
+                # already flat: confirmation below decides, and no
+                # second close is ever sent
+                self.journal.append_once("close_reconciled_flat",
+                                         key=obligation_id)
+            else:
+                contract = (requested.get("payload") or {}).get(
+                    "close_contract")
+                if not contract:
+                    return self._unresolved(
+                        "close_unresolved",
+                        "an unacknowledged close has no persisted "
+                        "contract; sameness cannot be verified and it "
+                        "is not re-issued", obligation_id)
+                same = (
+                    len(rows) == 1
+                    and rows[0]["position_identity"] ==
+                    contract["position_identity"]
+                    and rows[0]["side"] == contract["side"]
+                    and abs(abs(float(rows[0]["signed_quantity"]))
+                            - float(contract["units"])) <= 1e-9)
+                if not same:
+                    return self._unresolved(
+                        "close_unresolved",
+                        "the position changed or multiplied since the "
+                        "close was requested — a changed state is "
+                        "never closed by replay", obligation_id)
+                if getattr(self.port, "close_contract", None) != \
+                        "same_key_idempotent_reduce_only":
+                    return self._unresolved(
+                        "close_unresolved",
+                        "the port does not prove same-key idempotent "
+                        "reduce-only close semantics — an "
+                        "unacknowledged close is not re-issued on "
+                        "hope", obligation_id)
+                ack = self.port.request_close(**contract)
+                self.journal.append_once(
+                    "close_acknowledged", key=obligation_id,
+                    payload={"ack": dict(ack or {}),
+                             "reissued_with_same_key": True})
+        elif acked is None:
+            opened = self.journal.find("custody_opened",
+                                       obligation_id)
+            contract = (opened.get("payload") or {}).get(
+                "close_contract") if opened else None
+            if not contract:
+                contract = self._close_contract()
+            self.journal.append_once(
+                "close_requested", key=obligation_id,
+                payload={"close_contract": contract})
+            ack = self.port.request_close(**contract)
             self.journal.append_once(
                 "close_acknowledged", key=obligation_id,
                 payload={"ack": dict(ack or {})})
-        try:
-            self.custody.mark_in_flight(obligation_id, bar_index=0)
-        except Exception as exc:
-            if "already terminal" in str(exc):
-                pass
-            elif "cannot go in flight" not in str(exc) and \
-                    "flatten_in_flight" not in str(exc):
-                raise
+
+        # typed in-flight transition (E5)
+        record = self.custody.exists(obligation_id)
+        if record is None:
+            self._stop(f"obligation {obligation_id} vanished from "
+                       "custody")
+        state = record["state"]
+        if state == "flatten_requested":
+            self.custody.mark_in_flight(obligation_id,
+                                        bar_index=self._ordinal())
+        elif state == "flatten_in_flight":
+            pass
+        elif state == "flatten_confirmed":
+            self.journal.append_once("plan_completed")
+            return {"state": "completed",
+                    "obligation_id": obligation_id}
+        else:
+            self._stop(f"obligation {obligation_id} is terminal in "
+                       f"state {state!r} and claims no closure")
 
         # confirmation: ONLY fresh direct zero/zero evidence
         try:
@@ -486,14 +694,12 @@ class EffectExecutor:
             orders = self.fresh_orders()
             record = self.custody.confirm_with_direct_evidence(
                 obligation_id, positions=positions, orders=orders,
-                policy=self.policy, now=self.clock(), bar_index=0)
+                policy=self.policy, now=self.clock(),
+                bar_index=self._ordinal())
         except (LiveCustodyError, VenueEvidenceError) as exc:
-            self.journal.append_once(
+            return self._unresolved(
                 "flatten_unresolved",
-                payload={"incident": f"{type(exc).__name__}: {exc}"})
-            return {"state": "unresolved",
-                    "obligation_id": obligation_id,
-                    "incident": str(exc)}
+                f"{type(exc).__name__}: {exc}", obligation_id)
         self.journal.append_once("flatten_confirmed",
                                  key=obligation_id,
                                  payload={"reconciliation":

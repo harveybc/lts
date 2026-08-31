@@ -17,7 +17,7 @@ import pytest
 
 from app.effect_executor import (
     EffectExecutor, EffectJournal, ExecutorError, PlanAlreadyClaimed,
-    PlanStopped, directive_digest)
+    PlanLockHeld, PlanStopped, directive_digest)
 from app.live_flatten_custody import (
     LiveFlattenCustody, VenueObligationBinding)
 from app.session_authority_adapter import (
@@ -81,13 +81,19 @@ class FakePort:
         self.submit_calls.append(command)
         return {"acknowledged": command}
 
-    def request_close(self):
+    # E3: the port DECLARES its close semantics; without this a
+    # reissue of an unacknowledged close is refused
+    close_contract = "same_key_idempotent_reduce_only"
+
+    def request_close(self, **contract):
         if self.raise_on_close is not None:
-            raise self.raise_on_close
-        self.close_calls.append("close")
+            exc, self.raise_on_close = self.raise_on_close, None
+            raise exc
+        self.close_calls.append(dict(contract))
         if self.world is not None:
             self.world["flat"] = True       # the close changes reality
-        return {"acknowledged": "close"}
+        return {"acknowledged": contract.get("idempotency_key",
+                                             "close")}
 
 
 def book(extra_protective=True):
@@ -146,14 +152,38 @@ def make_executor(authority, tmp_path, directive, port, *,
             if evidence_fn is evidence else evidence_fn(
                 "positions", payload)
 
-    def outcomes():
+    _ALPACA_STATUS = {"cancelled": "canceled",
+                      "filled_before_cancel": "filled",
+                      "rejected": "rejected", "replaced": "replaced",
+                      "failed": "failed"}
+    _MT5_STATE = {"cancelled": "ORDER_STATE_CANCELED",
+                  "filled_before_cancel": "ORDER_STATE_FILLED",
+                  "rejected": "ORDER_STATE_REJECTED"}
+
+    def terminal_orders():
         if world.get("outcomes_raise") is not None:
             exc = world.pop("outcomes_raise")
             raise exc
-        if outcome_map is not None:
-            return dict(outcome_map)
-        return {identity: "cancelled"
-                for identity in directive.cancel_order_identities}
+        if world.get("terminal_override") is not None:
+            return world["terminal_override"]()
+        mapping = (dict(outcome_map) if outcome_map is not None
+                   else {identity: "cancelled" for identity in
+                         directive.cancel_order_identities})
+        rows = []
+        for identity, verdict in mapping.items():
+            if verdict in ("still_open", "gone_without_verdict",
+                           None):
+                continue        # absence is never a terminal verdict
+            if directive.venue == "mt5_demo":
+                rows.append({"ticket": identity, "symbol": "USDCAD",
+                             "state": _MT5_STATE[verdict]})
+            else:
+                rows.append({"id": identity, "symbol": "SPY",
+                             "status": _ALPACA_STATUS[verdict]})
+        payload = {"observed_at": OBSERVED, "orders": rows}
+        return evidence_fn(directive.venue, "terminal_orders",
+                           payload) if evidence_fn is evidence \
+            else evidence_fn("terminal_orders", payload)
 
     return EffectExecutor(
         journal_root=tmp_path / "journal", plan_id=plan_id,
@@ -161,7 +191,8 @@ def make_executor(authority, tmp_path, directive, port, *,
         authority_root=AUTHORITY_ROOT,
         expected_code_identity=reviewed_identity(),
         port=port, fresh_orders=fresh_orders,
-        fresh_positions=fresh_positions, outcomes=outcomes,
+        fresh_positions=fresh_positions,
+        terminal_orders=terminal_orders,
         custody=custody, clock=lambda: NOW)
 
 
@@ -425,8 +456,8 @@ class TestCrashAndRestart:
         # the close is acknowledged, then the confirmation read crashes
         real_close = port.request_close
 
-        def close_then_poison():
-            ack = real_close()
+        def close_then_poison(**contract):
+            ack = real_close(**contract)
             world["positions_raise"] = RuntimeError(
                 "crash before confirmation")
             return ack
@@ -435,14 +466,14 @@ class TestCrashAndRestart:
         with pytest.raises(RuntimeError,
                            match="crash before confirmation"):
             executor.execute()
-        assert port.close_calls == ["close"]
+        assert len(port.close_calls) == 1
 
         port.request_close = real_close
         resumed = make_executor(authority, tmp_path, directive, port,
                                 world=world, custody=custody)
         outcome = resumed.resume()
         assert outcome["state"] == "completed"
-        assert port.close_calls == ["close"], (
+        assert len(port.close_calls) == 1, (
             "an acknowledged close is not re-requested")
         record = custody.read(outcome["obligation_id"])
         assert record["state"] == "flatten_confirmed"
@@ -554,7 +585,7 @@ class TestSingleEffectElection:
             try:
                 executor.execute()
                 results[index] = "won"
-            except PlanAlreadyClaimed:
+            except (PlanAlreadyClaimed, PlanLockHeld):
                 results[index] = "refused"
 
         threads = [threading.Thread(target=contend, args=(i,))
@@ -668,3 +699,571 @@ class TestNoWriteEndToEnd:
         for name in ("cancel_order", "submit_decision",
                      "request_close"):
             assert callable(getattr(port, name))
+
+
+# ================================================================== #
+# E1-E5: authority and recovery boundaries                           #
+# ================================================================== #
+
+class TestE1AbsentIdentityNeverReachesThePort:
+
+    def test_an_absent_identity_stops_before_any_port_call(
+            self, authority, tmp_path):
+        """FROZEN COUNTEREXAMPLE. An identity absent from the fresh
+        order book was returned as verified, submitted to
+        cancel_order, and a forged outcome released the gate."""
+        ghost = VenueDirective(
+            venue="alpaca_paper", account_fingerprint=ALPACA_FP,
+            symbol="SPY", session_state="WIND_DOWN",
+            raw_model_output=0.0, mapped_command=0,
+            mapped_action={"kind": "hold", "risk_increasing": False},
+            overlay="pass_through", final_command=0,
+            effects=("cancel_pending_entries", "submit_decision"),
+            cancel_order_identities=("ghost-order-id",),
+            blocks_risk_increase=False,
+            requires_direct_confirmation=False,
+            preserve_protection=True, reason="adversary",
+            evidence_provenance={"venue_direct": True})
+        port = FakePort()
+        executor = make_executor(
+            authority, tmp_path, ghost, port,
+            outcome_map={"ghost-order-id": "cancelled"})
+        with pytest.raises(PlanStopped, match="ABSENT"):
+            executor.execute()
+        assert port.cancel_calls == []
+        assert port.submit_calls == []
+
+    def test_duplicate_identities_stop(self, authority, tmp_path):
+        twice = VenueDirective(
+            venue="alpaca_paper", account_fingerprint=ALPACA_FP,
+            symbol="SPY", session_state="WIND_DOWN",
+            raw_model_output=0.0, mapped_command=0,
+            mapped_action={"kind": "hold", "risk_increasing": False},
+            overlay="pass_through", final_command=0,
+            effects=("cancel_pending_entries", "submit_decision"),
+            cancel_order_identities=("parent-order-id",
+                                     "parent-order-id"),
+            blocks_risk_increase=False,
+            requires_direct_confirmation=False,
+            preserve_protection=True, reason="adversary",
+            evidence_provenance={"venue_direct": True})
+        port = FakePort()
+        with pytest.raises(PlanStopped, match="duplicate"):
+            make_executor(authority, tmp_path, twice, port).execute()
+        assert port.cancel_calls == []
+
+    def test_the_wrong_evidence_type_stops(self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        world = {"flat": False}
+        executor = make_executor(authority, tmp_path, directive, port,
+                                 world=world)
+        executor.fresh_orders = lambda: evidence(
+            "alpaca_paper", "positions", ALPACA_POSITIONS)
+        with pytest.raises(PlanStopped,
+                           match="wrong kind of evidence"):
+            executor.execute()
+        assert port.cancel_calls == []
+
+
+class TestE2TypedTerminalEvidence:
+
+    def test_a_bare_mapping_can_no_longer_release_the_gate(
+            self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        executor = make_executor(authority, tmp_path, directive, port)
+        executor.terminal_orders = lambda: {
+            "parent-order-id": "cancelled"}
+        with pytest.raises(ExecutorError, match="bare mapping"):
+            executor.execute()
+        assert port.submit_calls == []
+
+    def test_a_non_terminal_status_is_refused_by_the_parser(
+            self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        world = {"flat": False,
+                 "terminal_override": lambda: evidence(
+                     "alpaca_paper", "terminal_orders",
+                     {"observed_at": OBSERVED,
+                      "orders": [{"id": "parent-order-id",
+                                  "symbol": "SPY",
+                                  "status": "new"}]})}
+        executor = make_executor(authority, tmp_path, directive, port,
+                                 world=world)
+        with pytest.raises(PlanStopped, match="not a TERMINAL"):
+            executor.execute()
+        assert port.submit_calls == []
+
+    def test_open_orders_evidence_cannot_stand_in_for_verdicts(
+            self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        world = {"flat": False,
+                 "terminal_override": lambda: evidence(
+                     "alpaca_paper", "open_orders", book())}
+        executor = make_executor(authority, tmp_path, directive, port,
+                                 world=world)
+        with pytest.raises(PlanStopped,
+                           match="wrong kind of evidence"):
+            executor.execute()
+        assert port.submit_calls == []
+
+    def test_stale_terminal_evidence_stops(self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        stale = (NOW - timedelta(days=2)).isoformat()
+        world = {"flat": False,
+                 "terminal_override": lambda: evidence(
+                     "alpaca_paper", "terminal_orders",
+                     {"observed_at": stale,
+                      "orders": [{"id": "parent-order-id",
+                                  "symbol": "SPY",
+                                  "status": "canceled"}]})}
+        executor = make_executor(authority, tmp_path, directive, port,
+                                 world=world)
+        with pytest.raises(PlanStopped, match="stale"):
+            executor.execute()
+        assert port.submit_calls == []
+
+    def test_the_gate_journal_carries_the_evidence_provenance(
+            self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        executor = make_executor(authority, tmp_path, directive, port)
+        executor.execute()
+        record = executor.journal.find("cancellation_outcomes")
+        provenance = record["payload"]["provenance"]
+        assert provenance["evidence_type"] == "terminal_orders"
+        assert provenance["venue_direct"] is True
+        assert len(provenance["raw_sha256"]) == 64
+        assert len(provenance["parser_digest"]) == 32
+
+
+class TestE3CloseContractAndReconcileFirst:
+
+    def _crashed_close(self, authority, tmp_path, *, plan_id):
+        directive = alpaca_directive(authority,
+                                     state="FORCED_FLATTEN",
+                                     command=1)
+        custody = alpaca_custody(authority, tmp_path)
+        world = {"flat": False}
+        port = FakePort(world=world)
+        port.raise_on_close = RuntimeError("crash mid-close")
+        executor = make_executor(authority, tmp_path, directive, port,
+                                 plan_id=plan_id, world=world,
+                                 custody=custody)
+        with pytest.raises(RuntimeError, match="crash mid-close"):
+            executor.execute()
+        assert port.close_calls == []
+        return directive, custody, world, port
+
+    def test_the_close_binds_the_exact_position(self, authority,
+                                                tmp_path):
+        directive = alpaca_directive(authority,
+                                     state="FORCED_FLATTEN",
+                                     command=1)
+        custody = alpaca_custody(authority, tmp_path)
+        world = {"flat": False}
+        port = FakePort(world=world)
+        make_executor(authority, tmp_path, directive, port,
+                      world=world, custody=custody).execute()
+        contract = port.close_calls[0]
+        assert contract["position_identity"] == \
+            "sanitized-asset-uuid"
+        assert contract["side"] == "long"
+        assert contract["units"] == 10.0
+        assert contract["reduce_only"] is True
+        assert contract["idempotency_key"] == "close-plan-1"
+
+    def test_a_changed_position_is_never_closed_by_replay(
+            self, authority, tmp_path):
+        directive, custody, world, port = self._crashed_close(
+            authority, tmp_path, plan_id="plan-changed")
+        changed = json.loads(json.dumps(ALPACA_POSITIONS))
+        changed["positions"][0]["qty"] = "20"
+        resumed = make_executor(authority, tmp_path, directive, port,
+                                plan_id="plan-changed", world=world,
+                                custody=custody,
+                                positions_payload=changed)
+        outcome = resumed.resume()
+        assert outcome["state"] == "unresolved"
+        assert "changed" in outcome["incident"]
+        assert port.close_calls == []
+
+    def test_the_same_position_reissues_with_the_same_key(
+            self, authority, tmp_path):
+        directive, custody, world, port = self._crashed_close(
+            authority, tmp_path, plan_id="plan-same")
+        resumed = make_executor(authority, tmp_path, directive, port,
+                                plan_id="plan-same", world=world,
+                                custody=custody)
+        outcome = resumed.resume()
+        assert outcome["state"] == "completed"
+        assert len(port.close_calls) == 1
+        assert port.close_calls[0]["idempotency_key"] == \
+            "close-plan-same"
+        ack = resumed.journal.find("close_acknowledged")
+        assert ack["payload"]["reissued_with_same_key"] is True
+
+    def test_a_port_without_the_contract_never_reissues(
+            self, authority, tmp_path):
+        directive, custody, world, port = self._crashed_close(
+            authority, tmp_path, plan_id="plan-noc")
+
+        class NoContractPort(FakePort):
+            close_contract = None
+
+        blind = NoContractPort(world=world)
+        resumed = make_executor(authority, tmp_path, directive, blind,
+                                plan_id="plan-noc", world=world,
+                                custody=custody)
+        outcome = resumed.resume()
+        assert outcome["state"] == "unresolved"
+        assert "does not prove same-key" in outcome["incident"]
+        assert blind.close_calls == []
+
+    def test_reconciled_flat_confirms_without_reissue(self, authority,
+                                                      tmp_path):
+        directive, custody, world, port = self._crashed_close(
+            authority, tmp_path, plan_id="plan-flat")
+        world["flat"] = True        # the first close DID land
+        resumed = make_executor(authority, tmp_path, directive, port,
+                                plan_id="plan-flat", world=world,
+                                custody=custody)
+        outcome = resumed.resume()
+        assert outcome["state"] == "completed"
+        assert port.close_calls == [], (
+            "flat evidence confirms without a second close")
+
+    def test_multiple_positions_are_never_closed_blind(self,
+                                                       authority,
+                                                       tmp_path):
+        two = json.loads(json.dumps(ALPACA_POSITIONS))
+        two["positions"].append({**two["positions"][0],
+                                 "asset_id": "second-asset"})
+        directive = alpaca_directive(authority,
+                                     state="FORCED_FLATTEN",
+                                     command=1,
+                                     positions_payload=two)
+        custody = alpaca_custody(authority, tmp_path)
+        port = FakePort()
+        executor = make_executor(authority, tmp_path, directive, port,
+                                 positions_payload=two,
+                                 custody=custody)
+        with pytest.raises(PlanStopped, match="exactly ONE"):
+            executor.execute()
+        assert port.close_calls == []
+
+
+class TestE4RunLock:
+
+    def test_a_held_lock_refuses_and_the_port_is_untouched(
+            self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        executor = make_executor(authority, tmp_path, directive, port)
+        (executor.journal.root / "run.lock").write_text("4242")
+        with pytest.raises(PlanLockHeld, match="operator disposition"):
+            executor.execute()
+        with pytest.raises(PlanLockHeld):
+            executor.resume()
+        assert port.cancel_calls == []
+        assert port.submit_calls == []
+
+    def test_the_lock_is_released_on_success_and_on_stop(
+            self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.execute()
+        assert not (executor.journal.root / "run.lock").exists()
+        stopping = make_executor(
+            authority, tmp_path, alpaca_directive(authority),
+            FakePort(), plan_id="plan-stop",
+            outcome_map={"parent-order-id": "rejected"})
+        with pytest.raises(PlanStopped):
+            stopping.execute()
+        assert not (stopping.journal.root / "run.lock").exists()
+
+    def test_concurrent_resume_of_an_unacknowledged_close_is_single(
+            self, authority, tmp_path):
+        """FROZEN COUNTEREXAMPLE. Two concurrent resumes both saw
+        close_requested without close_acknowledged and BOTH called the
+        port: the journal refused the second acknowledgement, but the
+        venue had already received two closes."""
+        directive = alpaca_directive(authority,
+                                     state="FORCED_FLATTEN",
+                                     command=1)
+        custody = alpaca_custody(authority, tmp_path)
+        world = {"flat": False}
+        crash = FakePort(world=world)
+        crash.raise_on_close = RuntimeError("crash")
+        first = make_executor(authority, tmp_path, directive, crash,
+                              world=world, custody=custody)
+        with pytest.raises(RuntimeError):
+            first.execute()
+
+        barrier = threading.Barrier(2)
+        results = [None, None]
+        ports = [FakePort(world=world), FakePort(world=world)]
+
+        def contend(index):
+            executor = make_executor(authority, tmp_path, directive,
+                                     ports[index], world=world,
+                                     custody=custody)
+            barrier.wait(timeout=30)
+            try:
+                executor.resume()
+                results[index] = "ran"
+            except (PlanLockHeld, PlanAlreadyClaimed):
+                results[index] = "refused"
+
+        threads = [threading.Thread(target=contend, args=(i,))
+                   for i in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        total = sum(len(p.close_calls) for p in ports)
+        assert total <= 1, (results, total)
+        assert "refused" in results, results
+
+
+class TestE5PlanEnvelopeAndOrdinals:
+
+    @pytest.mark.parametrize("field,value", [
+        ("effects", ["FORGED"]),
+        ("directive_digest", "0" * 64),
+        ("evidence_policy_digest", "1" * 64),
+        ("authority_code_identity", "2" * 64),
+        ("plan_id", "someone-else"),
+        ("schema", "lts.other.v9")])
+    def test_a_tampered_plan_field_refuses(self, authority, tmp_path,
+                                           field, value):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.execute()
+        plan_path = executor.journal.root / "plan.json"
+        plan = json.loads(plan_path.read_text())
+        plan[field] = value
+        plan_path.write_text(json.dumps(plan))
+        resumed = make_executor(authority, tmp_path, directive,
+                                FakePort())
+        with pytest.raises(ExecutorError,
+                           match="digest mismatch|schema"):
+            resumed.resume()
+
+    def test_a_reforged_plan_digest_still_fails_the_recheck(
+            self, authority, tmp_path):
+        """A self-consistent forgery passes the envelope but the
+        directive recheck compares against the LIVE directive."""
+        import app.effect_executor as mod
+        directive = alpaca_directive(authority)
+        crash = FakePort()
+        crash.raise_on_submit = RuntimeError("crash before done")
+        executor = make_executor(authority, tmp_path, directive,
+                                 crash)
+        with pytest.raises(RuntimeError):
+            executor.execute()
+        plan_path = executor.journal.root / "plan.json"
+        plan = json.loads(plan_path.read_text())
+        plan["directive_digest"] = "0" * 64
+        body = {k: v for k, v in plan.items() if k != "digest"}
+        plan["digest"] = mod._sha(mod._canonical(body))
+        plan_path.write_text(json.dumps(plan))
+        resumed = make_executor(authority, tmp_path, directive,
+                                FakePort())
+        with pytest.raises(PlanStopped,
+                           match="directive identity changed"):
+            resumed.resume()
+
+    def test_no_exception_text_matching_remains(self):
+        source = Path(
+            __import__("app.effect_executor",
+                       fromlist=["x"]).__file__).read_text()
+        assert "in str(exc)" not in source
+
+    def test_custody_transitions_carry_a_monotone_ordinal(
+            self, authority, tmp_path):
+        directive = alpaca_directive(authority,
+                                     state="FORCED_FLATTEN",
+                                     command=1)
+        custody = alpaca_custody(authority, tmp_path)
+        world = {"flat": False}
+        port = FakePort(world=world)
+        executor = make_executor(authority, tmp_path, directive, port,
+                                 world=world, custody=custody)
+        outcome = executor.execute()
+        record = custody.read(outcome["obligation_id"])
+        assert record["requested_at_bar"] >= 1, (
+            "constant zero is not live provenance")
+        assert record["confirmed_at_bar"] > \
+            record["requested_at_bar"], (
+            "the ordinal is monotone across the transitions")
+
+
+# ================================================================== #
+# E4: two REAL processes at each unacknowledged boundary             #
+# ================================================================== #
+
+_PROCESS_CONTENDER = r'''
+import json, os, sys, time
+sys.path.insert(0, {repo!r})
+sys.path.insert(0, {repo!r} + "/tests")
+from unit.test_wp3_effect_executor import (FakePort, alpaca_custody,
+                                           alpaca_directive,
+                                           make_executor)
+from unit.test_wp3_session_adapter import (AUTHORITY_ROOT,
+                                           reviewed_identity)
+from app.session_authority_adapter import load_authority
+from app.effect_executor import (PlanAlreadyClaimed, PlanLockHeld,
+                                 PlanStopped)
+from pathlib import Path
+
+journal_root, boundary, marker_dir, barrier, ready = sys.argv[1:6]
+authority = load_authority(AUTHORITY_ROOT,
+                           expected_code_identity=reviewed_identity())
+
+
+class MarkerPort(FakePort):
+    def _mark(self, kind):
+        n = 0
+        while True:
+            try:
+                fd = os.open(Path(marker_dir) /
+                             f"{{kind}}-{{os.getpid()}}-{{n}}",
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                os.close(fd)
+                return
+            except FileExistsError:
+                n += 1
+
+    def cancel_order(self, identity):
+        self._mark("cancel")
+        return super().cancel_order(identity)
+
+    def submit_decision(self, command):
+        self._mark("submit")
+        return super().submit_decision(command)
+
+    def request_close(self, **contract):
+        self._mark("close")
+        return super().request_close(**contract)
+
+
+# journal_root is <tmp>/journal/<plan-id>; the builders expect <tmp>
+tmp = Path(journal_root).parents[1]
+world = {{"flat": False}}
+if boundary == "close":
+    directive = alpaca_directive(authority, state="FORCED_FLATTEN",
+                                 command=1)
+    custody = alpaca_custody(authority, tmp)
+else:
+    directive = alpaca_directive(authority)
+    custody = None
+port = MarkerPort(world=world)
+executor = make_executor(authority, tmp, directive, port,
+                         world=world, custody=custody)
+
+Path(ready).write_text("ready")
+while not Path(barrier).exists():
+    time.sleep(0.001)
+try:
+    outcome = executor.resume()
+    print(json.dumps({{"result": outcome.get("state")}}))
+except (PlanLockHeld, PlanAlreadyClaimed) as exc:
+    print(json.dumps({{"result": "refused",
+                      "kind": type(exc).__name__}}))
+except PlanStopped as exc:
+    print(json.dumps({{"result": "stopped", "reason": str(exc)[:80]}}))
+'''
+
+
+class TestE4TwoRealProcesses:
+
+    def _crash_at(self, authority, tmp_path, boundary):
+        if boundary == "close":
+            directive = alpaca_directive(authority,
+                                         state="FORCED_FLATTEN",
+                                         command=1)
+            custody = alpaca_custody(authority, tmp_path)
+        else:
+            directive = alpaca_directive(authority)
+            custody = None
+        world = {"flat": False}
+        port = FakePort(world=world)
+        if boundary == "submit":
+            port.raise_on_submit = RuntimeError("crash")
+        elif boundary == "cancel":
+            port.raise_on_cancel = RuntimeError("crash")
+        else:
+            port.raise_on_close = RuntimeError("crash")
+        executor = make_executor(authority, tmp_path, directive, port,
+                                 world=world, custody=custody)
+        with pytest.raises(RuntimeError):
+            executor.execute()
+        return executor.journal.root
+
+    @pytest.mark.parametrize("boundary,expected_effects", [
+        # ambiguous submit window: NEVER re-issued, nothing else runs
+        ("submit", {}),
+        # reduce-only cancel: the ONE winner re-issues it once and
+        # then legitimately completes the plan with one decision
+        ("cancel", {"cancel": 1, "submit": 1}),
+        # same position, same key: one close, and the winner confirms
+        ("close", {"close": 1}),
+    ])
+    def test_two_processes_resume_one_effect_at_most(
+            self, authority, tmp_path, boundary, expected_effects):
+        import subprocess
+        import sys as _sys
+        import time as _time
+        journal_root = self._crash_at(authority, tmp_path, boundary)
+        marker_dir = tmp_path / f"markers_{boundary}"
+        marker_dir.mkdir()
+        barrier = tmp_path / f"GO_{boundary}"
+        repo = str(Path(__file__).resolve().parents[2])
+        procs = []
+        for index in (0, 1):
+            ready = tmp_path / f"ready_{boundary}_{index}"
+            procs.append((subprocess.Popen(
+                [_sys.executable, "-c",
+                 _PROCESS_CONTENDER.format(repo=repo),
+                 str(journal_root), boundary, str(marker_dir),
+                 str(barrier), str(ready)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True), ready))
+        try:
+            waited = 0.0
+            while waited < 90.0 and not all(
+                    ready.exists() for _p, ready in procs):
+                _time.sleep(0.02)
+                waited += 0.02
+            assert waited < 90.0, "children never became ready"
+            barrier.write_text("go")
+            outputs = [p.communicate(timeout=180) for p, _r in procs]
+        finally:
+            for p, _r in procs:
+                if p.poll() is None:
+                    p.kill()
+        results = []
+        for out, err in outputs:
+            assert out.strip(), err[-2000:]
+            results.append(json.loads(out.strip().splitlines()[-1]))
+        markers = [m.name for m in marker_dir.iterdir()]
+        by_kind = {}
+        pids = set()
+        for name in markers:
+            kind, pid, _n = name.split("-")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            pids.add(pid)
+        assert by_kind == expected_effects, (boundary, results,
+                                             markers)
+        assert len(pids) <= 1, (
+            f"effects came from more than one process: {markers}")
+        assert "refused" in [r["result"] for r in results], (
+            "the lock must have refused exactly one claimant",
+            results)

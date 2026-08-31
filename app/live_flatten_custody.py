@@ -307,3 +307,17 @@ class LiveFlattenCustody:
 
     def read(self, obligation_id: str) -> dict:
         return self._store.read(obligation_id)
+
+    def exists(self, obligation_id: str):
+        """The record, or None when no such obligation exists — a
+        TYPED distinction, so a caller never matches exception text.
+        Integrity failures still raise: an unreadable record is not
+        the same fact as an absent one."""
+        try:
+            return self._store.read(obligation_id)
+        except self._custody.FlattenIntegrityError:
+            raise
+        except self._custody.FlattenObligationError as exc:
+            if "no such obligation" in str(exc):
+                return None
+            raise

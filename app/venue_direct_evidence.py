@@ -48,7 +48,8 @@ SCHEMA_VERSION = "lts.venue_direct_evidence.v1"
 
 VENUES = ("alpaca_paper", "mt5_demo")
 EVIDENCE_TYPES = ("account_session", "positions", "open_orders",
-                  "native_protection", "market_clock")
+                  "native_protection", "market_clock",
+                  "terminal_orders")
 ORDER_ROLES = ("entry", "protective_stop", "protective_take_profit",
                "close")
 SIDES = ("long", "short", "flat")
@@ -607,6 +608,86 @@ def _parse_alpaca_open_orders_v1(payload: Any) -> dict:
                 payload["observed_at"]).isoformat()}
 
 
+# E2: TERMINAL verdicts are their own evidence type, derived from
+# original venue bytes like everything else. A bare string can no
+# longer release the cancellation gate, and ABSENCE from an
+# open-order list is never a terminal verdict: only a status the
+# venue itself declares terminal produces one.
+_ALPACA_TERMINAL_STATUS_VERDICT = {
+    "canceled": "cancelled",
+    "expired": "cancelled",
+    "filled": "filled_before_cancel",
+    "rejected": "rejected",
+    "replaced": "replaced",
+    "failed": "failed",
+}
+_MT5_TERMINAL_STATE_VERDICT = {
+    "ORDER_STATE_CANCELED": "cancelled",
+    "ORDER_STATE_EXPIRED": "cancelled",
+    "ORDER_STATE_FILLED": "filled_before_cancel",
+    "ORDER_STATE_REJECTED": "rejected",
+}
+
+
+def _parse_terminal_rows(payload: Any, *, what: str,
+                         identity_field: str, status_field: str,
+                         verdict_map: Mapping[str, str]) -> dict:
+    if not isinstance(payload, dict):
+        raise VenueEvidenceError(f"{what} must be an object")
+    require_fields(what, payload, ("orders", "observed_at"))
+    rows = payload["orders"]
+    if not isinstance(rows, list):
+        raise VenueEvidenceError(f"{what}: orders must be a list")
+    verdicts: dict = {}
+    symbols = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise VenueEvidenceError(f"{what}[{index}] not an object")
+        require_fields(f"{what}[{index}]", row,
+                       (identity_field, "symbol", status_field))
+        identity = require_text(f"{what}[{index}].{identity_field}",
+                                row[identity_field])
+        if identity in verdicts:
+            raise VenueEvidenceError(
+                f"{what}: identity {identity!r} appears twice — "
+                "duplicate identities refuse")
+        status = require_text(f"{what}[{index}].{status_field}",
+                              row[status_field])
+        verdict = verdict_map.get(status)
+        if verdict is None:
+            raise VenueEvidenceError(
+                f"{what}[{index}]: status {status!r} is not a "
+                "TERMINAL status this parser models — a non-terminal "
+                "or unknown status can never be a verdict")
+        verdicts[identity] = verdict
+        symbols.add(require_text(f"{what}[{index}].symbol",
+                                 row["symbol"]))
+    return {"verdicts": tuple(sorted(verdicts.items())),
+            "orders_total": len(verdicts),
+            "internal_symbols": tuple(sorted(symbols)),
+            "observed_at": require_utc(
+                f"{what}.observed_at",
+                payload["observed_at"]).isoformat()}
+
+
+def _parse_alpaca_terminal_orders_v1(payload: Any) -> dict:
+    """Alpaca terminal order verdicts, e.g. ``GET /v2/orders/{id}``
+    per identity: the venue's own terminal ``status`` decides."""
+    return _parse_terminal_rows(
+        payload, what="alpaca.terminal_orders", identity_field="id",
+        status_field="status",
+        verdict_map=_ALPACA_TERMINAL_STATUS_VERDICT)
+
+
+def _parse_mt5_terminal_orders_v1(payload: Any) -> dict:
+    """MT5 terminal order verdicts, from the EA's history rows: the
+    venue's own terminal ``state`` decides."""
+    return _parse_terminal_rows(
+        payload, what="mt5.terminal_orders", identity_field="ticket",
+        status_field="state",
+        verdict_map=_MT5_TERMINAL_STATE_VERDICT)
+
+
 def _parse_mt5_account_session_v1(payload: Any) -> dict:
     """MT5 heartbeat, as the EA emits it. Numbers are JSON numbers."""
     if not isinstance(payload, dict):
@@ -835,6 +916,10 @@ PARSERS: Mapping[tuple, Callable] = MappingProxyType({
     ("mt5_demo", "positions", "v1"): _parse_mt5_positions_v1,
     ("mt5_demo", "open_orders", "v1"): _parse_mt5_open_orders_v1,
     ("mt5_demo", "market_clock", "v1"): _parse_mt5_market_clock_v1,
+    ("alpaca_paper", "terminal_orders", "v1"):
+        _parse_alpaca_terminal_orders_v1,
+    ("mt5_demo", "terminal_orders", "v1"):
+        _parse_mt5_terminal_orders_v1,
 })
 
 
@@ -869,6 +954,10 @@ SEALED_PARSER_IDENTITIES: Mapping[tuple, str] = MappingProxyType({
         "34e0be893f2e43eac00a06b6a50a3301",
     ("mt5_demo", "market_clock", "v1"):
         "a2da56287687f89dda0c144710511b82",
+    ("alpaca_paper", "terminal_orders", "v1"):
+        "9d5d44929add9a486cc967310e3a2c6d",
+    ("mt5_demo", "terminal_orders", "v1"):
+        "429cd563b1efcc6ab6994bd05e9471ed",
 })
 
 
