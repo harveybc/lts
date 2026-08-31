@@ -1514,8 +1514,42 @@ class ReceiptLedger:
                 pass
         return lock, epoch
 
+    def _validate_held_handle(self, lock: Path, epoch: str,
+                              route: str) -> None:
+        """WP4.0: the internal handle is validated BEFORE the release
+        intent is written. The epoch must be canonical, the lock must
+        be the protocol's own file, and its descriptor-verified
+        content must prove THIS process holds it under THIS epoch —
+        a malformed handle refuses without writing anything."""
+        if not isinstance(epoch, str) or \
+                not re.fullmatch(r"[0-9a-f]{32}", epoch):
+            raise ReceiptLedgerError(
+                f"route {route!r}: malformed release handle — epoch "
+                f"{epoch!r} is not a canonical 32-hex token; nothing "
+                "was written")
+        lock = Path(lock)
+        if lock.name != "register.lock":
+            raise ReceiptLedgerError(
+                f"route {route!r}: malformed release handle — "
+                f"{lock.name!r} is not the register lock; nothing "
+                "was written")
+        expected = f"held:{os.getpid()}:{epoch}".encode()
+        try:
+            content = secure_read_bytes(lock, what="register lock")
+        except Exception as exc:
+            raise ReceiptLedgerError(
+                f"route {route!r}: the lock could not be verified "
+                f"for release ({exc}) — nothing was written") from exc
+        if content != expected:
+            raise ReceiptLedgerError(
+                f"route {route!r}: this process does not hold the "
+                f"lock under epoch {epoch} (lock reads "
+                f"{content[:60]!r}) — release refused before any "
+                "intent was written")
+
     def _release_lock(self, lock: Path, epoch: str,
                       route: str) -> None:
+        self._validate_held_handle(lock, epoch, route)
         try:
             holder = os.getpid()
             intent, intent_bytes = seal_json({

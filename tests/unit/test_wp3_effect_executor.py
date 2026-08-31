@@ -3253,3 +3253,123 @@ class TestE15ReleaseIntentBinding:
         assert completion["holder_pid"] == intent_obj["holder_pid"]
         assert second.resume() == {"state": "completed",
                                    "resumed": True}
+
+
+# ================================================================== #
+# WP4.0: held-lock handle validation before release intent           #
+# ================================================================== #
+
+class TestWP40HandleValidation:
+    """WP4.0 FROZEN: the release paths unpacked the internal handle
+    blindly — a release of a lock held by pid 99999 wrote its intent,
+    moved the lock and wrote a completion, and garbage epochs (int,
+    wrong length, uppercase) landed in release-artefact FILENAMES.
+    The handle is now validated BEFORE the intent: canonical 32-hex
+    epoch, the protocol's own lock file, and descriptor-verified
+    content proving THIS process holds the lock under THIS epoch."""
+
+    def _executor(self, authority, tmp_path, held_by=None,
+                  epoch="cd" * 16):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.journal.root.mkdir(parents=True, exist_ok=True)
+        lock = executor.journal.root / "run.lock"
+        holder = os.getpid() if held_by is None else held_by
+        _forge(lock, f"held:{holder}:{epoch}".encode())
+        return executor, lock
+
+    def _assert_nothing_written(self, root):
+        assert not list(root.glob("*.rel.*")), list(root.iterdir())
+
+    def test_foreign_holder_release_refuses_before_intent(
+            self, authority, tmp_path):
+        executor, lock = self._executor(authority, tmp_path,
+                                        held_by=99999)
+        with pytest.raises(ExecutorError,
+                           match="does not hold the run lock"):
+            executor._release_run_lock((lock, "cd" * 16))
+        self._assert_nothing_written(executor.journal.root)
+        assert lock.read_bytes() == b"held:99999:" + b"cd" * 16
+
+    @pytest.mark.parametrize("epoch", [
+        12345, "abc", "AB" * 16, None, "zz" * 16, "cd" * 16 + "0"])
+    def test_malformed_epoch_refuses_before_intent(
+            self, authority, tmp_path, epoch):
+        executor, lock = self._executor(authority, tmp_path)
+        with pytest.raises(ExecutorError,
+                           match="nothing was written"):
+            executor._release_run_lock((lock, epoch))
+        self._assert_nothing_written(executor.journal.root)
+
+    def test_malformed_handle_shapes_refuse(self, authority,
+                                            tmp_path):
+        executor, lock = self._executor(authority, tmp_path)
+        for handle in (None, "handle", (lock,), (lock, "cd" * 16,
+                                                 "extra")):
+            with pytest.raises(ExecutorError,
+                               match="malformed release handle"):
+                executor._release_run_lock(handle)
+        self._assert_nothing_written(executor.journal.root)
+
+    def test_wrong_lock_path_refuses(self, authority, tmp_path):
+        executor, _lock = self._executor(authority, tmp_path)
+        alien = tmp_path / "run.lock"
+        _forge(alien, f"held:{os.getpid()}:{'cd' * 16}".encode())
+        with pytest.raises(ExecutorError,
+                           match="not this plan's run lock"):
+            executor._release_run_lock((alien, "cd" * 16))
+        self._assert_nothing_written(executor.journal.root)
+
+    def test_epoch_mismatch_with_lock_content_refuses(
+            self, authority, tmp_path):
+        """The handle's epoch must be the one the lock records."""
+        executor, lock = self._executor(authority, tmp_path,
+                                        epoch="ab" * 16)
+        with pytest.raises(ExecutorError,
+                           match="does not hold the run lock"):
+            executor._release_run_lock((lock, "cd" * 16))
+        self._assert_nothing_written(executor.journal.root)
+
+    def test_route_lock_foreign_holder_refuses(self, tmp_path):
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        ledger = ReceiptLedger(tmp_path / "ledger")
+        ledger.register(receipt_for(b"b1", seq=1), route="v|a|s")
+        route_dir = next(d for d in ledger.root.iterdir()
+                         if d.is_dir())
+        rlock = route_dir / "register.lock"
+        _forge(rlock, b"held:99999:" + b"ef" * 16)
+        before = sorted(p.name for p in route_dir.iterdir())
+        with pytest.raises(ReceiptLedgerError,
+                           match="does not hold the lock"):
+            ledger._release_lock(rlock, "ef" * 16, "v|a|s")
+        assert sorted(p.name for p in route_dir.iterdir()) == before
+
+    def test_route_lock_malformed_epoch_refuses(self, tmp_path):
+        from app.venue_direct_evidence import (ReceiptLedger,
+                                               ReceiptLedgerError)
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        ledger = ReceiptLedger(tmp_path / "ledger")
+        ledger.register(receipt_for(b"b1", seq=1), route="v|a|s")
+        route_dir = next(d for d in ledger.root.iterdir()
+                         if d.is_dir())
+        rlock = route_dir / "register.lock"
+        _forge(rlock, f"held:{os.getpid()}:{'ef' * 16}".encode())
+        for epoch in ("../../escape/intent", 7, "EF" * 16):
+            with pytest.raises(ReceiptLedgerError,
+                               match="nothing was written"):
+                ledger._release_lock(rlock, epoch, "v|a|s")
+
+    def test_the_legitimate_cycle_still_releases(self, authority,
+                                                 tmp_path):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.execute()
+        assert re.fullmatch(
+            r"released:[0-9a-f]{32}",
+            (executor.journal.root / "run.lock").read_text())

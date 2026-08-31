@@ -461,6 +461,47 @@ class EffectExecutor:
                 pass
         return lock, epoch
 
+    def _validate_run_handle(self, handle) -> tuple:
+        """WP4.0: validate the held-lock tuple BEFORE any release
+        intent is written — the handle's shape, a canonical 32-hex
+        epoch, this plan's own lock file, and descriptor-verified
+        content proving THIS process holds the lock under THIS
+        epoch. A malformed handle refuses with nothing written."""
+        import re as re_module
+        if not isinstance(handle, tuple) or len(handle) != 2:
+            raise ExecutorError(
+                f"plan {self.plan_id}: malformed release handle "
+                f"{type(handle).__name__} — release refused before "
+                "any intent was written")
+        lock, epoch = handle
+        lock = Path(lock)
+        if not isinstance(epoch, str) or \
+                not re_module.fullmatch(r"[0-9a-f]{32}", epoch):
+            raise ExecutorError(
+                f"plan {self.plan_id}: malformed release handle — "
+                f"epoch {epoch!r} is not a canonical 32-hex token; "
+                "nothing was written")
+        if lock != self._lock_path():
+            raise ExecutorError(
+                f"plan {self.plan_id}: malformed release handle — "
+                f"{lock.name!r} is not this plan's run lock; nothing "
+                "was written")
+        expected = f"held:{os.getpid()}:{epoch}".encode()
+        try:
+            content = secure_read_bytes(lock, what="run lock")
+        except Exception as exc:
+            raise ExecutorError(
+                f"plan {self.plan_id}: the run lock could not be "
+                f"verified for release ({exc}) — nothing was "
+                "written") from exc
+        if content != expected:
+            raise ExecutorError(
+                f"plan {self.plan_id}: this process does not hold "
+                f"the run lock under epoch {epoch} (lock reads "
+                f"{content[:60]!r}) — release refused before any "
+                "intent was written")
+        return lock, epoch
+
     def _release_run_lock(self, handle) -> None:
         """E14: append-only witnessed release. An immutable intent
         record is durable BEFORE the lock moves; the lock walks
@@ -475,8 +516,7 @@ class EffectExecutor:
             LOCK_RELEASE_COMPLETION_SCHEMA,
             LOCK_RELEASE_INTENT_SCHEMA, seal_json,
             sealed_json_bytes)
-        lock, epoch = handle
-        lock = Path(lock)
+        lock, epoch = self._validate_run_handle(handle)
         try:
             holder = os.getpid()
             intent, intent_bytes = seal_json({
