@@ -56,7 +56,8 @@ from app.live_flatten_custody import (
 from app.session_authority_adapter import (
     AuthorityUnavailable, VenueDirective, load_authority)
 from app.venue_direct_evidence import (
-    VenueDirectEvidence, VenueEvidenceError, VenueEvidencePolicy)
+    VenueDirectEvidence, VenueEvidenceError, VenueEvidencePolicy,
+    require_utc)
 
 FILE_MODE = 0o600
 DIR_MODE = 0o700
@@ -244,6 +245,7 @@ class EffectExecutor:
                  fresh_positions: Callable[[], VenueDirectEvidence],
                  terminal_orders: Callable[[], VenueDirectEvidence],
                  custody: Optional[LiveFlattenCustody] = None,
+                 receipt_ledger: Optional[Any] = None,
                  clock: Callable[[], datetime] = lambda:
                  datetime.now(timezone.utc)):
         if not isinstance(directive, VenueDirective):
@@ -267,33 +269,47 @@ class EffectExecutor:
         self.fresh_positions = fresh_positions
         self.terminal_orders = terminal_orders
         self.custody = custody
+        self.receipt_ledger = receipt_ledger
         self.clock = clock
         self.journal = EffectJournal(Path(journal_root) / plan_id)
 
-    # -- the per-plan run lock (E4) --------------------------------
+    # -- the per-plan run lock (E4/E6/E9) --------------------------
+    # The lock file is NEVER unlinked. Release was unlink-then-fsync,
+    # so an unlink that succeeded before a failing directory fsync
+    # left the lock ABSENT from the live namespace and a second
+    # claimant entered immediately. The lock is now MONOTONE content:
+    # held:<pid> -> releasing -> released, every transition an
+    # in-place write plus file fsync — no namespace change, so no
+    # directory fsync can strand it. A claimant may enter only on the
+    # exact content "released"; held, releasing, garbage, or an
+    # unreadable file all refuse, so no failure can leave an absent,
+    # unacknowledged lock.
+
+    def _lock_path(self) -> Path:
+        return self.journal.root / "run.lock"
+
+    @staticmethod
+    def _write_lock_state(lock: Path, state: str, *,
+                          fsync: bool = True) -> None:
+        fd = os.open(lock, os.O_WRONLY | os.O_TRUNC)
+        try:
+            os.write(fd, state.encode())
+            if fsync:
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+
     def _acquire_run_lock(self):
-        """E6: the lock is DIRECTORY-durable. The file fsync alone
-        leaves the directory entry volatile: after a crash/reboot the
-        entry could vanish although the effect transaction had begun,
-        and another process would enter. Any UNCERTAIN acquire — a
-        failing file fsync or a failing parent fsync — blocks
-        execution and leaves the lock in place, so a future claimant
-        refuses and an operator disposes."""
-        lock = self.journal.root / "run.lock"
+        lock = self._lock_path()
         _refuse_symlink(lock, "run lock")
         try:
             fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                          FILE_MODE)
-        except FileExistsError as exc:
-            raise PlanLockHeld(
-                f"plan {self.plan_id}: another claimant holds the run "
-                "lock — the reconcile-through-acknowledgement "
-                "transaction is exclusive, and a lock left by a dead "
-                "process is an operator disposition, never an "
-                "automatic takeover") from exc
+        except FileExistsError:
+            return self._reclaim_run_lock(lock)
         try:
             try:
-                os.write(fd, str(os.getpid()).encode())
+                os.write(fd, f"held:{os.getpid()}".encode())
                 os.fchmod(fd, FILE_MODE)
                 os.fsync(fd)
             finally:
@@ -307,20 +323,72 @@ class EffectExecutor:
                 "operator disposes") from exc
         return lock
 
-    def _release_run_lock(self, lock) -> None:
-        """The release is directory-durable too. An uncertain release
-        leaves the lock standing: a future claimant refuses and an
-        operator disposes — never a silent second entrant."""
+    def _reclaim_run_lock(self, lock: Path):
+        """Enter ONLY over the exact durable content \"released\".
+        The reclaim transition is elected by its own O_EXCL lock so
+        two claimants reading \"released\" cannot both rewrite it."""
         try:
-            os.unlink(lock)
-            _fsync_dir(lock.parent)
-        except FileNotFoundError:
-            pass
+            content = lock.read_bytes().decode("utf-8",
+                                               errors="replace")
+        except Exception:
+            content = "<unreadable>"
+        if content != "released":
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: the run lock reads "
+                f"{content[:24]!r}, not 'released' — another claimant "
+                "holds it or its release is uncertain; an operator "
+                "disposes, never an automatic takeover")
+        reclaim = lock.with_suffix(".lock.reclaim")
+        _refuse_symlink(reclaim, "reclaim lock")
+        try:
+            fd = os.open(reclaim, os.O_WRONLY | os.O_CREAT |
+                         os.O_EXCL, FILE_MODE)
+        except FileExistsError as exc:
+            raise PlanLockHeld(
+                f"plan {self.plan_id}: a competing reclaim is in "
+                "progress") from exc
+        os.close(fd)
+        try:
+            if lock.read_bytes() != b"released":
+                raise PlanLockHeld(
+                    f"plan {self.plan_id}: the lock changed under "
+                    "the reclaim — refused")
+            try:
+                self._write_lock_state(lock, f"held:{os.getpid()}")
+            except Exception as exc:
+                try:
+                    self._write_lock_state(lock, "released",
+                                           fsync=False)
+                except Exception:
+                    pass        # non-released content refuses anyway
+                raise PlanLockHeld(
+                    f"plan {self.plan_id}: the reclaim could not be "
+                    f"made durable ({exc}) — refused") from exc
+        finally:
+            try:
+                os.unlink(reclaim)
+            except FileNotFoundError:
+                pass
+        return lock
+
+    def _release_run_lock(self, lock) -> None:
+        """Monotone release: releasing -> released, in place. Any
+        failure restores non-released content, so at every boundary
+        either the old lock remains authoritative or a durable
+        released state exists — the file is never absent."""
+        try:
+            self._write_lock_state(lock, "releasing")
+            self._write_lock_state(lock, "released")
         except Exception as exc:
+            try:
+                self._write_lock_state(lock, f"held:{os.getpid()}",
+                                       fsync=False)
+            except Exception:
+                pass            # whatever remains is not "released"
             raise ExecutorError(
                 f"plan {self.plan_id}: the lock release could not be "
-                f"made durable ({exc}) — the lock may persist, a "
-                "future claimant will refuse, and an operator must "
+                f"made durable ({exc}) — the lock stays authoritative,"
+                " a future claimant will refuse, and an operator must "
                 "dispose") from exc
 
     # -- plan persistence ------------------------------------------
@@ -503,13 +571,44 @@ class EffectExecutor:
             evidence = self._fresh(self.terminal_orders,
                                    "terminal_orders",
                                    what="terminal-order evidence")
+            # E11: the receipt must be REGISTERED in the durable
+            # per-route ledger before this evidence authorizes
+            # anything — monotone sequence and body uniqueness are
+            # facts of the ledger, not declarations of the receipt.
+            if self.receipt_ledger is None:
+                self._stop("no receipt ledger was provided; an "
+                           "unregistered receipt authorizes nothing")
+            route = "|".join((self.policy.venue,
+                              self.policy.account_fingerprint,
+                              self.policy.symbol))
+            try:
+                registered = self.receipt_ledger.register(
+                    evidence.receipt, route=route)
+            except VenueEvidenceError as exc:
+                self._stop(f"receipt registration refused: {exc}")
+            # E10: freshness is judged PER REQUESTED IDENTITY from
+            # each verdict's own venue event time. No aggregate
+            # maximum may authorize another row.
+            now = self.clock()
             verdicts = dict(evidence.facts.get("verdicts", ()))
-            outcomes = {identity: verdicts[identity]
-                        for identity in identities
-                        if identity in verdicts}
+            outcomes = {}
+            dropped_stale = {}
+            for identity in identities:
+                entry = verdicts.get(identity)
+                if entry is None:
+                    continue
+                event_at = require_utc("verdict.event_at",
+                                       entry["event_at"])
+                age = (now - event_at).total_seconds()
+                if age > self.policy.max_age_seconds:
+                    dropped_stale[identity] = round(age, 3)
+                    continue
+                outcomes[identity] = entry["verdict"]
             self.journal.append_once(
                 "cancellation_outcomes",
                 payload={"outcomes": outcomes,
+                         "dropped_stale": dropped_stale,
+                         "receipt_registered": dict(registered),
                          "provenance": evidence.provenance()})
             verdict = self.directive.permits_dependent_effects(
                 outcomes)

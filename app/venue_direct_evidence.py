@@ -38,9 +38,11 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -263,11 +265,16 @@ class VenueEvidencePolicy:
     max_age_seconds: float
     schema_version: str
     calendar_identity: str
+    # E11: the POLICY names the collector whose receipts it accepts.
+    # An arbitrary nonempty string was authority for nobody.
+    collector_source: str
+    collector_code_identity: str
 
     def __post_init__(self):
         require_enum("venue", self.venue, VENUES)
         for name in ("account_fingerprint", "symbol",
-                     "schema_version", "calendar_identity"):
+                     "schema_version", "calendar_identity",
+                     "collector_source", "collector_code_identity"):
             require_text(name, getattr(self, name))
         require_real("max_age_seconds", self.max_age_seconds,
                      positive=True)
@@ -301,6 +308,8 @@ class VenueEvidencePolicy:
             "max_age_seconds": self.max_age_seconds,
             "schema_version": self.schema_version,
             "calendar_identity": self.calendar_identity,
+            "collector_source": self.collector_source,
+            "collector_code_identity": self.collector_code_identity,
             "parsers": sorted(
                 f"{'|'.join(key)}={identity}"
                 for key, identity in SEALED_PARSER_IDENTITIES.items()),
@@ -634,14 +643,27 @@ _MT5_TERMINAL_STATE_VERDICT = {
 }
 
 
+# E10: the venue timestamp that corresponds to each declared status.
+# A status whose dedicated stamp field is set for a DIFFERENT outcome
+# is a contradiction and refuses.
+_ALPACA_STATUS_STAMP_FIELD = {"canceled": "canceled_at",
+                              "expired": "expired_at",
+                              "filled": "filled_at"}
+_ALPACA_OPTIONAL_STAMPS = ("canceled_at", "expired_at", "filled_at")
+
+
 def _parse_terminal_rows(payload: Any, *, what: str,
                          identity_field: str, status_field: str,
                          event_time_field: str,
-                         verdict_map: Mapping[str, str]) -> dict:
-    """E8: the payload is the venue's ARRAY of order objects — no
-    wrapper and no caller-inserted timestamp. Freshness derives from
-    the VENUE'S OWN event timestamps on each row; a locally generated
-    receipt lives in the acquisition envelope, never in here."""
+                         verdict_map: Mapping[str, str],
+                         status_stamp_fields: Mapping[str, str] = (),
+                         optional_stamps: tuple = ()) -> dict:
+    """E8/E10: the payload is the venue's ARRAY of order objects — no
+    wrapper, no caller-inserted timestamp. Each verdict carries ITS
+    OWN venue event time, taken from the stamp field the venue
+    dedicates to the declared status where one exists, else the
+    generic event field. No aggregate maximum may authorise another
+    row: consumers must judge freshness PER identity."""
     if not isinstance(payload, list):
         raise VenueEvidenceError(
             f"{what}: the venue body is an ARRAY of order objects; a "
@@ -650,15 +672,24 @@ def _parse_terminal_rows(payload: Any, *, what: str,
         raise VenueEvidenceError(
             f"{what}: an empty terminal body carries no verdict — "
             "absence is never a terminal verdict")
+    status_stamp_fields = dict(status_stamp_fields)
     verdicts: dict = {}
     symbols = set()
     latest = None
     for index, row in enumerate(payload):
         if not isinstance(row, dict):
             raise VenueEvidenceError(f"{what}[{index}] not an object")
-        require_fields(f"{what}[{index}]", row,
-                       (identity_field, "symbol", status_field,
-                        event_time_field))
+        base = {identity_field, "symbol", status_field,
+                event_time_field}
+        allowed = base | set(optional_stamps)
+        missing = sorted(base - set(row))
+        unknown = sorted(set(row) - allowed)
+        if missing:
+            raise VenueEvidenceError(
+                f"{what}[{index}]: missing fields {missing}")
+        if unknown:
+            raise VenueEvidenceError(
+                f"{what}[{index}]: unknown fields {unknown}")
         identity = require_text(f"{what}[{index}].{identity_field}",
                                 row[identity_field])
         if identity in verdicts:
@@ -673,10 +704,23 @@ def _parse_terminal_rows(payload: Any, *, what: str,
                 f"{what}[{index}]: status {status!r} is not a "
                 "TERMINAL status this parser models — a non-terminal "
                 "or unknown status can never be a verdict")
-        stamp = require_utc(f"{what}[{index}].{event_time_field}",
-                            row[event_time_field])
+        # a stamp dedicated to a DIFFERENT outcome contradicts the
+        # declared status
+        own_stamp = status_stamp_fields.get(status)
+        for stamp_field in optional_stamps:
+            value = row.get(stamp_field)
+            if value is not None and stamp_field != own_stamp:
+                raise VenueEvidenceError(
+                    f"{what}[{index}]: status {status!r} contradicts "
+                    f"a set {stamp_field!r} — the venue's own facts "
+                    "disagree")
+        source_field = own_stamp if own_stamp and \
+            row.get(own_stamp) is not None else event_time_field
+        stamp = require_utc(f"{what}[{index}].{source_field}",
+                            row[source_field])
         latest = stamp if latest is None or stamp > latest else latest
-        verdicts[identity] = verdict
+        verdicts[identity] = {"verdict": verdict,
+                              "event_at": stamp.isoformat()}
         symbols.add(require_text(f"{what}[{index}].symbol",
                                  row["symbol"]))
     return {"verdicts": tuple(sorted(verdicts.items())),
@@ -691,7 +735,9 @@ def _parse_alpaca_terminal_orders_v1(payload: Any) -> dict:
     return _parse_terminal_rows(
         payload, what="alpaca.terminal_orders", identity_field="id",
         status_field="status", event_time_field="updated_at",
-        verdict_map=_ALPACA_TERMINAL_STATUS_VERDICT)
+        verdict_map=_ALPACA_TERMINAL_STATUS_VERDICT,
+        status_stamp_fields=_ALPACA_STATUS_STAMP_FIELD,
+        optional_stamps=_ALPACA_OPTIONAL_STAMPS)
 
 
 def _parse_mt5_terminal_orders_v1(payload: Any) -> dict:
@@ -973,7 +1019,7 @@ SEALED_PARSER_IDENTITIES: Mapping[tuple, str] = MappingProxyType({
     ("mt5_demo", "market_clock", "v1"):
         "a2da56287687f89dda0c144710511b82",
     ("alpaca_paper", "terminal_orders", "v1"):
-        "f6c25265c5ed070e372d5888f1d5f8d1",
+        "a0f6089cb27d3718443a6bf58e59b1c5",
     ("mt5_demo", "terminal_orders", "v1"):
         "96cca1f60e270c7e8bb718124a0d1676",
 })
@@ -1032,10 +1078,13 @@ class AcquisitionReceipt:
                 f"monotonic_seq must be a nonnegative int, got "
                 f"{self.monotonic_seq!r}")
         if not isinstance(self.body_sha256, str) or \
-                len(self.body_sha256) != 64:
+                len(self.body_sha256) != 64 or any(
+                    c not in "0123456789abcdef"
+                    for c in self.body_sha256):
             raise VenueEvidenceError(
-                "body_sha256 must be the 64-hex digest of the exact "
-                "venue bytes this receipt was issued for")
+                "body_sha256 must be the canonical 64-character "
+                "lowercase hex digest of the exact venue bytes this "
+                "receipt was issued for — no other shape is a digest")
 
     @staticmethod
     def build(*, collector_source: str,
@@ -1061,6 +1110,143 @@ class AcquisitionReceipt:
 # evidence types whose payload is a venue body that MUST arrive with
 # an acquisition receipt
 RECEIPT_REQUIRED = ("terminal_orders",)
+
+
+class ReceiptLedgerError(VenueEvidenceError):
+    """The receipt ledger refuses — typed, never a default."""
+
+
+class ReceiptLedger:
+    """E11: a DURABLE per-route ledger that makes receipt
+    monotonicity and body uniqueness facts instead of declarations.
+
+    One directory per route (venue|account|symbol). One file per
+    sequence number, created with the audited uncertain-write
+    protocol: an O_EXCL temporary, write, fchmod 0600, fsync, an
+    exclusive final create, rename, parent fsync — a failure at any
+    point registers nothing. A route-level registration lock makes
+    the read-check-create transaction exclusive, so:
+
+    * a sequence rollback or reuse refuses (strictly increasing,
+      atomically enforced);
+    * a replayed BODY under a fresh, higher, fabricated sequence
+      refuses (body uniqueness per route);
+    * two concurrent collectors elect exactly one registration;
+    * re-registering the identical receipt is idempotent, because a
+      resume must not fail on its own history.
+
+    Registration happens BEFORE a receipt's evidence may authorize
+    any effect; an unregistered receipt authorizes nothing."""
+
+    def __init__(self, root: Any):
+        self.root = Path(root)
+        if self.root.is_symlink():
+            raise ReceiptLedgerError(
+                f"{self.root}: symlinked ledger root refused")
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.root, 0o700)
+
+    def _route_dir(self, route: str) -> Path:
+        require_text("route", route)
+        safe = route.replace("|", "_").replace("/", "_")
+        directory = self.root / safe
+        if directory.is_symlink():
+            raise ReceiptLedgerError(
+                f"{safe}: symlinked route refused")
+        directory.mkdir(exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+        return directory
+
+    def register(self, receipt: AcquisitionReceipt, *,
+                 route: str) -> dict:
+        if not isinstance(receipt, AcquisitionReceipt):
+            raise ReceiptLedgerError(
+                "a typed AcquisitionReceipt is required")
+        directory = self._route_dir(route)
+        payload = receipt.as_dict()
+        lock = directory / "register.lock"
+        if lock.is_symlink():
+            raise ReceiptLedgerError("symlinked register lock refused")
+        try:
+            lock_fd = os.open(lock, os.O_WRONLY | os.O_CREAT |
+                              os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            raise ReceiptLedgerError(
+                f"route {route!r}: a concurrent registration holds "
+                "the lock — exactly one collector registers at a "
+                "time") from exc
+        try:
+            os.write(lock_fd, str(os.getpid()).encode())
+            os.fsync(lock_fd)
+        finally:
+            os.close(lock_fd)
+        try:
+            existing = {}
+            for path in directory.glob("[0-9]*.json"):
+                if path.is_symlink():
+                    raise ReceiptLedgerError(
+                        f"{path.name}: symlinked ledger record "
+                        "refused")
+                record = json.loads(path.read_text())
+                existing[int(record["monotonic_seq"])] = record
+            seq = receipt.monotonic_seq
+            if seq in existing:
+                if existing[seq] == payload:
+                    return existing[seq]        # idempotent resume
+                raise ReceiptLedgerError(
+                    f"route {route!r}: sequence {seq} is already "
+                    "registered with DIFFERENT content — reuse "
+                    "refused")
+            if existing and seq <= max(existing):
+                raise ReceiptLedgerError(
+                    f"route {route!r}: sequence {seq} does not "
+                    f"exceed the registered maximum {max(existing)} "
+                    "— rollback or reuse refused")
+            for record in existing.values():
+                if record["body_sha256"] == payload["body_sha256"]:
+                    raise ReceiptLedgerError(
+                        f"route {route!r}: this exact body was "
+                        f"already registered at sequence "
+                        f"{record['monotonic_seq']} — a replayed "
+                        "body under a fresh receipt is refused")
+            path = directory / f"{seq:08d}.json"
+            tmp = path.with_suffix(f".json.tmp.{os.getpid()}")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         0o600)
+            try:
+                os.write(fd, json.dumps(payload, indent=1,
+                                        default=str).encode())
+                os.fchmod(fd, 0o600)
+                os.fsync(fd)
+            except Exception:
+                os.close(fd)
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+                raise
+            os.close(fd)
+            try:
+                final = os.open(path, os.O_WRONLY | os.O_CREAT |
+                                os.O_EXCL, 0o600)
+            except FileExistsError as exc:
+                os.unlink(tmp)
+                raise ReceiptLedgerError(
+                    f"route {route!r}: sequence {seq} was registered "
+                    "concurrently") from exc
+            os.close(final)
+            os.replace(tmp, path)
+            fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            return payload
+        finally:
+            try:
+                os.unlink(lock)
+            except FileNotFoundError:
+                pass
 
 
 # ---------------------------------------------------------------- #
@@ -1207,6 +1393,17 @@ class VenueDirectEvidence:
                 raise VenueEvidenceError(
                     f"the receipt is stamped {drift:.3f}s in the "
                     "future")
+            if receipt.collector_source != \
+                    policy.collector_source or \
+                    receipt.collector_code_identity != \
+                    policy.collector_code_identity:
+                raise VenueEvidenceError(
+                    f"the receipt names collector "
+                    f"{receipt.collector_source!r}/"
+                    f"{receipt.collector_code_identity!r} but the "
+                    f"policy binds {policy.collector_source!r}/"
+                    f"{policy.collector_code_identity!r} — a foreign "
+                    "collector is refused")
             if receipt.received_at < self.observed_at:
                 raise VenueEvidenceError(
                     "the receipt predates the venue event it carries "

@@ -111,7 +111,9 @@ def policy(venue="alpaca_paper", symbol="SPY",
                 symbol=symbol,
                 allowed_sources=("alpaca_paper_rest_v2",),
                 max_age_seconds=120.0,
-                calendar_identity="cal-venue-v1")
+                calendar_identity="cal-venue-v1",
+                collector_source="wp3_test_collector",
+                collector_code_identity="collector-code-0001")
     base.update(kw)
     return VenueEvidencePolicy.build(**base)
 

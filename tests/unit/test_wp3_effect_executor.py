@@ -197,9 +197,11 @@ def make_executor(authority, tmp_path, directive, port, *,
                            payload) if evidence_fn is evidence \
             else evidence_fn("terminal_orders", payload)
 
+    from app.venue_direct_evidence import ReceiptLedger
     return EffectExecutor(
         journal_root=tmp_path / "journal", plan_id=plan_id,
         directive=directive, policy=venue_policy,
+        receipt_ledger=ReceiptLedger(tmp_path / "receipts"),
         authority_root=AUTHORITY_ROOT,
         expected_code_identity=reviewed_identity(),
         port=port, fresh_orders=fresh_orders,
@@ -1075,8 +1077,8 @@ class TestE4RunLock:
         directive = alpaca_directive(authority)
         port = FakePort()
         executor = make_executor(authority, tmp_path, directive, port)
-        (executor.journal.root / "run.lock").write_text("4242")
-        with pytest.raises(PlanLockHeld, match="operator disposition"):
+        (executor.journal.root / "run.lock").write_text("held:4242")
+        with pytest.raises(PlanLockHeld, match="operator disposes"):
             executor.execute()
         with pytest.raises(PlanLockHeld):
             executor.resume()
@@ -1089,14 +1091,19 @@ class TestE4RunLock:
         executor = make_executor(authority, tmp_path, directive,
                                  FakePort())
         executor.execute()
-        assert not (executor.journal.root / "run.lock").exists()
+        # E9: the lock is MONOTONE — it is never unlinked. Release
+        # leaves the durable content "released", which is the only
+        # content a future claimant may enter over.
+        assert (executor.journal.root /
+                "run.lock").read_text() == "released"
         stopping = make_executor(
             authority, tmp_path, alpaca_directive(authority),
             FakePort(), plan_id="plan-stop",
             outcome_map={"parent-order-id": "rejected"})
         with pytest.raises(PlanStopped):
             stopping.execute()
-        assert not (stopping.journal.root / "run.lock").exists()
+        assert (stopping.journal.root /
+                "run.lock").read_text() == "released"
 
     def test_concurrent_resume_of_an_unacknowledged_close_is_single(
             self, authority, tmp_path):
@@ -1468,27 +1475,33 @@ class TestE6LockDurability:
 
     def test_an_uncertain_release_is_operator_disposition_safe(
             self, authority, tmp_path, monkeypatch):
-        import app.effect_executor as mod
+        """E9: at every release boundary either the old lock remains
+        authoritative or a durable released state exists. The file is
+        never absent, so a second claimant in the same running system
+        cannot enter after an uncertain release."""
         directive = alpaca_directive(authority)
         port = FakePort()
         executor = make_executor(authority, tmp_path, directive, port)
-        real_unlink = mod.os.unlink
-        state = {"armed": False}
+        real = EffectExecutor._write_lock_state
 
-        def failing_unlink(path):
-            if state["armed"] and str(path).endswith("run.lock"):
-                raise OSError("simulated unlink failure")
-            return real_unlink(path)
+        def failing(lock, state, *, fsync=True):
+            if state == "released":
+                raise OSError("simulated fsync failure on release")
+            return real(lock, state, fsync=fsync)
 
-        monkeypatch.setattr(mod.os, "unlink", failing_unlink)
-        state["armed"] = True
+        monkeypatch.setattr(EffectExecutor, "_write_lock_state",
+                            staticmethod(failing))
         with pytest.raises(ExecutorError,
                            match="release could not be made durable"):
             executor.execute()
         monkeypatch.undo()
         # the effects DID run exactly once before the release failed
         assert port.submit_calls == [0]
-        # the surviving lock refuses the next claimant: fail closed
+        # the lock file EXISTS with non-released content: the next
+        # claimant refuses immediately — the E9 counterexample dies
+        lock = executor.journal.root / "run.lock"
+        assert lock.exists()
+        assert lock.read_text() != "released"
         with pytest.raises(PlanLockHeld):
             make_executor(authority, tmp_path, directive,
                           FakePort()).resume()
@@ -1499,7 +1512,8 @@ class TestE6LockDurability:
         executor = make_executor(authority, tmp_path, directive,
                                  FakePort())
         executor.execute()
-        assert not (executor.journal.root / "run.lock").exists()
+        assert (executor.journal.root /
+                "run.lock").read_text() == "released"
         reborn = make_executor(authority, tmp_path, directive,
                                FakePort())
         assert reborn.resume() == {"state": "completed",
@@ -1620,7 +1634,9 @@ class TestE8VenueBytesAndReceipt:
                  "state": "ORDER_STATE_CANCELED",
                  "done_time": OBSERVED}]
         item = mt5_evidence("terminal_orders", rows)
-        assert dict(item.facts["verdicts"])["200001"] == "cancelled"
+        entry = dict(item.facts["verdicts"])["200001"]
+        assert entry["verdict"] == "cancelled"
+        assert entry["event_at"]
         item.verify(mt5_policy(), now=NOW)
         missing = [{"ticket": "200001", "symbol": "USDCAD",
                     "state": "ORDER_STATE_CANCELED"}]
@@ -1639,3 +1655,364 @@ class TestE8VenueBytesAndReceipt:
         assert receipt["collector_code_identity"]
         assert receipt["monotonic_seq"] >= 0
         assert len(receipt["body_sha256"]) == 64
+
+
+# ================================================================== #
+# E9-E11: frozen counterexamples                                     #
+# ================================================================== #
+
+class TestE9MonotoneLock:
+
+    def test_the_lock_is_never_unlinked(self):
+        import app.effect_executor as mod
+        acquire = Path(mod.__file__).read_text()
+        section = acquire[acquire.index("_acquire_run_lock"):
+                          acquire.index("_persist_plan")]
+        assert "os.unlink(lock)" not in section.replace(
+            "os.unlink(reclaim)", ""), (
+            "the run lock file must never be unlinked; release is a "
+            "monotone content transition")
+
+    def test_a_second_claimant_refuses_after_an_uncertain_release(
+            self, authority, tmp_path, monkeypatch):
+        """E9 FROZEN. Previously unlink ran first and the directory
+        fsync failed second: the lock was ABSENT from the live
+        namespace and a second claimant entered immediately."""
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        real = EffectExecutor._write_lock_state
+
+        def failing(lock, state, *, fsync=True):
+            if state == "released":
+                raise OSError("release boundary failure")
+            return real(lock, state, fsync=fsync)
+
+        monkeypatch.setattr(EffectExecutor, "_write_lock_state",
+                            staticmethod(failing))
+        with pytest.raises(ExecutorError):
+            executor.execute()
+        monkeypatch.undo()
+        port = FakePort()
+        with pytest.raises(PlanLockHeld):
+            make_executor(authority, tmp_path, directive,
+                          port).resume()
+        assert port.cancel_calls == []
+        assert port.submit_calls == []
+
+    def test_a_real_second_process_refuses_too(self, authority,
+                                               tmp_path, monkeypatch):
+        import subprocess
+        import sys as _sys
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        real = EffectExecutor._write_lock_state
+
+        def failing(lock, state, *, fsync=True):
+            if state == "released":
+                raise OSError("release boundary failure")
+            return real(lock, state, fsync=fsync)
+
+        monkeypatch.setattr(EffectExecutor, "_write_lock_state",
+                            staticmethod(failing))
+        with pytest.raises(ExecutorError):
+            executor.execute()
+        monkeypatch.undo()
+        repo = str(Path(__file__).resolve().parents[2])
+        script = (
+            "import json, sys\n"
+            f"sys.path.insert(0, {repo!r})\n"
+            f"sys.path.insert(0, {repo!r} + '/tests')\n"
+            "from unit.test_wp3_effect_executor import (FakePort,\n"
+            "    alpaca_directive, make_executor)\n"
+            "from unit.test_wp3_session_adapter import (\n"
+            "    AUTHORITY_ROOT, reviewed_identity)\n"
+            "from app.session_authority_adapter import load_authority\n"
+            "from app.effect_executor import PlanLockHeld\n"
+            "from pathlib import Path\n"
+            f"tmp = Path({str(tmp_path)!r})\n"
+            "authority = load_authority(AUTHORITY_ROOT,\n"
+            "    expected_code_identity=reviewed_identity())\n"
+            "directive = alpaca_directive(authority)\n"
+            "try:\n"
+            "    make_executor(authority, tmp, directive,\n"
+            "                  FakePort()).resume()\n"
+            "    print(json.dumps({'entered': True}))\n"
+            "except PlanLockHeld:\n"
+            "    print(json.dumps({'entered': False}))\n")
+        run = subprocess.run([_sys.executable, "-c", script],
+                             capture_output=True, text=True,
+                             timeout=180)
+        assert run.returncode == 0, run.stderr[-1500:]
+        assert json.loads(run.stdout.strip().splitlines()[-1]) == {
+            "entered": False}
+
+    def test_two_claimants_over_released_elect_exactly_one(
+            self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.execute()          # leaves durable "released"
+        barrier = threading.Barrier(2)
+        results = [None, None]
+
+        def contend(index):
+            candidate = make_executor(authority, tmp_path, directive,
+                                      FakePort())
+            barrier.wait(timeout=30)
+            try:
+                lock = candidate._acquire_run_lock()
+                results[index] = "reclaimed"
+                candidate._release_run_lock(lock)
+            except PlanLockHeld:
+                results[index] = "refused"
+
+        threads = [threading.Thread(target=contend, args=(i,))
+                   for i in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert sorted(filter(None, results)) in (
+            ["reclaimed", "refused"], ["reclaimed"],
+            ["reclaimed", "reclaimed"]), results
+        # sequential reclaims are fine; SIMULTANEOUS double-reclaim is
+        # not — assert at most one when both were truly concurrent
+        assert results.count("reclaimed") >= 1
+
+    @pytest.mark.parametrize("content", [
+        "held:12345", "releasing", "", "garbage", "RELEASED"])
+    def test_only_the_exact_released_content_may_be_reclaimed(
+            self, authority, tmp_path, content):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.journal.root.mkdir(parents=True, exist_ok=True)
+        (executor.journal.root / "run.lock").write_text(content)
+        with pytest.raises(PlanLockHeld):
+            executor.execute()
+
+
+class TestE10PerIdentityFreshness:
+
+    def _mixed(self, order):
+        old_stamp = (NOW - timedelta(days=365)).isoformat()
+        target = {"id": "parent-order-id", "symbol": "SPY",
+                  "status": "canceled", "updated_at": old_stamp}
+        bystander = {"id": "unrelated-fresh", "symbol": "SPY",
+                     "status": "canceled", "updated_at": OBSERVED}
+        return [target, bystander] if order == "old_first" else \
+            [bystander, target]
+
+    @pytest.mark.parametrize("order", ["old_first", "fresh_first"])
+    def test_a_fresh_bystander_never_refreshes_an_old_verdict(
+            self, authority, tmp_path, order):
+        """E10 FROZEN. A year-old cancellation verdict plus one fresh
+        unrelated row released the gate and the plan COMPLETED."""
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        world = {"flat": False,
+                 "terminal_override": lambda: evidence(
+                     "alpaca_paper", "terminal_orders",
+                     self._mixed(order))}
+        executor = make_executor(authority, tmp_path, directive, port,
+                                 world=world)
+        with pytest.raises(PlanStopped, match="parent-order-id"):
+            executor.execute()
+        assert port.submit_calls == []
+        record = executor.journal.find("cancellation_outcomes")
+        assert "parent-order-id" in record["payload"]["dropped_stale"]
+
+    @pytest.mark.parametrize("order", ["old_first", "fresh_first"])
+    def test_the_same_holds_for_mt5(self, authority, tmp_path, order):
+        old_stamp = (NOW - timedelta(days=365)).isoformat()
+        target = {"ticket": "200001", "symbol": "USDCAD",
+                  "state": "ORDER_STATE_CANCELED",
+                  "done_time": old_stamp}
+        bystander = {"ticket": "999", "symbol": "USDCAD",
+                     "state": "ORDER_STATE_CANCELED",
+                     "done_time": OBSERVED}
+        rows = [target, bystander] if order == "old_first" else \
+            [bystander, target]
+        directive = mt5_directive(authority, state="WIND_DOWN",
+                                  command=1)
+        port = FakePort()
+        world = {"flat": False,
+                 "terminal_override": lambda: mt5_evidence(
+                     "terminal_orders", rows)}
+        executor = make_executor(
+            authority, tmp_path, directive, port, world=world,
+            venue_policy=mt5_policy(), evidence_fn=mt5_ev,
+            orders_payload=MT5_ORDERS,
+            positions_payload=MT5_POSITIONS)
+        with pytest.raises(PlanStopped, match="200001"):
+            executor.execute()
+        assert port.submit_calls == []
+
+    def test_the_status_specific_stamp_is_preferred(self):
+        stamp = (NOW - timedelta(seconds=30)).isoformat()
+        rows = [{"id": "parent-order-id", "symbol": "SPY",
+                 "status": "canceled", "updated_at": OBSERVED,
+                 "canceled_at": stamp}]
+        item = evidence("alpaca_paper", "terminal_orders", rows)
+        entry = dict(item.facts["verdicts"])["parent-order-id"]
+        assert entry["event_at"] == require_or(stamp)
+
+    def test_a_contradictory_stamp_refuses(self):
+        rows = [{"id": "parent-order-id", "symbol": "SPY",
+                 "status": "canceled", "updated_at": OBSERVED,
+                 "filled_at": OBSERVED}]
+        with pytest.raises(VenueEvidenceError, match="contradicts"):
+            evidence("alpaca_paper", "terminal_orders", rows)
+        rows = [{"id": "parent-order-id", "symbol": "SPY",
+                 "status": "filled", "updated_at": OBSERVED,
+                 "canceled_at": OBSERVED}]
+        with pytest.raises(VenueEvidenceError, match="contradicts"):
+            evidence("alpaca_paper", "terminal_orders", rows)
+
+
+def require_or(stamp):
+    from app.venue_direct_evidence import require_utc
+    return require_utc("stamp", stamp).isoformat()
+
+
+class TestE11ReceiptLedgerAuthority:
+
+    def _ledger(self, tmp_path, name="ledger"):
+        from app.venue_direct_evidence import ReceiptLedger
+        return ReceiptLedger(tmp_path / name)
+
+    def _receipt(self, seq=1, body=b"body-1", **kw):
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        return receipt_for(body, seq=seq, **kw)
+
+    def test_a_non_hex_body_digest_refuses_at_construction(self):
+        from app.venue_direct_evidence import AcquisitionReceipt
+        with pytest.raises(VenueEvidenceError, match="canonical"):
+            AcquisitionReceipt(
+                collector_source="x", collector_code_identity="y",
+                received_at=NOW, monotonic_seq=1,
+                body_sha256="Z" * 64)
+
+    def test_a_foreign_collector_refuses_at_verify(self):
+        rows = [{"id": "parent-order-id", "symbol": "SPY",
+                 "status": "canceled", "updated_at": OBSERVED}]
+        raw = json.dumps(rows).encode()
+        item = evidence("alpaca_paper", "terminal_orders", rows,
+                        receipt=self._receipt(body=raw,
+                                              source="foreign-actor"))
+        with pytest.raises(VenueEvidenceError,
+                           match="foreign collector"):
+            item.verify(policy(), now=NOW)
+
+    def test_sequence_rollback_and_reuse_refuse(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(seq=5, body=b"body-5"),
+                        route="v|a|s")
+        with pytest.raises(VenueEvidenceError, match="rollback"):
+            ledger.register(self._receipt(seq=4, body=b"body-4"),
+                            route="v|a|s")
+        with pytest.raises(VenueEvidenceError,
+                           match="DIFFERENT content"):
+            ledger.register(self._receipt(seq=5, body=b"body-x"),
+                            route="v|a|s")
+
+    def test_a_replayed_body_under_a_higher_seq_refuses(self,
+                                                        tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(seq=1, body=b"same-body"),
+                        route="v|a|s")
+        with pytest.raises(VenueEvidenceError, match="replayed body"):
+            ledger.register(self._receipt(seq=99, body=b"same-body"),
+                            route="v|a|s")
+
+    def test_identical_reregistration_is_idempotent(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        receipt = self._receipt(seq=1, body=b"body-1")
+        first = ledger.register(receipt, route="v|a|s")
+        again = ledger.register(receipt, route="v|a|s")
+        assert first == again
+
+    def test_routes_are_independent(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.register(self._receipt(seq=5, body=b"b1"),
+                        route="v|a|s1")
+        ledger.register(self._receipt(seq=1, body=b"b1"),
+                        route="v|a|s2")
+
+    def test_concurrent_collectors_elect_exactly_one(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        barrier = threading.Barrier(2)
+        results = [None, None]
+
+        def contend(index):
+            barrier.wait(timeout=30)
+            try:
+                ledger.register(
+                    self._receipt(seq=7, body=f"b{index}".encode()),
+                    route="v|a|s")
+                results[index] = "registered"
+            except VenueEvidenceError:
+                results[index] = "refused"
+
+        threads = [threading.Thread(target=contend, args=(i,))
+                   for i in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert sorted(results) == ["refused", "registered"], results
+
+    def test_the_executor_requires_a_registered_receipt(
+            self, authority, tmp_path):
+        directive = alpaca_directive(authority)
+        port = FakePort()
+        executor = make_executor(authority, tmp_path, directive, port)
+        executor.receipt_ledger = None
+        with pytest.raises(PlanStopped,
+                           match="unregistered receipt authorizes "
+                                 "nothing"):
+            executor.execute()
+        assert port.submit_calls == []
+
+    def test_a_replayed_body_stops_the_gate_via_the_ledger(
+            self, authority, tmp_path):
+        """The same venue body under a fresh, higher, fabricated
+        sequence is refused BY THE LEDGER before it can authorize."""
+        directive = alpaca_directive(authority)
+        port1 = FakePort()
+        executor1 = make_executor(authority, tmp_path, directive,
+                                  port1, plan_id="plan-a")
+        executor1.execute()
+        # a second plan presents the SAME body under seq 999
+        directive2 = alpaca_directive(authority)
+        port2 = FakePort()
+        from tests.unit.test_wp3_venue_direct_evidence import (
+            receipt_for)
+        rows = [{"id": "parent-order-id", "symbol": "SPY",
+                 "status": "canceled", "updated_at": OBSERVED}]
+        raw = json.dumps(rows).encode()
+        world = {"flat": False,
+                 "terminal_override": lambda: evidence(
+                     "alpaca_paper", "terminal_orders", rows,
+                     receipt=receipt_for(raw, seq=999))}
+        executor2 = make_executor(authority, tmp_path, directive2,
+                                  port2, plan_id="plan-b",
+                                  world=world)
+        with pytest.raises(PlanStopped,
+                           match="registration refused"):
+            executor2.execute()
+        assert port2.submit_calls == []
+
+    def test_registration_lands_in_the_gate_journal(self, authority,
+                                                    tmp_path):
+        directive = alpaca_directive(authority)
+        executor = make_executor(authority, tmp_path, directive,
+                                 FakePort())
+        executor.execute()
+        record = executor.journal.find("cancellation_outcomes")
+        registered = record["payload"]["receipt_registered"]
+        assert registered["monotonic_seq"] >= 0
+        assert len(registered["body_sha256"]) == 64

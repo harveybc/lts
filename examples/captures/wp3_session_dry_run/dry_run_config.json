@@ -19,7 +19,9 @@
    "mt5_bridge_snapshot_v1"
   ],
   "max_age_seconds": 120.0,
-  "calendar_identity": "cal-venue-v1"
+  "calendar_identity": "cal-venue-v1",
+  "collector_source": "wp3_test_collector",
+  "collector_code_identity": "collector-code-0001"
  },
  "session_policy": {
   "enabled": true,
