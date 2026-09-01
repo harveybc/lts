@@ -93,11 +93,14 @@ def _contained_path(root: Path, rel: str) -> Path:
     return candidate
 
 
-def _sha256_descriptor_first(root: Path, rel: str) -> str:
-    """C16: the artifact is opened descriptor-first with O_NOFOLLOW,
-    verified REGULAR, owned by this uid and not group/other-writable
-    from the fstat of that very descriptor, and hashed FROM the
-    descriptor — no second path resolution can substitute it."""
+def _read_descriptor_first(root: Path, rel: str) -> tuple:
+    """C16/C17: open the artifact descriptor-first with O_NOFOLLOW,
+    verify REGULAR / owner-uid / not-group-other-writable from the
+    fstat of that very descriptor, and read the FULL bytes FROM that
+    descriptor. Returns (bytes, sha256_hex) from ONE verified
+    descriptor — the caller parses the RETURNED BYTES and never
+    reopens the path, so no substitution between verify and consume
+    is possible (C17: the acta TOCTOU seam is closed)."""
     import errno as _errno
     import os as _os
     import stat as _stat
@@ -124,15 +127,25 @@ def _sha256_descriptor_first(root: Path, rel: str) -> str:
             raise ArtifactPathError(
                 f"{rel!r}: group/other-writable mode "
                 f"{oct(_stat.S_IMODE(st.st_mode))} refused")
-        digest = hashlib.sha256()
+        chunks = []
         while True:
             chunk = _os.read(fd, 65536)
             if not chunk:
                 break
-            digest.update(chunk)
-        return digest.hexdigest()
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        return data, hashlib.sha256(data).hexdigest()
     finally:
         _os.close(fd)
+
+
+def _sha256_descriptor_first(root: Path, rel: str) -> str:
+    """Digest-only wrapper over the single-descriptor reader, for
+    artifacts whose CONTENT the judge does not parse (backup files,
+    the diff, the rollback script). Structured artifacts the judge
+    parses use _read_descriptor_first and consume the returned
+    bytes."""
+    return _read_descriptor_first(root, rel)[1]
 
 
 def _canonical_digest(payload) -> str:
@@ -329,19 +342,23 @@ def evaluate(snapshot: dict, *, expected_account_fingerprint: str,
                             "reference does not authorize")
         else:
             try:
-                actual = _sha256_descriptor_first(root, acta_rel)
+                acta_bytes, actual = _read_descriptor_first(
+                    root, acta_rel)
             except ArtifactPathError as exc:
                 failures.append(f"P3: acta: {exc}")
-                actual = None
+                acta_bytes = actual = None
             if actual is not None and actual != acta_declared:
                 failures.append("P3: the acta file does not hash "
                                 "to its declared digest")
             elif actual is not None:
+                # C17: parse the VERIFIED BYTES, never reopen the
+                # path — the verified stream is the consumed stream
                 try:
-                    acta = json.loads(
-                        (Path(root) / acta_rel).read_text())
+                    acta = json.loads(acta_bytes.decode("utf-8"))
                 except Exception as exc:
-                    failures.append(f"P3: acta unreadable: {exc}")
+                    failures.append(
+                        f"P3: verified acta bytes are malformed: "
+                        f"{exc}")
         if acta is not None:
             if not _verify_sealed_manifest(acta, failures,
                                            "P3 acta"):

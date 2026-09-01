@@ -435,3 +435,101 @@ class TestC16PathAndDescriptorDiscipline:
                      heartbeat=heartbeat(trade_allowed=False))
         assert result["verdict"] == "GO_READ_ONLY_COLLECTOR_ONLY"
         assert result["failures"] == []
+
+
+class TestC17ActaDescriptorConsumed:
+    """C17: the acta is read from ONE verified descriptor and parsed
+    from those returned bytes — never reopened by path. The frozen
+    TOCTOU (verify good bytes, consume a swapped replacement) is
+    dead."""
+
+    def test_the_reader_returns_bytes_and_their_own_digest(
+            self, tmp_path):
+        from tools.collector_activation_preflight import (
+            _read_descriptor_first)
+        import os as os_mod
+        root = tmp_path / "r"
+        root.mkdir()
+        f = root / "a.json"
+        f.write_bytes(b'{"k": 1}')
+        os_mod.chmod(f, 0o600)
+        data, digest = _read_descriptor_first(root, "a.json")
+        assert data == b'{"k": 1}'
+        assert digest == hashlib.sha256(data).hexdigest()
+
+    def test_evaluate_never_reopens_a_verified_structured_artifact(
+            self):
+        """STRUCTURAL: the evaluate() body parses the acta from the
+        bytes _read_descriptor_first returned and contains no
+        path-reopen (read_text/read_bytes/open of a root-relative
+        artifact) after verification. The only read_text calls live
+        in main() over operator-supplied CLI JSON, outside the
+        canonical root."""
+        import inspect
+        import tools.collector_activation_preflight as mod
+        body = inspect.getsource(mod.evaluate)
+        assert "read_text" not in body
+        assert "read_bytes" not in body
+        assert "acta_bytes.decode" in body, (
+            "the acta must be parsed from the verified bytes")
+
+    def test_symlinked_acta_is_refused_by_nofollow(self, tmp_path):
+        import os as os_mod
+        kit = real_kit(tmp_path)
+        acta = kit["backup_root"] / "review_acta.json"
+        real = kit["backup_root"] / "real_acta.json"
+        acta.rename(real)
+        os_mod.symlink(real, acta)
+        result = run_kit(kit)
+        assert any("symlink refused" in f or "acta" in f
+                   for f in result["failures"])
+
+    def test_a_rename_swap_to_attacker_bytes_is_not_consumed(
+            self, tmp_path):
+        """Even a rename swap cannot be consumed: the verified digest
+        is computed from the same descriptor whose bytes are parsed,
+        so an acta whose declared digest no longer matches the file
+        refuses rather than being read."""
+        import os as os_mod
+        kit = real_kit(tmp_path)
+        acta = kit["backup_root"] / "review_acta.json"
+        attacker = dict(json.loads(acta.read_text()))
+        attacker.pop("seal_sha256", None)
+        attacker["reviewer_identity"] = "attacker"
+        attacker["seal_sha256"] = _canonical_digest(attacker)
+        # the declared digest still names the ORIGINAL acta; the file
+        # now holds attacker bytes
+        acta.write_text(json.dumps(attacker, sort_keys=True))
+        os_mod.chmod(acta, 0o600)
+        result = run_kit(kit)
+        assert result["verdict"] == "COORDINATED_WINDOW_REQUIRED"
+        assert any("does not hash to its declared digest" in f
+                   for f in result["failures"])
+        # the attacker reviewer was NEVER consumed
+        assert not any("attacker" in f for f in result["failures"])
+
+    def test_malformed_verified_bytes_refuse(self, tmp_path):
+        import os as os_mod
+        kit = real_kit(tmp_path)
+        acta = kit["backup_root"] / "review_acta.json"
+        acta.write_bytes(b"not json at all")
+        os_mod.chmod(acta, 0o600)
+        kit["ea_diff_review"] = {
+            "acta_path": acta.name,
+            "acta_sha256": hashlib.sha256(
+                acta.read_bytes()).hexdigest()}
+        result = run_kit(kit)
+        assert any("verified acta bytes are malformed" in f
+                   for f in result["failures"])
+
+    def test_digest_mismatch_refuses_before_parsing(self, tmp_path):
+        kit = real_kit(tmp_path)
+        review = dict(kit["ea_diff_review"], acta_sha256="e" * 64)
+        result = run_kit({**kit, "ea_diff_review": review})
+        assert any("does not hash to its declared digest" in f
+                   for f in result["failures"])
+
+    def test_the_clean_go_path_still_holds(self, tmp_path):
+        result = run(tmp_path)
+        assert result["verdict"] == "GO_READ_ONLY_COLLECTOR_ONLY"
+        assert result["failures"] == []
