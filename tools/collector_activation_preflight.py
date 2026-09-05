@@ -294,7 +294,15 @@ def evaluate(snapshot: dict, *, expected_account_fingerprint: str,
         # ignores the field and the precondition text makes no such
         # claim. (The heartbeat schema still carries it for other
         # consumers.)
-        if int(expected_terminal_build) != \
+        if type(expected_terminal_build) is not int \
+                or expected_terminal_build <= 0:
+            failures.append(
+                "P5: expected_terminal_build must be a positive "
+                "int (exact type; no string parsing, truncation "
+                f"or normalization) — got "
+                f"{expected_terminal_build!r} "
+                f"({type(expected_terminal_build).__name__})")
+        elif expected_terminal_build != \
                 OWNER_RATIFIED_TERMINAL_BUILD:
             failures.append(
                 f"P5: expected build {expected_terminal_build} is "
@@ -302,7 +310,11 @@ def evaluate(snapshot: dict, *, expected_account_fingerprint: str,
                 f"{OWNER_RATIFIED_TERMINAL_BUILD} (ratification "
                 "2026-09-04; a different build needs a new owner "
                 "disposition)")
-        if beat.terminal_build != OWNER_RATIFIED_TERMINAL_BUILD:
+        if type(beat.terminal_build) is not int:
+            failures.append(
+                "P5: heartbeat terminal_build must be a strict "
+                f"integer — got {beat.terminal_build!r}")
+        elif beat.terminal_build != OWNER_RATIFIED_TERMINAL_BUILD:
             failures.append(
                 f"P5: terminal build {beat.terminal_build} is not "
                 f"the owner-ratified "

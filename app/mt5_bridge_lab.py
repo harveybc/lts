@@ -17,7 +17,7 @@ from typing import Any, Mapping, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import StrictInt, BaseModel, ConfigDict, Field
 
 
 SCHEMA_VERSION = "lts.mt5.bridge_olap.v1"
@@ -134,7 +134,10 @@ class HeartbeatPayload(StrictModel):
     environment: str
     connected: bool
     trade_allowed: bool
-    terminal_build: int = Field(ge=0)
+    # C25 (agent-multi@0b4d2748): STRICT integer — the owner's
+    # decision is the integer 6140, not every value that parses
+    # into it; strings and floats refuse at the schema
+    terminal_build: StrictInt = Field(ge=0)
     terminal_ping_ms: float = Field(ge=0)
     observed_at: datetime
 

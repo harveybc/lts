@@ -578,3 +578,65 @@ class TestOwnerRatifiedBuild6140:
         result = run(tmp_path)
         assert not any("build" in f.lower()
                        for f in result["failures"])
+
+
+class TestStrictBuildBoundary:
+    """C25 (order @0b4d2748): the expected build is validated as an
+    EXACT positive int equal to 6140 before heartbeat-dependent
+    branches — no int(), parsing, truncation or normalization."""
+
+    def _run_expected(self, tmp_path, expected):
+        kit = real_kit(tmp_path)
+        return evaluate(snapshot(),
+                        expected_account_fingerprint=FP_A,
+                        expected_server_fingerprint=FP_S,
+                        expected_symbol="ETHUSD",
+                        expected_terminal_build=expected,
+                        expected_reviewer_identity="musashi",
+                        now=NOW, **kit)
+
+    def _assert_named_refusal(self, result):
+        assert result["verdict"] != "GO_READ_ONLY_COLLECTOR_ONLY"
+        assert any("positive int" in f or "owner-ratified" in f
+                   for f in result["failures"])
+
+    def test_string_6140_refuses(self, tmp_path):
+        self._assert_named_refusal(
+            self._run_expected(tmp_path, "6140"))
+
+    def test_float_6140_refuses(self, tmp_path):
+        self._assert_named_refusal(
+            self._run_expected(tmp_path, 6140.0))
+
+    def test_float_6140_5_refuses(self, tmp_path):
+        self._assert_named_refusal(
+            self._run_expected(tmp_path, 6140.5))
+
+    def test_boolean_refuses(self, tmp_path):
+        self._assert_named_refusal(
+            self._run_expected(tmp_path, True))
+
+    def test_null_refuses(self, tmp_path):
+        self._assert_named_refusal(
+            self._run_expected(tmp_path, None))
+
+    def test_negative_refuses(self, tmp_path):
+        self._assert_named_refusal(
+            self._run_expected(tmp_path, -6140))
+
+    def test_arbitrary_integer_refuses(self, tmp_path):
+        self._assert_named_refusal(
+            self._run_expected(tmp_path, 6141))
+
+    def test_heartbeat_build_must_be_strict_int(self, tmp_path):
+        result = run(tmp_path,
+                     heartbeat=heartbeat(terminal_build="6140"))
+        assert result["verdict"] != "GO_READ_ONLY_COLLECTOR_ONLY"
+        assert any("strict schema" in f
+                   or "strict integer" in f
+                   for f in result["failures"])
+
+    def test_exact_int_6140_passes_build_checks(self, tmp_path):
+        result = run(tmp_path)
+        assert not any("build" in f.lower()
+                       for f in result["failures"])
