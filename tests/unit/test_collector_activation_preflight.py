@@ -19,7 +19,7 @@ from tools.collector_activation_preflight import (
 NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
 FP_A = "a" * 16
 FP_S = "b" * 16
-BUILD = 4620
+BUILD = 6140
 
 
 def snapshot(**kw):
@@ -533,3 +533,48 @@ class TestC17ActaDescriptorConsumed:
         result = run(tmp_path)
         assert result["verdict"] == "GO_READ_ONLY_COLLECTOR_ONLY"
         assert result["failures"] == []
+
+
+class TestOwnerRatifiedBuild6140:
+    """Owner ratification 2026-09-04 (agent-multi@bb105fa6): the
+    judge itself carries the ratified build 6140. The stale 6090
+    and any arbitrary build refuse on BOTH sides."""
+
+    def _run_expected(self, tmp_path, expected):
+        kit = real_kit(tmp_path)
+        return evaluate(snapshot(),
+                        expected_account_fingerprint=FP_A,
+                        expected_server_fingerprint=FP_S,
+                        expected_symbol="ETHUSD",
+                        expected_terminal_build=expected,
+                        expected_reviewer_identity="musashi",
+                        now=NOW, **kit)
+
+    def test_stale_expected_6090_refuses(self, tmp_path):
+        result = self._run_expected(tmp_path, 6090)
+        assert result["verdict"] != "GO_READ_ONLY_COLLECTOR_ONLY"
+        assert any("owner-ratified" in f and "6090" in f
+                   for f in result["failures"])
+
+    def test_arbitrary_expected_build_refuses(self, tmp_path):
+        result = self._run_expected(tmp_path, 6155)
+        assert result["verdict"] != "GO_READ_ONLY_COLLECTOR_ONLY"
+        assert any("owner-ratified" in f
+                   for f in result["failures"])
+
+    def test_observed_stale_6090_refuses(self, tmp_path):
+        result = run(tmp_path,
+                     heartbeat=heartbeat(terminal_build=6090))
+        assert result["verdict"] != "GO_READ_ONLY_COLLECTOR_ONLY"
+        assert any("terminal build 6090" in f
+                   for f in result["failures"])
+
+    def test_observed_arbitrary_build_refuses(self, tmp_path):
+        result = run(tmp_path,
+                     heartbeat=heartbeat(terminal_build=7001))
+        assert result["verdict"] != "GO_READ_ONLY_COLLECTOR_ONLY"
+
+    def test_ratified_pair_passes_build_check(self, tmp_path):
+        result = run(tmp_path)
+        assert not any("build" in f.lower()
+                       for f in result["failures"])

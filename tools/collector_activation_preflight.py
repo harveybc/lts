@@ -200,6 +200,18 @@ def _verify_artifact(entry, root: Path, failures: list,
                         f"{declared[:12]}… — invented or stale")
 
 
+# Owner ratification 2026-09-04 (agent-multi@bb105fa6, record sha
+# 399483a14ab4821a49155afd72d153e870e2f9c051945875ca7fdfb5a5726186):
+# terminal build 6140 ACCEPTED as the current expected build for
+# collector preflight and operator-kit validation, superseding the
+# stale 6090 in this scope only. The judge makes the ratification
+# EXECUTABLE: an expected-build argument that differs from the
+# ratified value refuses, so neither the old 6090 nor an arbitrary
+# build can be smuggled in through the kit. A different observed
+# build requires a NEW owner disposition.
+OWNER_RATIFIED_TERMINAL_BUILD = 6140
+
+
 def evaluate(snapshot: dict, *, expected_account_fingerprint: str,
              expected_server_fingerprint: str,
              expected_symbol: str,
@@ -282,10 +294,19 @@ def evaluate(snapshot: dict, *, expected_account_fingerprint: str,
         # ignores the field and the precondition text makes no such
         # claim. (The heartbeat schema still carries it for other
         # consumers.)
-        if beat.terminal_build != int(expected_terminal_build):
+        if int(expected_terminal_build) != \
+                OWNER_RATIFIED_TERMINAL_BUILD:
+            failures.append(
+                f"P5: expected build {expected_terminal_build} is "
+                f"not the owner-ratified "
+                f"{OWNER_RATIFIED_TERMINAL_BUILD} (ratification "
+                "2026-09-04; a different build needs a new owner "
+                "disposition)")
+        if beat.terminal_build != OWNER_RATIFIED_TERMINAL_BUILD:
             failures.append(
                 f"P5: terminal build {beat.terminal_build} is not "
-                f"the expected {expected_terminal_build}")
+                f"the owner-ratified "
+                f"{OWNER_RATIFIED_TERMINAL_BUILD}")
         beat_age = (now - beat.observed_at).total_seconds()
         if beat_age < 0 or beat_age > MAX_HEARTBEAT_AGE_SECONDS:
             failures.append(
