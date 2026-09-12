@@ -24,7 +24,9 @@ from app.model_runner_heartbeat import (
     linear_model_identity,
     write_runner_heartbeat,
 )
-from app.runner_retry_taxonomy import classify_runner_exception
+from app.runner_retry_taxonomy import (backoff_seconds,
+                                       classify_runner_exception,
+                                       transient_cause)
 
 
 def _utc_now() -> datetime:
@@ -539,32 +541,58 @@ def main() -> int:
         stopped.set()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    # R4: consecutive transient failures back off, bounded. A good tick
+    # resets the count — recovery is measured by success, not by elapsed
+    # time.
+    backoff_base = float(config.get("transient_backoff_base_seconds", 15.0))
+    backoff_cap = float(config.get("transient_backoff_cap_seconds", 300.0))
+    consecutive_transient = 0
     try:
         while not stopped.is_set():
             try:
                 result = runner.tick(allow_execution=not args.inference_only)
+                consecutive_transient = 0
                 runner.write_heartbeat(result)
                 print(json.dumps(result, sort_keys=True, default=str), flush=True)
             except Exception as exc:
-                # 103: transient connection/session failures keep the
-                # normal cadence; anything else is fatal — an advancing
+                # 103: transient connection/session failures retry with a
+                # bounded backoff; anything else is fatal — an advancing
                 # degraded heartbeat on the slow fatal cadence so the
                 # condition pages immediately and is never mislabeled as
                 # connectivity (091 keeps the service alive either way;
                 # ledger idempotency makes the next tick safe).
+                #
+                # R4: the classification follows the explicit `raise ...
+                # from` chain, so a ConnectionError the broker wrapped in
+                # AlpacaPaperError is still transient. The heartbeat names
+                # the cause that made it so, because "degraded" without a
+                # named cause is not an observation.
                 kind = classify_runner_exception(exc)
-                runner.write_heartbeat({
+                cause = transient_cause(exc)
+                degraded = {
                     "state": "degraded_error",
                     "phase": "connect" if kind == "transient" else "fatal",
                     "error": f"{type(exc).__name__}: {exc}",
                     "orders_submitted": None,
-                })
+                    "transient_cause": (type(cause).__name__ if cause
+                                        else "UNAVAILABLE"),
+                }
+                if kind == "transient":
+                    consecutive_transient += 1
+                    wait = backoff_seconds(consecutive_transient,
+                                           base=backoff_base,
+                                           cap=backoff_cap)
+                    degraded["consecutive_transient"] = consecutive_transient
+                    degraded["retry_in_seconds"] = wait
+                runner.write_heartbeat(degraded)
                 if args.once:
                     raise
                 if kind == "fatal":
                     stopped.wait(float(
                         config.get("fatal_retry_seconds", 3600.0)))
                     continue
+                stopped.wait(wait)
+                continue
             if args.once:
                 break
             stopped.wait(float(config["loop_seconds"]))
