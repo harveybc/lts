@@ -10,6 +10,16 @@ using [trading-contracts](https://github.com/harveybc/trading-contracts).
 
 ## Status
 
+**Publication scope (2026-09-14):** subsequent paper-execution and data-contract
+work is published in a [research snapshot](https://github.com/harveybc/lts/tree/ed698ed5d0831e5f93700b04778f451bb7d37230).
+It is not all integrated into this `main` branch, and updating GitHub does not
+update a running service. Start an evaluation with offline fixtures, not with
+broker credentials or service restarts.
+
+LTS is the execution component, not the doctoral representation-learning model.
+See the [research repository map](https://github.com/harveybc/predictor/blob/master/docs/RESEARCH_STACK.md)
+for its relationship to forecasting, feature extraction and DOIN.
+
 **ACTIVE — core repository.** Package `lts` version **0.1.0**
 ([`setup.py`](setup.py)).
 
