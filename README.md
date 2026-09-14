@@ -28,6 +28,14 @@ are OANDA practice, Alpaca paper, IBKR paper, an MT5 bridge and a Capital.com
 demo lab. Real-capital trading is **not** enabled anywhere in this
 repository, and none of the examples or strategies are financial advice.
 
+## Use with a coding agent
+
+> Read this README and inspect the chosen console script before running it.
+> Start with CLI help and isolated offline fixtures. Do not start an execution
+> runner, connect a broker, alter an account, or restart a live service.
+> Report configured model/data identities and distinguish simulated behavior
+> from paper/live evidence. Preserve existing processes and database contents.
+
 ## Role and non-responsibilities
 
 **Owns**
