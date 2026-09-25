@@ -769,3 +769,26 @@ def test_emit_failures_are_counted_not_raised(tmp_path: Path) -> None:
         runner=broken_runner,
     )
     assert failures == 1
+
+
+def test_a_detail_that_only_changes_in_its_numbers_is_the_same_event_and_is_not_re_emitted(tmp_path: Path) -> None:
+    """2026-09-24: `mt5_bridge_stale` carried the heartbeat age in its detail, so every five-minute run hashed a new
+    detail, called it a changed event and paged the Telegram group -- 220 alerts in one day for one condition."""
+    store = MonitorStore(tmp_path / "monitor.sqlite")
+    state: dict = {}
+
+    def stale(age: str) -> dict:
+        return {"key": "mt5_bridge_stale", "title": "MT5 bridge stale", "detail": f"latest MT5 heartbeat age: {age}",
+                "severity": "critical", "category": "operations", "discussion": False}
+    try:
+        first = process_events([stale("3h12m")], state, store, now=1000.0, repeat_seconds=3600.0)
+        assert [e["kind"] for e in first] == ["observe"]
+        for minutes, age in ((5, "3h17m"), (10, "3h22m"), (55, "4h07m")):
+            again = process_events([stale(age)], state, store, now=1000.0 + minutes * 60, repeat_seconds=3600.0)
+            assert again == [], f"re-emitted at +{minutes} min for a detail that only changed in its numbers"
+        # the same condition repeats once the repeat window has passed, and a real change of severity is a new event
+        assert [e["kind"] for e in process_events([stale("4h13m")], state, store, now=1000.0 + 3601, repeat_seconds=3600.0)] == ["observe"]
+        worse = dict(stale("4h20m"), severity="emergency")
+        assert [e["kind"] for e in process_events([worse], state, store, now=1000.0 + 3700, repeat_seconds=3600.0)] == ["observe"]
+    finally:
+        store.close()

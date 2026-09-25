@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import re
 import json
 import math
 import os
@@ -1267,6 +1268,20 @@ class MonitorStore:
         self.connection.close()
 
 
+_VOLATILE = re.compile(r"\d[\d.,:]*\s*[a-zA-Z%]*")
+
+
+def _event_digest(item: Mapping[str, Any]) -> str:
+    """What makes an event the SAME event across runs: its title, severity and its detail with every number blanked.
+
+    The detail of a stale-heartbeat event carries the age ("latest MT5 heartbeat age: 3h12m"), which changes every
+    run; hashing it verbatim made every run a "changed" event and the group received one alert per five minutes for a
+    whole day (220 on 2026-09-24). Numbers are not identity; a real change of state is a new title or severity, and
+    the unchanged event repeats only every --repeat-minutes."""
+    detail = _VOLATILE.sub("#", str(item.get("detail", "")))
+    return hashlib.sha256(f"{item['title']}|{item.get('severity', '')}|{detail}".encode("utf-8")).hexdigest()
+
+
 def process_events(
     events: Sequence[Mapping[str, Any]],
     state: dict[str, Any],
@@ -1281,9 +1296,7 @@ def process_events(
     current = {str(item["key"]): item for item in events}
     for key, item in current.items():
         previous = event_state.get(key) or {}
-        digest = hashlib.sha256(
-            f"{item['title']}|{item['detail']}".encode("utf-8")
-        ).hexdigest()
+        digest = _event_digest(item)
         due = (
             not previous.get("active")
             or previous.get("digest") != digest
