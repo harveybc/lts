@@ -49,11 +49,13 @@ from app.broker_refusal import (
     RECOVERY_RETRY_WITH_BOUND,
     BrokerRefusal,
 )
+from app.mt5_bridge_lab import Mt5BridgeError
 from app.mt5_execution_bridge import (
     ExecutionResultPayload,
     Mt5ExecutionConfig,
     Mt5ExecutionStore,
 )
+from app.mt5_unknown_outcome import OrderObservation
 from app.mt5_policy_risk import (
     ACTION_CLOSE,
     ACTION_OPEN_LONG,
@@ -388,29 +390,40 @@ def _enqueue(store, config, key):
         artifact_sha256="a" * 64, config_sha256="b" * 64, input_sha256="c" * 64)
 
 
-def test_the_bridge_today_collapses_a_timeout_and_a_closed_market_into_one_state(tmp_path):
-    """The gap this lane's classifier fills, measured on the real store.
+def test_the_bridge_no_longer_collapses_a_timeout_and_a_closed_market(tmp_path):
+    """The gap this lane's classifier filled, now closed in the service.
 
-    ``Mt5ExecutionStore.complete`` writes ``failed`` for both, so nothing
-    downstream can tell an unproven effect from a proven non-effect. The
-    classifier's verdicts for the same two payloads differ, which is the point.
+    RP149 recorded the defect here and could not fix it: ``complete`` wrote
+    ``state = "succeeded" if payload.success else "failed"``, so a timeout and a
+    closed market landed in ONE state and the timed-out command stopped counting
+    against the daily entry budget. The owner grant of 2026-09-26 made the
+    classifier's verdict the state the store writes, so the two payloads now
+    part company in the store exactly as they always did in the classifier.
     """
     config = _bridge_config(tmp_path)
     store = Mt5ExecutionStore(config.database_path)
     try:
-        # one at a time: the route's declared concurrency permits a single
-        # unresolved command, which is why the first is completed before the
-        # second is enqueued.
         timed_out = _enqueue(store, config, "decision-timeout")
         first = store.complete(_payload(timed_out["command_id"], 10012,
                                         "request canceled by timeout"))
+        assert first["state"] == "effect_unknown"
+        # The route is now blocked: the position may exist. The only exit is a
+        # read-side observation, so the second decision cannot even be queued
+        # until the terminal has been ASKED what it did.
+        with pytest.raises(Mt5BridgeError, match="never been observed"):
+            _enqueue(store, config, "decision-closed")
+        store.reconcile_unknown_effect(
+            command_id=timed_out["command_id"],
+            account_fingerprint=FINGERPRINT,
+            observation=OrderObservation(
+                query="MetaTrader5.history_orders_get",
+                observed_at=NOW + timedelta(minutes=2), order_exists=False))
+
         closed = _enqueue(store, config, "decision-closed")
         second = store.complete(_payload(closed["command_id"], 10018, "market is closed"))
-        assert first["state"] == second["state"] == "failed", \
-            "today both land in one state; this is the defect, recorded"
-        # and the timed-out command, recorded as failed, no longer counts against
-        # the daily entry budget -- the slot it may still be holding is free.
-        assert store.command_counts() == {"failed": 2}
+        assert second["state"] == "failed", "a closed market PROVES nothing was placed"
+        assert store.command_counts() == {"failed": 2}, \
+            "the timeout only became a failure because the broker was asked"
     finally:
         store.connection.close()
 

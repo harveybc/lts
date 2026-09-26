@@ -23,6 +23,24 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import Field
 
+from app.mt5_unknown_outcome import (
+    BUDGET_RELEASING_STATES,
+    OPEN_STATES,
+    EVENT_MIGRATION_CORRECTION,
+    OUTCOME_SCHEMA,
+    STATE_DELIVERED,
+    STATE_EFFECT_UNKNOWN,
+    STATE_FAILED,
+    STATE_PENDING,
+    STATE_SUCCEEDED,
+    TERMINAL_STATES,
+    UNRESOLVED_STATES,
+    Outcome,
+    OrderObservation,
+    RECONCILABLE_STATES,
+    outcome_for_execution_result,
+    outcome_from_observation,
+)
 from app.mt5_bridge_lab import (
     EVENT_SCHEMA,
     HEARTBEAT_SCHEMA,
@@ -211,6 +229,29 @@ class Mt5ExecutionStore(Mt5BridgeStore):
                 payload_json TEXT NOT NULL,
                 digest TEXT NOT NULL
             );
+            -- Owner grant 2026-09-26: the append-only outcome ledger. A
+            -- command's terminal state is the LATEST record here, and a
+            -- record is never edited: an EA result, a read-side
+            -- reconciliation and a migration's correction of a historical
+            -- mislabelling are three separate appended events, each with its
+            -- own timestamps. execution_commands.state keeps the first
+            -- terminal write for compatibility and is only ever a fallback
+            -- for commands that predate this ledger.
+            CREATE TABLE IF NOT EXISTS execution_command_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                command_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                event_kind TEXT NOT NULL,
+                consumes_budget_slot INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL,
+                observed_at TEXT,
+                supersedes_state TEXT,
+                outcome_json TEXT NOT NULL,
+                source_schema TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mt5_outcomes_command
+                ON execution_command_outcomes(command_id,id);
             """)
 
     def record_bars_evidence(self, *, symbol: str, payload: str,
@@ -236,6 +277,136 @@ class Mt5ExecutionStore(Mt5BridgeStore):
     @staticmethod
     def _command_id(idempotency_key: str) -> str:
         return "mt5-" + hashlib.sha256(idempotency_key.encode()).hexdigest()[:40]
+
+    # ------------------------------------------------- the outcome ledger
+    #: The read path for a command's state: the LATEST appended outcome, and the
+    #: legacy ``state`` column only for commands that never got one. Nothing is
+    #: rewritten in place, so every reader must join through this.
+    _EFFECTIVE_FROM = (
+        " FROM execution_commands c"
+        " LEFT JOIN execution_command_outcomes o"
+        " ON o.id = (SELECT MAX(x.id) FROM execution_command_outcomes x"
+        " WHERE x.command_id = c.command_id)"
+    )
+    _EFFECTIVE_STATE = "COALESCE(o.outcome,c.state)"
+
+    def policy_inputs(
+        self, config: "Mt5ExecutionConfig", *, symbol: str,
+        now: Optional[datetime] = None,
+    ) -> dict[str, int]:
+        """The three counts ``mt5_policy_risk`` refuses an order on, measured
+        from this store rather than passed in by a caller.
+
+        ``entries_today`` is the number of budget slots HELD, so an unknown
+        effect counts. Handing the policy interface a count derived any other
+        way is how the defect reached the budget boundary in the first place.
+        """
+        moment = now or datetime.now(timezone.utc)
+        day_start = f"{moment.date().isoformat()}T00:00:00+00:00"
+        unknown = self.unreconciled_unknown_effects(config.account_fingerprint)
+        placeholders = ",".join("?" for _ in sorted(OPEN_STATES))
+        with self._lock:
+            unresolved = int(self.connection.execute(
+                f"SELECT COUNT(*){self._EFFECTIVE_FROM}"
+                " WHERE c.account_fingerprint=? AND c.symbol=?"
+                f" AND {self._EFFECTIVE_STATE} IN ({placeholders})",
+                (config.account_fingerprint, symbol.upper(),
+                 *sorted(OPEN_STATES)),
+            ).fetchone()[0])
+        return {
+            "entries_today": self.daily_entry_slots_consumed(
+                day_start=day_start,
+                account_fingerprint=config.account_fingerprint),
+            "unknown_effects": len(unknown),
+            "unresolved_commands_on_route": unresolved,
+        }
+
+    def _append_outcome(
+        self, command_id: str, outcome: Outcome, previous_state: Optional[str],
+    ) -> int:
+        """Append one outcome record. Called with the lock and inside a
+        transaction by the writer; it never UPDATEs an existing record."""
+        cursor = self.connection.execute(
+            "INSERT INTO execution_command_outcomes"
+            "(command_id,outcome,evidence,event_kind,consumes_budget_slot,"
+            "recorded_at,observed_at,supersedes_state,outcome_json,"
+            "source_schema) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                command_id, outcome.state, outcome.evidence, outcome.event_kind,
+                1 if outcome.consumes_budget_slot else 0, _utc_now(),
+                None if outcome.observed_at is None
+                else outcome.observed_at.isoformat(),
+                previous_state, _canonical_json(outcome.as_fact()),
+                OUTCOME_SCHEMA,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def effective_state(self, command_id: str) -> Optional[str]:
+        """The command's state as the read path sees it, or ``None`` if the
+        command does not exist."""
+        with self._lock:
+            row = self.connection.execute(
+                f"SELECT {self._EFFECTIVE_STATE}{self._EFFECTIVE_FROM}"
+                " WHERE c.command_id=?", (command_id,),
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def outcome_history(self, command_id: str) -> list[dict[str, Any]]:
+        """Every appended outcome for one command, oldest first. The chain is
+        the audit trail: a reconciliation never erases the unknown it exits."""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM execution_command_outcomes WHERE command_id=?"
+                " ORDER BY id", (command_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def unreconciled_unknown_effects(
+        self, account_fingerprint: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """Commands whose effect nobody has observed. Each one holds a daily
+        budget slot and blocks new risk on its route until a read-side query
+        says what the broker actually did."""
+        query = (
+            "SELECT c.command_id,c.symbol,c.action,c.created_at,c.completed_at,"
+            f"o.evidence,o.recorded_at{self._EFFECTIVE_FROM}"
+            f" WHERE {self._EFFECTIVE_STATE}=?"
+        )
+        params: list[Any] = [STATE_EFFECT_UNKNOWN]
+        if account_fingerprint is not None:
+            query += " AND c.account_fingerprint=?"
+            params.append(account_fingerprint)
+        with self._lock:
+            rows = self.connection.execute(
+                query + " ORDER BY c.created_at", tuple(params)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def daily_entry_slots_consumed(
+        self, *, day_start: str, account_fingerprint: Optional[str] = None
+    ) -> int:
+        """How many of the day's entry slots are held.
+
+        The inversion that fixes the defect: a slot is counted as consumed
+        unless the effective state is one that PROVES no order exists. The old
+        query asked ``state != 'failed'`` over a column where every unproven
+        outcome had already been written as ``failed``, so a timed-out send
+        freed the slot it may still have been holding.
+        """
+        placeholders = ",".join("?" for _ in sorted(BUDGET_RELEASING_STATES))
+        query = (
+            f"SELECT COUNT(*){self._EFFECTIVE_FROM}"
+            " WHERE c.action LIKE 'open_%' AND c.created_at>=?"
+            f" AND {self._EFFECTIVE_STATE} NOT IN ({placeholders})"
+        )
+        params: list[Any] = [day_start, *sorted(BUDGET_RELEASING_STATES)]
+        if account_fingerprint is not None:
+            query += " AND c.account_fingerprint=?"
+            params.append(account_fingerprint)
+        with self._lock:
+            return int(self.connection.execute(
+                query, tuple(params)).fetchone()[0])
 
     def enqueue(
         self,
@@ -279,19 +450,32 @@ class Mt5ExecutionStore(Mt5BridgeStore):
             ).fetchone()
             if existing is not None:
                 return {**dict(existing), "replayed": True}
+            # An unknown effect is UNRESOLVED on its route exactly as a pending
+            # or delivered command is: the position may exist, so no new order
+            # is placed on that route until a read-side query says otherwise.
+            placeholders = ",".join("?" for _ in sorted(UNRESOLVED_STATES))
             unresolved = self.connection.execute(
-                "SELECT command_id FROM execution_commands WHERE "
-                "account_fingerprint=? AND symbol=? AND state IN ('pending','delivered')",
-                (config.account_fingerprint, symbol),
+                f"SELECT c.command_id,{self._EFFECTIVE_STATE}"
+                f"{self._EFFECTIVE_FROM}"
+                " WHERE c.account_fingerprint=? AND c.symbol=?"
+                f" AND {self._EFFECTIVE_STATE} IN ({placeholders})",
+                (config.account_fingerprint, symbol,
+                 *sorted(UNRESOLVED_STATES)),
             ).fetchone()
             if unresolved is not None:
+                if str(unresolved[1]) == STATE_EFFECT_UNKNOWN:
+                    raise Mt5BridgeError(
+                        "An unresolved MT5 effect on this route has never been "
+                        "observed; it is reconciled by a read-side broker query "
+                        "before any new order exists")
                 raise Mt5BridgeError("An unresolved MT5 route command already exists")
             if action in _OPEN_ACTIONS:
-                count = self.connection.execute(
-                    "SELECT COUNT(*) FROM execution_commands WHERE action LIKE 'open_%' "
-                    "AND created_at>=? AND state!='failed'",
-                    (f"{now.date().isoformat()}T00:00:00+00:00",),
-                ).fetchone()[0]
+                # The daily budget counts every slot that is HELD. An unknown
+                # effect holds its slot, because the position may exist;
+                # releasing one requires a positive observation that no order
+                # exists, never the absence of a confirmation.
+                count = self.daily_entry_slots_consumed(
+                    day_start=f"{now.date().isoformat()}T00:00:00+00:00")
                 if count >= config.max_open_commands_per_day:
                     raise Mt5BridgeError("MT5 daily Demo entry budget is exhausted")
             self.connection.execute(
@@ -368,22 +552,92 @@ class Mt5ExecutionStore(Mt5BridgeStore):
                 raise Mt5BridgeError("Unknown MT5 command result")
             value = payload.model_dump(by_alias=True, mode="json")
             serialized = _canonical_json(value)
-            if row[0] in {"succeeded", "failed"}:
+            if row[0] in TERMINAL_STATES:
                 if row[1] != serialized:
                     raise Mt5BridgeError("MT5 command result identity collision")
-                return {"duplicate": True, "state": row[0]}
-            state = "succeeded" if payload.success else "failed"
+                return {"duplicate": True,
+                        "state": self.effective_state(payload.command_id),
+                        "recorded_state": row[0]}
+            # THREE outcomes, not two. ``failed`` from here on means the
+            # venue's own machine code proves no order exists; a send whose
+            # effect was never observed is ``effect_unknown`` and stays that
+            # way until a read-side query reconciles it.
+            outcome = outcome_for_execution_result(value)
             self.connection.execute(
                 "UPDATE execution_commands SET state=?,completed_at=?,result_json=? "
                 "WHERE command_id=?",
-                (state, _utc_now(), serialized, payload.command_id),
+                (outcome.state, _utc_now(), serialized, payload.command_id),
             )
-            return {"duplicate": False, "state": state}
+            self._append_outcome(payload.command_id, outcome, row[0])
+            return {"duplicate": False, "state": outcome.state,
+                    "evidence": outcome.evidence,
+                    "consumes_budget_slot": outcome.consumes_budget_slot}
+
+    def reconcile_unknown_effect(
+        self,
+        *,
+        command_id: str,
+        account_fingerprint: str,
+        observation: OrderObservation,
+    ) -> dict[str, Any]:
+        """The ONLY exit from ``effect_unknown``.
+
+        A retry cannot take it, a timeout cannot take it and an operator's
+        assumption cannot take it: the only argument accepted is an
+        ``OrderObservation``, which refuses to exist unless it names a declared
+        READ-side broker query and carries the time the state was observed. An
+        unanswered query raises ``ReconciliationInconclusive`` and the command
+        keeps both its unknown state and its budget slot.
+
+        The exit is APPENDED as its own event. The original unknown record and
+        the ``state`` column are left exactly as they were written.
+        """
+        with self._lock, self.connection:
+            row = self.connection.execute(
+                f"SELECT c.command_id,{self._EFFECTIVE_STATE}"
+                f"{self._EFFECTIVE_FROM}"
+                " WHERE c.command_id=? AND c.account_fingerprint=?",
+                (command_id, account_fingerprint.lower()),
+            ).fetchone()
+            if row is None:
+                raise Mt5BridgeError("Unknown MT5 command reconciliation")
+            current = str(row[1])
+            if current not in RECONCILABLE_STATES:
+                raise Mt5BridgeError(
+                    f"only an MT5 command whose effect is unknown is "
+                    f"reconciled; this one is {current}")
+            outcome = outcome_from_observation(observation)
+            record_id = self._append_outcome(command_id, outcome, current)
+            return {
+                "command_id": command_id,
+                "previous_state": current,
+                "state": outcome.state,
+                "evidence": outcome.evidence,
+                "consumes_budget_slot": outcome.consumes_budget_slot,
+                "outcome_record_id": record_id,
+                "observed_at": observation.observed_at.isoformat(),
+                "query": observation.query,
+            }
+
+    def record_migration_correction(
+        self, *, command_id: str, outcome: Outcome, previous_state: str,
+    ) -> int:
+        """Append one migration correction. Used only by
+        ``tools/mt5_unknown_outcome_migration.py``; refuses any other event
+        kind so a live path cannot relabel a command through this door."""
+        if outcome.event_kind != EVENT_MIGRATION_CORRECTION:
+            raise Mt5BridgeError(
+                "only a migration correction is appended through this path")
+        with self._lock, self.connection:
+            return self._append_outcome(command_id, outcome, previous_state)
 
     def command_counts(self) -> dict[str, int]:
+        """Counts by EFFECTIVE state, so a reconciled or corrected command is
+        counted as what it is now rather than as what was first written."""
         with self._lock:
             rows = self.connection.execute(
-                "SELECT state,COUNT(*) FROM execution_commands GROUP BY state"
+                f"SELECT {self._EFFECTIVE_STATE} AS s,COUNT(*)"
+                f"{self._EFFECTIVE_FROM} GROUP BY s"
             ).fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
 
@@ -398,8 +652,9 @@ class Mt5ExecutionStore(Mt5BridgeStore):
         """
         with self._lock:
             row = self.connection.execute(
-                "SELECT * FROM execution_commands WHERE"
-                " account_fingerprint=? AND idempotency_key=?",
+                f"SELECT c.*,{self._EFFECTIVE_STATE} AS effective_state,"
+                f"o.evidence AS outcome_evidence{self._EFFECTIVE_FROM}"
+                " WHERE c.account_fingerprint=? AND c.idempotency_key=?",
                 (account_fingerprint.lower(), idempotency_key),
             ).fetchone()
         return dict(row) if row is not None else None
@@ -411,9 +666,10 @@ class Mt5ExecutionStore(Mt5BridgeStore):
                 "SELECT payload_json FROM account_snapshots ORDER BY id DESC LIMIT 1"
             ).fetchone()
             commands = self.connection.execute(
-                "SELECT action,symbol,volume,stop_loss,take_profit,result_json "
-                "FROM execution_commands WHERE state='succeeded' "
-                "ORDER BY completed_at,created_at"
+                "SELECT c.action,c.symbol,c.volume,c.stop_loss,c.take_profit,"
+                f"c.result_json{self._EFFECTIVE_FROM}"
+                f" WHERE {self._EFFECTIVE_STATE}='{STATE_SUCCEEDED}'"
+                " ORDER BY c.completed_at,c.created_at"
             ).fetchall()
         if snapshot is None:
             return {"available": False, "reason": "snapshot_missing"}
@@ -595,6 +851,15 @@ def create_mt5_execution_app(
         result["command_counts"] = store.command_counts()
         result["exposure_reconciliation"] = store.exposure_reconciliation()
         result["declared_concurrency"] = DECLARED_CONCURRENCY
+        # Owner grant 2026-09-26: an effect nobody observed is visible in the
+        # status, holds its daily budget slot and blocks its route until a
+        # read-side query reconciles it.
+        unknown = store.unreconciled_unknown_effects()
+        result["unreconciled_unknown_effects"] = {
+            "count": len(unknown),
+            "commands": unknown,
+            "exit": "read_side_broker_query_only",
+        }
         return result
 
     @app.post("/v1/heartbeat")

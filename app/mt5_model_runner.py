@@ -30,6 +30,13 @@ from app.model_runner_heartbeat import (
     write_runner_heartbeat,
 )
 from app.mt5_execution_bridge import Mt5ExecutionConfig, Mt5ExecutionStore
+from app.mt5_unknown_outcome import (
+    STATE_DELIVERED,
+    STATE_EFFECT_UNKNOWN,
+    STATE_FAILED,
+    STATE_PENDING,
+    STATE_SUCCEEDED,
+)
 from app.project3_sac_observation import (
     SacObservationError,
     build_sac_observation,
@@ -90,7 +97,11 @@ def durable_command_heartbeat(
         account_fingerprint, idempotency_key)
     if command is None:
         return None
-    state = str(command.get("state") or "")
+    # Owner grant 2026-09-26: the state a reader must act on is the EFFECTIVE
+    # one -- the latest appended outcome -- because a reconciliation and a
+    # migration correction are appended records and never rewrite the column.
+    state = str(command.get("effective_state")
+                or command.get("state") or "")
     command_id = str(command.get("command_id") or "")
     if not command_id:
         raise Mt5ModelRunnerError(
@@ -100,13 +111,23 @@ def durable_command_heartbeat(
         "command_state": state,
         "state_source": "execution_commands",
     }
-    if state == "pending":
+    if state == STATE_PENDING:
         return {"state": "command_pending", **common}
-    if state == "delivered":
+    if state == STATE_DELIVERED:
         return {"state": "command_delivered", **common}
-    if state == "failed":
+    if state == STATE_FAILED:
         return {"state": "command_failed", **common}
-    if state != "succeeded":
+    if state == STATE_EFFECT_UNKNOWN:
+        # Neither success nor failure. The runner must not treat this as a
+        # finished command that placed nothing: the position may exist, and the
+        # only exit is a read-side broker query recorded as a reconciliation.
+        return {
+            "state": "command_effect_unknown",
+            "reconciliation_required": True,
+            "outcome_evidence": command.get("outcome_evidence"),
+            **common,
+        }
+    if state != STATE_SUCCEEDED:
         raise Mt5ModelRunnerError(
             f"unsupported durable MT5 command state {state!r}")
 

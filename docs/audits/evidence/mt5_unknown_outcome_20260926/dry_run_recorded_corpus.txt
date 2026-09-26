@@ -1,0 +1,26 @@
+
+MT5 unknown-outcome migration — DRY RUN (nothing written)
+========================================================================
+
+Corrections that WOULD be appended:
+  mt5-h-broken  ETHUSD   failed -> effect_unknown   [record_cannot_support_either_reading]
+  mt5-h-contra  ETHUSD   failed -> effect_unknown   [result_contradicts_itself]
+  mt5-h-nocode  ETHUSD   failed -> effect_unknown   [no_machine_code_reported]
+  mt5-h-noresult  ETHUSD   failed -> effect_unknown   [delivered_without_a_result]
+  mt5-h-timeout  ETHUSD   failed -> effect_unknown   [retcode_leaves_outcome_unproven]
+
+commands examined: 9
+  confirmed_failed_no_record_written: 2
+  out_of_scope_not_a_failed_row: 2
+  relabel_as_effect_unknown: 5
+evidence of the failed rows re-read:
+  delivered_without_a_result: 1
+  never_delivered_to_the_ea: 1
+  no_machine_code_reported: 1
+  record_cannot_support_either_reading: 1
+  result_contradicts_itself: 1
+  retcode_leaves_outcome_unproven: 1
+  retcode_proves_no_order_exists: 1
+entry budget slots reclaimed (now held, not free): 5
+
+report: docs/audits/evidence/mt5_unknown_outcome_20260926/dry_run_recorded_corpus.json
