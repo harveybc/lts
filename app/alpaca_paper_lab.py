@@ -15,6 +15,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import requests
 
+from app.broker_refusal import attach_venue_facts
+
 
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 DATA_BASE_URL = "https://data.alpaca.markets"
@@ -276,8 +278,19 @@ class AlpacaPaperClient:
         except ValueError as exc:
             raise AlpacaPaperError(f"{endpoint} returned invalid JSON") from exc
         if not success:
-            message = payload.get("message", "request rejected") if isinstance(payload, dict) else ""
-            raise AlpacaPaperError(f"{endpoint} returned HTTP {response.status_code}: {message}")
+            body = payload if isinstance(payload, dict) else {}
+            message = body.get("message", "request rejected") if body else ""
+            # RP157: the venue's own status, machine code and reason travel
+            # as STRUCTURED facts. The message string is unchanged, and the
+            # reason is carried verbatim so no consumer has to parse prose.
+            raise attach_venue_facts(
+                AlpacaPaperError(
+                    f"{endpoint} returned HTTP {response.status_code}: {message}"
+                ),
+                status=response.status_code,
+                code=body.get("code"),
+                reason=message if message else str(payload),
+            )
         return payload
 
     @staticmethod

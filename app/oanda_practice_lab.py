@@ -21,6 +21,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 import requests
 
+from app.broker_refusal import attach_venue_facts
+
 
 PRACTICE_BASE_URL = "https://api-fxpractice.oanda.com"
 ORDER_CONFIRMATION = "ENABLE_PROTECTED_OANDA_PRACTICE_ORDERS"
@@ -234,7 +236,17 @@ class OandaPracticeClient:
             ) from exc
         if response.status_code >= 400:
             message = payload.get("errorMessage") or payload.get("errorCode") or payload
-            raise OandaPracticeError(f"OANDA HTTP {response.status_code}: {message}")
+            # RP157: OANDA's reject reason is a machine enum value, not
+            # prose. Carry it as a structured fact so no consumer has to
+            # parse the message string to learn what the venue refused.
+            raise attach_venue_facts(
+                OandaPracticeError(
+                    f"OANDA HTTP {response.status_code}: {message}"
+                ),
+                status=response.status_code,
+                code=payload.get("errorCode") or payload.get("rejectReason"),
+                reason=str(message),
+            )
         return payload
 
     def account_details(self) -> Dict[str, Any]:

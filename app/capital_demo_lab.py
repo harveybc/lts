@@ -16,6 +16,8 @@ from typing import Any, Mapping, Optional, Sequence
 
 import requests
 
+from app.broker_refusal import attach_venue_facts
+
 
 DEMO_BASE_URL = "https://demo-api-capital.backend-capital.com"
 API_PREFIX = "/api/v1"
@@ -28,6 +30,29 @@ GET_ENDPOINTS = {
     "working_orders": "/workingorders",
     "markets": "/markets",
 }
+
+
+
+def _venue_body(response: Any) -> Mapping[str, Any]:
+    """The venue's own answer, or an empty mapping. A body we cannot read
+    is never invented into one."""
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 — an unreadable body is simply absent
+        return {}
+    return body if isinstance(body, Mapping) else {}
+
+
+def _venue_code(response: Any) -> Optional[Any]:
+    """Capital.com answers a refusal with an ``errorCode`` enum value."""
+    return _venue_body(response).get("errorCode")
+
+
+def _venue_reason(response: Any) -> str:
+    """The venue's own words, verbatim, never reworded."""
+    body = _venue_body(response)
+    reason = body.get("errorCode") or body.get("message")
+    return str(reason) if reason else f"HTTP {response.status_code}"
 
 
 class CapitalDemoError(RuntimeError):
@@ -236,8 +261,14 @@ class CapitalDemoClient:
             None if 200 <= response.status_code < 300 else "http_error",
         )
         if not 200 <= response.status_code < 300:
-            raise CapitalDemoError(
-                f"Capital.com Demo authentication returned HTTP {response.status_code}"
+            raise attach_venue_facts(
+                CapitalDemoError(
+                    "Capital.com Demo authentication returned HTTP "
+                    f"{response.status_code}"
+                ),
+                status=response.status_code,
+                code=_venue_code(response),
+                reason=_venue_reason(response),
             )
         cst = response.headers.get("CST")
         security_token = response.headers.get("X-SECURITY-TOKEN")
@@ -281,8 +312,13 @@ class CapitalDemoClient:
             None if 200 <= response.status_code < 300 else "http_error",
         )
         if not 200 <= response.status_code < 300:
-            raise CapitalDemoError(
-                f"Capital.com {endpoint} returned HTTP {response.status_code}"
+            raise attach_venue_facts(
+                CapitalDemoError(
+                    f"Capital.com {endpoint} returned HTTP {response.status_code}"
+                ),
+                status=response.status_code,
+                code=_venue_code(response),
+                reason=_venue_reason(response),
             )
         try:
             payload = response.json()

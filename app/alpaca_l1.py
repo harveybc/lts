@@ -19,6 +19,11 @@ import requests
 from trading_contracts import ExecutionReportV2, OrderIntentV2, ProtectionLegState
 
 from app.alpaca_paper_lab import AlpacaPaperClient, AlpacaPaperError
+from app.broker_refusal import (
+    OPERATION_MUTATING,
+    attach_venue_facts,
+    classify_exception,
+)
 from app.demo_execution_service import DemoExecutionError, DemoExecutionService
 from app.ibkr_l1_journal import L1ExecutionOlap
 
@@ -109,10 +114,19 @@ class AlpacaPaperTradingClient(AlpacaPaperClient):
                 body = response.json()
             except ValueError:
                 body = {}
-            message = body.get("message", "request rejected") if isinstance(body, dict) else ""
-            raise AlpacaPaperError(
-                f"Alpaca Paper {method} {path} returned HTTP "
-                f"{response.status_code}: {message}"
+            if not isinstance(body, dict):
+                body = {}
+            message = body.get("message", "request rejected") if body else ""
+            # RP157: the venue's status, machine code and verbatim reason
+            # travel as structured facts; the message string is unchanged.
+            raise attach_venue_facts(
+                AlpacaPaperError(
+                    f"Alpaca Paper {method} {path} returned HTTP "
+                    f"{response.status_code}: {message}"
+                ),
+                status=response.status_code,
+                code=body.get("code"),
+                reason=message if message else "request rejected",
             )
         if allow_empty and not response.content:
             return None
@@ -224,6 +238,25 @@ class AlpacaL1Executor:
         self.profile = profile
         self.service = service
 
+    def new_risk_blocker(self) -> Optional[str]:
+        """Why new risk may NOT be placed right now, or ``None``.
+
+        RP157: this executor already set ``halt=hold`` on a protection
+        failure or a failed submission and already journalled
+        ``effect_unknown`` before every broker call — but it never read
+        either back, so a fresh idempotency key could place new risk while
+        an earlier effect's outcome was still unproven. An unknown state is
+        never assumed flat; it blocks until it is reconciled. The IBKR L1
+        executor has read its hold since finding 064.
+        """
+        halt = self.store.get_state("halt", "none")
+        if halt != "none":
+            return f"halted:{halt}"
+        for effect in self.store.nonterminal_effects():
+            if effect["state"] == "effect_unknown":
+                return f"effect_unknown:{effect['effect_id']}"
+        return None
+
     def _account(self) -> dict[str, Any]:
         account = self.client.account()
         observed = self.client.account_fingerprint(account)
@@ -249,7 +282,15 @@ class AlpacaL1Executor:
     ) -> dict[str, Any]:
         existing = self.store.effect_by_key(idempotency_key)
         if existing is not None:
+            # A repeated key resumes from the persisted effect and never
+            # submits a second order for the same client order id.
             return {**existing, "replayed": True}
+        blocker = self.new_risk_blocker()
+        if blocker is not None:
+            raise AlpacaPaperError(
+                f"Alpaca Paper new risk is blocked ({blocker}); "
+                "reconciliation must clear it first"
+            )
         if symbol.upper() != self.profile.symbol or asset_id != self.profile.asset_id:
             raise AlpacaPaperError("Alpaca order does not match the active model route")
         if side not in {"buy", "sell"} or qty <= 0 or qty > self.profile.quantity_ceiling:
@@ -299,7 +340,18 @@ class AlpacaL1Executor:
             self.store.advance_effect(effect_id, "effect_unknown")
         try:
             submitted = self.client.submit_bracket(contract)
-        except Exception:
+        except Exception as error:
+            # The effect is already journalled ``effect_unknown``: the
+            # outcome of this call is not proven either way. Record WHAT
+            # the venue refused and WHICH recovery is declared, then hold.
+            refusal = classify_exception(
+                error, venue=self.profile.venue,
+                operation=OPERATION_MUTATING,
+                client_order_id=client_order_id,
+            )
+            self.store.record_broker_fact(
+                effect_id, "submit_refusal", refusal.as_fact()
+            )
             self.store.set_state("halt", "hold")
             raise
         order_id = str(submitted.get("id", ""))
@@ -321,6 +373,14 @@ class AlpacaL1Executor:
         ) >= self.profile.max_orders_per_day
         for pending in self.store.l1_pending_decisions("would_be_order"):
             key = str(pending["idempotency_key"])
+            blocker = self.new_risk_blocker()
+            if blocker is not None:
+                # The decision stays pending: a hold or an unreconciled
+                # unknown effect is not a reason to drop a decision, and it
+                # is certainly not a reason to submit.
+                results.append({"idempotency_key": key,
+                                "blocked": blocker})
+                continue
             if budget_exhausted:
                 # Finding 101: budget exhaustion is a durable decision
                 # outcome with full lineage and zero submission — the
