@@ -1,0 +1,110 @@
+{
+ "account_snapshots_in_window": {
+  "first": "2026-08-03T23:30:24.965369+00:00",
+  "last": "2026-08-03T23:46:59.626585+00:00",
+  "max_gap_s": 424.708,
+  "median_gap_s": 59.995,
+  "n": 12
+ },
+ "cadence_on_the_same_day": {
+  "account_snapshots": {
+   "max": 1581.399,
+   "n": 1407,
+   "p50": 60.001,
+   "p95": 60.018
+  },
+  "heartbeats": {
+   "max": 1581.375,
+   "n": 5612,
+   "p50": 15.0,
+   "p95": 15.018
+  }
+ },
+ "comparable_clean_windows": {
+  "F3": {
+   "heartbeats": {
+    "first": "2026-08-25T21:01:22.348792+00:00",
+    "last": "2026-08-26T00:59:52.523276+00:00",
+    "max_gap_s": 15.034,
+    "median_gap_s": 15.0,
+    "n": 955
+   },
+   "snapshots": {
+    "first": "2026-08-25T21:01:07.533760+00:00",
+    "last": "2026-08-26T00:59:52.542180+00:00",
+    "max_gap_s": 60.041,
+    "median_gap_s": 60.002,
+    "n": 240
+   }
+  },
+  "F5": {
+   "heartbeats": {
+    "first": "2026-09-01T21:01:28.868017+00:00",
+    "last": "2026-09-02T00:59:59.023477+00:00",
+    "max_gap_s": 15.047,
+    "median_gap_s": 15.0,
+    "n": 955
+   },
+   "snapshots": {
+    "first": "2026-09-01T21:01:14.030330+00:00",
+    "last": "2026-09-02T00:59:59.041349+00:00",
+    "max_gap_s": 60.045,
+    "median_gap_s": 60.0,
+    "n": 240
+   }
+  }
+ },
+ "corroborants_that_narrow_but_do_not_close_the_hole": {
+  "balance_and_equity_before_and_after_the_hole": {
+   "23:39:09": 10000.0,
+   "23:46:14": 10000.0,
+   "23:46:59": 10000.0
+  },
+  "first_non_zero_position_in_the_whole_55218_snapshot_history": "2026-08-03T23:47:14.765291+00:00 (the NEXT command's fill)",
+  "note": "a completed round trip inside the hole would normally have moved the realized balance; that it did not is a corroborant for the owner and the auditor to weigh, and it is deliberately NOT an admission condition in code",
+  "trade_events_received_before_that_fill": 0
+ },
+ "heartbeats_in_window": {
+  "first": "2026-08-03T23:30:39.912890+00:00",
+  "last": "2026-08-03T23:46:59.612726+00:00",
+  "max_gap_s": 409.684,
+  "median_gap_s": 15.0,
+  "n": 40
+ },
+ "note": "gap measurements across the retained streams inside the window of the one real unknown effect, read read-only from the deployed store. Times are the streams' own ISO timestamps; no account identifier, host name, IP or token appears.",
+ "reading": "the hole is present on the TERMINAL's own clock as well as on the bridge's receipt clock: 23:39:09 -> 23:46:14, 425 s with no account snapshot and 410 s with no heartbeat. It is not a transport delay that buffered and caught up.",
+ "schema": "lts.mt5.window_continuity_measurement.v1",
+ "terminal_clock_gaps": {
+  "heartbeat_connected_trade_allowed_values": [
+   [
+    1,
+    1
+   ]
+  ],
+  "heartbeat_gaps_over_60s": [
+   {
+    "from": "2026-08-03T23:25:38+00:00",
+    "gap_s": 286.0,
+    "recv_gap_s": 285.912,
+    "to": "2026-08-03T23:30:24+00:00"
+   },
+   {
+    "from": "2026-08-03T23:39:24+00:00",
+    "gap_s": 410.0,
+    "recv_gap_s": 409.684,
+    "to": "2026-08-03T23:46:14+00:00"
+   }
+  ],
+  "snapshot_gaps_over_120s": [
+   {
+    "from": "2026-08-03T23:39:09+00:00",
+    "gap_s": 425.0,
+    "to": "2026-08-03T23:46:14+00:00"
+   }
+  ]
+ },
+ "window_utc": [
+  "2026-08-03T23:30:24.951197+00:00",
+  "2026-08-03T23:47:00.000173+00:00"
+ ]
+}

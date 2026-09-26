@@ -1,0 +1,72 @@
+{
+  "accounts_masked": [
+    "0000********************"
+  ],
+  "continuity_budget_seconds": 180.0,
+  "continuity_budget_source": "command_line",
+  "counts": {
+    "admissible_retained_records_settle_it": 0,
+    "candidates": 1,
+    "inconclusive_retained_records_refuse": 1
+  },
+  "database": "<masked-extract-path>/mt5-extract.sqlite",
+  "generated_at": "2026-09-26T20:56:19.334556+00:00",
+  "mode": "read_only_report",
+  "rows": [
+    {
+      "classifier_evidence": "no_machine_code_reported",
+      "command_action": "open_short",
+      "command_id": "mt5-610092ed3f4cbcc63f60615521e57856a7733d08",
+      "completed_at": "2026-08-03T23:30:24.951197+00:00",
+      "created_at": "2026-08-03T22:21:21.588483+00:00",
+      "effective_state": "failed",
+      "holds_budget_slot_after": true,
+      "label_source": "classifier_on_historical_row",
+      "recorded_state": "failed",
+      "refusal": "the retained observation is sampled across a 424.7s gap (2026-08-03T23:39:09.928505+00:00 -> 2026-08-03T23:46:14.636174+00:00) against a 180.0s declared budget; in that gap the account was not observed at all, and absence of data is not absence of an order",
+      "state_after": "effect_unknown",
+      "symbol": "ETHUSD",
+      "verdict": "inconclusive_retained_records_refuse",
+      "window": {
+        "bracketed_after": true,
+        "bracketed_before": true,
+        "closed_by": "next_command",
+        "end": "2026-08-03T23:47:00.000173+00:00",
+        "max_gap_budget_seconds": 180.0,
+        "observations_inside": 12,
+        "start": "2026-08-03T23:30:24.951197+00:00",
+        "trade_events": 0
+      }
+    }
+  ],
+  "ruling": "an effect_unknown leaves that state through a live read-side broker query or through the retained record under its own conditions; every refusal keeps the state and the slot",
+  "schema": "lts.mt5.retained_reconciliation_report.v1",
+  "venue_break_from_observed_record": {
+    "derived": true,
+    "duration_minutes": 30,
+    "evidence": {
+      "commands_read": 53,
+      "market_closed_retcodes": [
+        10018
+      ],
+      "refusal_dates_utc": [
+        "2026-08-18",
+        "2026-08-25",
+        "2026-08-31",
+        "2026-09-01"
+      ],
+      "refusal_rows": 4,
+      "refused_minutes": [
+        1260,
+        1261
+      ],
+      "resume_minute_observed_succeeding": 1290
+    },
+    "resume_minute": 1290,
+    "resume_utc": "21:30",
+    "schema": "lts.mt5.venue_break.v1",
+    "source": "observed_record",
+    "start_minute": 1260,
+    "start_utc": "21:00"
+  }
+}

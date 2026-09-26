@@ -25,6 +25,8 @@ from pydantic import Field
 
 from app.mt5_unknown_outcome import (
     BUDGET_RELEASING_STATES,
+    CLOSED_BY_END_OF_RECORD,
+    CLOSED_BY_NEXT_COMMAND,
     OPEN_STATES,
     EVENT_MIGRATION_CORRECTION,
     OUTCOME_SCHEMA,
@@ -38,6 +40,7 @@ from app.mt5_unknown_outcome import (
     Outcome,
     OrderObservation,
     RECONCILABLE_STATES,
+    RetainedRecordWindow,
     outcome_for_execution_result,
     outcome_from_observation,
 )
@@ -85,7 +88,18 @@ _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _MODEL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
 _SYMBOL_RE = re.compile(r"^[A-Z0-9._-]{2,32}$")
 _OPEN_ACTIONS = frozenset({"open_long", "open_short"})
-_ACTIONS = frozenset({"open_long", "open_short", "close"})
+#: The route-closing verb, spelled ONCE. Correction of 2026-09-26: a reader of
+#: `exposure_reconciliation` branched on `"close_position"`, a verb this
+#: vocabulary has never contained, so that branch had never executed and a
+#: closed position's ticket was never retired from the authorized set. Naming
+#: the close verb here, and pinning the partition below, is what stops the same
+#: mismatch from being reintroduced silently.
+_CLOSE_ACTIONS = frozenset({"close"})
+_ACTIONS = _OPEN_ACTIONS | _CLOSE_ACTIONS
+#: Every action is either an open or a close. If a third kind is ever added, this
+#: assertion fails at import instead of leaving a branch quietly unreachable.
+assert _ACTIONS == _OPEN_ACTIONS | _CLOSE_ACTIONS
+assert not _OPEN_ACTIONS & _CLOSE_ACTIONS
 
 
 @dataclass(frozen=True)
@@ -383,6 +397,45 @@ class Mt5ExecutionStore(Mt5BridgeStore):
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def retained_record_window(
+        self,
+        *,
+        command_id: str,
+        account_fingerprint: str,
+        max_gap_seconds: float,
+    ) -> RetainedRecordWindow:
+        """Build the retained evidence about one command's whole window.
+
+        READ-ONLY, and it reads only this store's own streams. The window runs
+        from the moment the command completed to the creation of the route's
+        next command; where no next command exists it runs to the end of the
+        record and says so, which is what makes the staleness condition in
+        ``observation_from_retained_records`` bite.
+
+        Observations are ordered by primary key, so the returned row ids are the
+        evidence a reader can go back to. Nothing here decides anything: every
+        admission condition lives in the outcome module.
+        """
+        with self._lock:
+            return read_retained_record_window(
+                self.connection, command_id=command_id,
+                account_fingerprint=account_fingerprint,
+                max_gap_seconds=max_gap_seconds)
+
+    def venue_break_command_rows(self) -> list[dict[str, Any]]:
+        """Every command as the venue-break derivation reads it.
+
+        Three fields only: when it was created, its effective state and the
+        venue's own machine code. No message is read, and no window is derived
+        here — ``app/mt5_venue_break.py`` owns that and can refuse.
+        """
+        with self._lock:
+            rows = self.connection.execute(
+                f"SELECT c.created_at,{self._EFFECTIVE_STATE} AS state,"
+                f"c.result_json{self._EFFECTIVE_FROM} ORDER BY c.created_at"
+            ).fetchall()
+        return [_venue_break_row(row) for row in rows]
+
     def daily_entry_slots_consumed(
         self, *, day_start: str, account_fingerprint: Optional[str] = None
     ) -> int:
@@ -467,6 +520,7 @@ class Mt5ExecutionStore(Mt5BridgeStore):
                     raise Mt5BridgeError(
                         "An unresolved MT5 effect on this route has never been "
                         "observed; it is reconciled by a read-side broker query "
+                        "or by the retained record under its own conditions "
                         "before any new order exists")
                 raise Mt5BridgeError("An unresolved MT5 route command already exists")
             if action in _OPEN_ACTIONS:
@@ -585,9 +639,16 @@ class Mt5ExecutionStore(Mt5BridgeStore):
         A retry cannot take it, a timeout cannot take it and an operator's
         assumption cannot take it: the only argument accepted is an
         ``OrderObservation``, which refuses to exist unless it names a declared
-        READ-side broker query and carries the time the state was observed. An
+        READ-side query and carries the time the state was observed. An
         unanswered query raises ``ReconciliationInconclusive`` and the command
         keeps both its unknown state and its budget slot.
+
+        Two sources are admissible, per the correction of 2026-09-26: a live
+        read-side broker query, or the lane's retained account-snapshot and
+        trade-event streams built by ``retained_record_window`` and admitted by
+        ``observation_from_retained_records`` — which refuses whenever its
+        window is uncovered, holds exposure, holds a transaction, is stale or is
+        sampled across a gap.
 
         The exit is APPENDED as its own event. The original unknown record and
         the ``state`` column are left exactly as they were written.
@@ -680,7 +741,7 @@ class Mt5ExecutionStore(Mt5BridgeStore):
         authorized_by_ticket: dict[str, dict[str, Any]] = {}
         for row in commands:
             action, symbol = str(row[0]), str(row[1]).upper()
-            if action == "close_position":
+            if action in _CLOSE_ACTIONS:
                 authorized_by_ticket = {
                     ticket: command
                     for ticket, command in authorized_by_ticket.items()
@@ -730,6 +791,163 @@ class Mt5ExecutionStore(Mt5BridgeStore):
             "unexpected_orders": len(orders),
             "all_authorized": not unexpected and not orders,
         }
+
+
+# ============================================ the retained-record read path
+# Correction of 2026-09-26. These are module-level and take a CONNECTION, not a
+# store, for one reason: the second admissible reconciliation source has to be
+# readable from a `file:<path>?mode=ro` connection that cannot write, so a report
+# against a live database never risks creating a table or a journal. The store
+# method delegates here under its own lock.
+
+
+def _venue_break_row(row: Any) -> dict[str, Any]:
+    """One command as the venue-break derivation reads it: when, what state, and
+    the venue's machine code. The message is never read."""
+    code: Optional[int] = None
+    raw = row["result_json"]
+    if raw:
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            value = None
+        if isinstance(value, Mapping):
+            candidate = value.get("result_code")
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                code = candidate
+    return {"created_at": row["created_at"], "state": str(row["state"]),
+            "result_code": code}
+
+
+def read_venue_break_command_rows(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Every command, read for the venue-break derivation. Read-only.
+
+    A database written by pre-fix code has no outcome ledger at all, and a
+    read-only connection must not create one. Where the ledger is absent the
+    legacy ``state`` column is read directly — which is exactly what the
+    effective-state join would fall back to anyway.
+    """
+    connection.row_factory = sqlite3.Row
+    ledger = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND"
+        " name='execution_command_outcomes'"
+    ).fetchone()
+    if ledger is None:
+        rows = connection.execute(
+            "SELECT created_at,state,result_json FROM execution_commands"
+            " ORDER BY created_at"
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            f"SELECT c.created_at,{Mt5ExecutionStore._EFFECTIVE_STATE} AS state,"
+            f"c.result_json{Mt5ExecutionStore._EFFECTIVE_FROM}"
+            f" ORDER BY c.created_at"
+        ).fetchall()
+    return [_venue_break_row(row) for row in rows]
+
+
+def _bracket(row: Any) -> Optional[dict[str, Any]]:
+    if row is None:
+        return None
+    return {"row_id": row["id"], "observed_at": row["received_at"],
+            "positions_total": row["positions_total"],
+            "orders_total": row["orders_total"]}
+
+
+def read_retained_record_window(
+    connection: sqlite3.Connection,
+    *,
+    command_id: str,
+    account_fingerprint: str,
+    max_gap_seconds: float,
+) -> RetainedRecordWindow:
+    """Collect the retained evidence about one command's whole window.
+
+    The window runs from the moment the command completed to the creation of the
+    route's next command; with no next command it runs to the end of the record
+    and SAYS SO, which is what makes the staleness condition in
+    ``observation_from_retained_records`` bite on a silent bridge.
+
+    This function decides nothing. It gathers rows and names them by primary key
+    so a reader can go back to each one; every admission condition lives in
+    ``app/mt5_unknown_outcome.py`` and every one of them can refuse.
+    """
+    connection.row_factory = sqlite3.Row
+    fingerprint = account_fingerprint.lower()
+    command = connection.execute(
+        "SELECT command_id,symbol,completed_at,created_at FROM "
+        "execution_commands WHERE command_id=? AND account_fingerprint=?",
+        (command_id, fingerprint),
+    ).fetchone()
+    if command is None:
+        raise Mt5BridgeError("Unknown MT5 command window")
+    start = command["completed_at"] or command["created_at"]
+    if start is None:
+        raise Mt5BridgeError(
+            "an MT5 command with no completion has no settled window")
+    following = connection.execute(
+        "SELECT created_at FROM execution_commands WHERE "
+        "account_fingerprint=? AND symbol=? AND created_at>? "
+        "ORDER BY created_at LIMIT 1",
+        (fingerprint, command["symbol"], start),
+    ).fetchone()
+    if following is None:
+        closed_by = CLOSED_BY_END_OF_RECORD
+        end_row = connection.execute(
+            "SELECT MAX(received_at) FROM account_snapshots WHERE "
+            "account_fingerprint=?", (fingerprint,),
+        ).fetchone()
+        end = None if end_row is None else end_row[0]
+        if end is None or end <= start:
+            raise Mt5BridgeError(
+                "the retained record holds no observation after this command "
+                "completed")
+    else:
+        closed_by = CLOSED_BY_NEXT_COMMAND
+        end = following["created_at"]
+    observations = [
+        {"row_id": row["id"], "observed_at": row["received_at"],
+         "positions_total": row["positions_total"],
+         "orders_total": row["orders_total"]}
+        for row in connection.execute(
+            "SELECT id,received_at,positions_total,orders_total FROM "
+            "account_snapshots WHERE account_fingerprint=? AND received_at>? "
+            "AND received_at<? ORDER BY id", (fingerprint, start, end),
+        ).fetchall()
+    ]
+    before = connection.execute(
+        "SELECT id,received_at,positions_total,orders_total FROM "
+        "account_snapshots WHERE account_fingerprint=? AND received_at<=? "
+        "ORDER BY id DESC LIMIT 1", (fingerprint, start),
+    ).fetchone()
+    after = connection.execute(
+        "SELECT id,received_at,positions_total,orders_total FROM "
+        "account_snapshots WHERE account_fingerprint=? AND received_at>=? "
+        "ORDER BY id LIMIT 1", (fingerprint, end),
+    ).fetchone()
+    events = [
+        {"event_id": row["event_id"], "event_type": row["event_type"],
+         "observed_at": row["received_at"]}
+        for row in connection.execute(
+            "SELECT event_id,event_type,received_at FROM trade_events WHERE "
+            "account_fingerprint=? AND received_at>? AND received_at<? "
+            "ORDER BY received_at", (fingerprint, start, end),
+        ).fetchall()
+    ]
+    return RetainedRecordWindow(
+        command_id=command_id,
+        window_start=start,
+        window_end=end,
+        closed_by=closed_by,
+        observations=observations,
+        trade_events=events,
+        max_gap_seconds=max_gap_seconds,
+        boundary_before=_bracket(before),
+        boundary_after=_bracket(after),
+        detail={"symbol": command["symbol"]},
+    )
 
 
 def _command_line(command: Mapping[str, Any]) -> str:

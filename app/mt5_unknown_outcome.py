@@ -26,14 +26,27 @@ The ruling this module implements
    confirmation. ``consumes_budget_slot`` is written as a deny-by-default
    predicate for that reason: a state this module has never heard of holds the
    slot rather than freeing it.
-3. **Reconciliation is the only exit.** An ``effect_unknown`` becomes
-   ``succeeded`` or ``failed`` only through a READ-side query against the broker
-   that observes the actual order state, recorded as a separate event carrying
-   its own observation timestamp. Not a retry, not a resend, not a timeout, not
-   an operator's assumption. The read-versus-mutating axis of
+3. **Reconciliation is the only exit, from one of TWO admissible sources.** An
+   ``effect_unknown`` becomes ``succeeded`` or ``failed`` only through a
+   READ-side observation of the actual order state, recorded as a separate event
+   carrying its own observation timestamp. Not a retry, not a resend, not a
+   timeout, not an operator's assumption. The read-versus-mutating axis of
    ``app/broker_refusal.py`` does that work here: an ``OrderObservation``
-   refuses to exist unless it names a declared read-side broker query, and
+   refuses to exist unless it names a declared read-side query, and
    ``order_send`` is not one.
+
+   **Correction of 2026-09-26 (owner's own).** The first ruling admitted only a
+   LIVE query against the broker. That is stricter than the evidence requires
+   and, whenever the terminal has gone silent, unsatisfiable — so an unknown
+   effect would stay unknown forever and its route blocked forever. The second
+   admissible source is therefore **the retained record**: the account-snapshot
+   and trade-event streams this lane already stores. It is admitted only under
+   conditions strict enough that the absence of data can never be read as the
+   absence of an order — see ``RetainedRecordWindow`` and
+   ``observation_from_retained_records``, where every one of those conditions
+   can refuse. Neither source may be satisfied by a retry, a guess, a timeout or
+   an operator's assumption, and every refusal keeps the command's state and its
+   budget slot.
 4. **Nothing is rewritten in place.** Outcomes are APPENDED to
    ``execution_command_outcomes``; the read path prefers the latest record per
    command. A reconciliation, and a migration's correction of a historical
@@ -53,8 +66,8 @@ from __future__ import annotations
 import json
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Mapping, Optional
+from datetime import datetime, timezone
+from typing import Any, Mapping, Optional, Sequence
 
 from app.broker_refusal import (
     OPERATION_MUTATING,
@@ -146,6 +159,12 @@ EVIDENCE_RECORD_CANNOT_SUPPORT_EITHER_READING = (
 )
 EVIDENCE_READ_SIDE_OBSERVED_ORDER = "read_side_observed_the_order"
 EVIDENCE_READ_SIDE_OBSERVED_NO_ORDER = "read_side_observed_no_order"
+#: The second admissible source, kept distinct AT THE EVIDENCE LEVEL so a reader
+#: never has to open the detail to learn that an exit came from the retained
+#: streams rather than from a live broker query.
+EVIDENCE_RETAINED_RECORDS_OBSERVED_NO_ORDER = (
+    "retained_records_observed_no_order"
+)
 
 #: Evidence that can only ever justify ``effect_unknown``.
 UNKNOWN_EVIDENCE = frozenset({
@@ -159,6 +178,7 @@ UNKNOWN_EVIDENCE = frozenset({
 RECONCILIATION_EVIDENCE = frozenset({
     EVIDENCE_READ_SIDE_OBSERVED_ORDER,
     EVIDENCE_READ_SIDE_OBSERVED_NO_ORDER,
+    EVIDENCE_RETAINED_RECORDS_OBSERVED_NO_ORDER,
 })
 EVIDENCE = UNKNOWN_EVIDENCE | RECONCILIATION_EVIDENCE | frozenset({
     EVIDENCE_VENUE_REPORTED_SUCCESS,
@@ -173,13 +193,40 @@ EVIDENCE = UNKNOWN_EVIDENCE | RECONCILIATION_EVIDENCE | frozenset({
 #: site rather than to the failure. ``account_snapshot`` is this repository's
 #: own read path (the bridge's signed snapshot), named here so a reconciliation
 #: can cite it.
+#: The second admissible source, named as its own query: a read of the lane's
+#: OWN retained streams. It is a read-side query in exactly the sense that
+#: matters — it observes what happened and cannot cause anything — and it is
+#: admitted only through ``observation_from_retained_records``, which is where
+#: all of its conditions live.
+QUERY_RETAINED_RECORDS = "lts.mt5.retained_records"
 READ_SIDE_QUERIES = frozenset({
     "MetaTrader5.positions_get",
     "MetaTrader5.orders_get",
     "MetaTrader5.history_orders_get",
     "MetaTrader5.history_deals_get",
     "lts.mt5.account_snapshot",
+    QUERY_RETAINED_RECORDS,
 })
+
+# ------------------------------------------------ the reconciliation sources
+#: A live read-side query against the broker: the first ruling's only source.
+SOURCE_LIVE_BROKER_QUERY = "live_broker_read_query"
+#: The retained account-snapshot and trade-event streams: the source added by
+#: the correction of 2026-09-26.
+SOURCE_RETAINED_RECORDS = "retained_account_snapshots_and_trade_events"
+RECONCILIATION_SOURCES = frozenset({
+    SOURCE_LIVE_BROKER_QUERY, SOURCE_RETAINED_RECORDS,
+})
+#: The tables a retained-record observation rests on. Named in the appended
+#: event, because an exit whose provenance is not readable is not provenance.
+RETAINED_RECORD_TABLES = ("account_snapshots", "trade_events")
+
+
+def reconciliation_source_for(query: Any) -> str:
+    """Which admissible source a declared read query belongs to."""
+    if query == QUERY_RETAINED_RECORDS:
+        return SOURCE_RETAINED_RECORDS
+    return SOURCE_LIVE_BROKER_QUERY
 #: Calls that can CHANGE venue state. Naming them is not decoration: a
 #: reconciliation citing one of these is not an observation of the effect, it is
 #: a second attempt at causing it, and it is refused by name.
@@ -333,10 +380,23 @@ def outcome_from_observation(observation: OrderObservation) -> Outcome:
             "stays unknown and keeps its budget slot, because the absence of a "
             "confirmation is not an observation of absence"
         )
+    source = reconciliation_source_for(observation.query)
     detail = {"query": observation.query,
+              "reconciliation_source": source,
               "broker_reference": observation.broker_reference,
               **dict(observation.detail)}
     if observation.order_exists:
+        if source == SOURCE_RETAINED_RECORDS:
+            # The retained streams can witness that nothing is there. They
+            # cannot witness that a position they DO see belongs to this
+            # command rather than to another command or to a hand trade, and a
+            # reconciliation that guessed the attribution would be the same
+            # class of error this module exists to forbid.
+            raise ReconciliationInconclusive(
+                "the retained record shows exposure it cannot attribute to "
+                "this command; an order that exists is confirmed by a live "
+                "read-side broker query, never by attribution"
+            )
         return Outcome(
             state=STATE_SUCCEEDED,
             evidence=EVIDENCE_READ_SIDE_OBSERVED_ORDER,
@@ -346,10 +406,259 @@ def outcome_from_observation(observation: OrderObservation) -> Outcome:
         )
     return Outcome(
         state=STATE_FAILED,
-        evidence=EVIDENCE_READ_SIDE_OBSERVED_NO_ORDER,
+        evidence=(EVIDENCE_RETAINED_RECORDS_OBSERVED_NO_ORDER
+                  if source == SOURCE_RETAINED_RECORDS
+                  else EVIDENCE_READ_SIDE_OBSERVED_NO_ORDER),
         event_kind=EVENT_RECONCILIATION,
         observed_at=observation.observed_at,
         detail=detail,
+    )
+
+
+# ================================================ the retained-record source
+#: How a window's far end is closed.
+CLOSED_BY_NEXT_COMMAND = "next_command"
+CLOSED_BY_END_OF_RECORD = "end_of_record"
+WINDOW_CLOSURES = frozenset({CLOSED_BY_NEXT_COMMAND, CLOSED_BY_END_OF_RECORD})
+
+
+def _aware(value: Any, what: str) -> datetime:
+    """One instant, or a refusal. A naive timestamp is not a time."""
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, str):
+        try:
+            moment = datetime.fromisoformat(value)
+        except ValueError as error:
+            raise ValueError(f"{what} is not readable as a time") from error
+    else:
+        raise ValueError(f"{what} is missing")
+    if moment.tzinfo is None:
+        raise ValueError(f"{what} carries no timezone and so is not a time")
+    return moment.astimezone(timezone.utc)
+
+
+def _count(row: Mapping[str, Any], key: str) -> int:
+    """A stored count, or a refusal. A missing count is NEVER read as zero —
+    that inference is the whole defect this module exists to forbid."""
+    value = row.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ReconciliationInconclusive(
+            f"a retained observation is missing {key}; a missing count is not "
+            f"a count of zero"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class RetainedRecordWindow:
+    """The retained evidence about one unknown command's whole window.
+
+    The window runs from the moment the unknown command COMPLETED to the moment
+    the route's next command was created — the only interval in which an order
+    from that command could have appeared and still be attributable to it. The
+    admission conditions live in ``observation_from_retained_records`` and every
+    one of them can refuse; this type only carries the rows.
+
+    ``observations`` are the account snapshots inside the window, each a mapping
+    with ``row_id``, ``observed_at``, ``positions_total`` and ``orders_total``.
+    ``boundary_before`` and ``boundary_after`` are the observations that bracket
+    it, so coverage is proved at both ends rather than assumed. ``trade_events``
+    are the venue transactions received for the window. ``max_gap_seconds`` is
+    the DECLARED continuity budget and comes from configuration — the lane's own
+    ``stale_heartbeat_seconds`` — never from a number invented here.
+    """
+
+    command_id: str
+    window_start: datetime
+    window_end: datetime
+    closed_by: str
+    observations: Sequence[Mapping[str, Any]]
+    trade_events: Sequence[Mapping[str, Any]]
+    max_gap_seconds: float
+    boundary_before: Optional[Mapping[str, Any]] = None
+    boundary_after: Optional[Mapping[str, Any]] = None
+    source_tables: Sequence[str] = RETAINED_RECORD_TABLES
+    detail: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.closed_by not in WINDOW_CLOSURES:
+            raise ValueError(f"undeclared window closure: {self.closed_by!r}")
+        if self.max_gap_seconds <= 0:
+            raise ValueError(
+                "the continuity budget is a positive number of seconds, "
+                "declared in configuration"
+            )
+        start = _aware(self.window_start, "window_start")
+        end = _aware(self.window_end, "window_end")
+        if end <= start:
+            raise ValueError("a window ends after it starts")
+
+
+def observation_from_retained_records(
+    window: RetainedRecordWindow,
+    *,
+    now: Optional[datetime] = None,
+) -> OrderObservation:
+    """Admit the retained record as a positive no-order observation, or refuse.
+
+    Six conditions. Each one exists because without it the absence of data could
+    be read as the absence of an order, and every failure raises
+    ``ReconciliationInconclusive`` naming what was missing — the command then
+    keeps its ``effect_unknown`` state AND its budget slot.
+
+    1. **The window is covered at its start.** There must be an observation at
+       or before the moment the command completed, and it must read flat, so the
+       account's state is known when the window opens.
+    2. **The window is covered at its end.** Either the route's next command
+       closes it and an observation exists at or after that moment — proving the
+       stream was still alive when the window ended — or the window runs to the
+       end of the record, and then the record must still be FRESH within the
+       same declared budget. A stale store cannot settle an unknown whose window
+       reaches the present; the bridge going silent is precisely the case that
+       must refuse. The closing observation's own counts are deliberately NOT
+       required to be flat: at that moment the route's next command exists, and
+       its exposure is not this command's.
+    3. **Every observation inside reads flat**, with both counts present. A
+       missing count is not zero.
+    4. **No transaction was received for the window.** ``trade_events`` is a
+       pushed event stream, not a sample: one row in it is a transaction and
+       refuses the reconciliation outright.
+    5. **No interval of the window is unobserved for longer than the declared
+       budget.** The continuity sequence runs from the opening observation
+       through every observation inside to the window's own end, so the tail
+       between the last flat observation and the end of the window is bounded by
+       the same budget as every interior gap. This is the condition the one real
+       ``effect_unknown`` in this fleet FAILS: its window holds a 424.7-second
+       hole, on the terminal's own clock, in which the account was not observed
+       at all.
+    6. **Nothing is inferred from silence alone.** The observation returned can
+       only ever say ``order_exists=False``; presence is never attributed from
+       the retained streams (see ``outcome_from_observation``).
+
+    Returns an ``OrderObservation`` naming ``QUERY_RETAINED_RECORDS``, its own
+    observation timestamp and the rows it rests on, so the appended
+    reconciliation event carries its whole provenance.
+    """
+    start = _aware(window.window_start, "window_start")
+    end = _aware(window.window_end, "window_end")
+    budget = float(window.max_gap_seconds)
+
+    if window.boundary_before is None:
+        raise ReconciliationInconclusive(
+            "the retained record does not observe the account at the moment "
+            "the unknown command completed; the window is not covered at its "
+            "start and absence of an observation is not absence of an order"
+        )
+    before_at = _aware(window.boundary_before.get("observed_at"),
+                       "boundary_before.observed_at")
+    if before_at > start:
+        raise ReconciliationInconclusive(
+            "the first retained observation falls after the command completed; "
+            "the window's opening moment is unobserved"
+        )
+
+    if window.closed_by == CLOSED_BY_NEXT_COMMAND:
+        if window.boundary_after is None:
+            raise ReconciliationInconclusive(
+                "the retained record does not observe the account at the "
+                "moment the route's next command was created; the window is "
+                "not covered at its end"
+            )
+        after_at = _aware(window.boundary_after.get("observed_at"),
+                          "boundary_after.observed_at")
+        if after_at < end:
+            raise ReconciliationInconclusive(
+                "the closing retained observation falls before the window "
+                "ends; the window's closing moment is unobserved"
+            )
+    else:
+        if now is None:
+            raise ReconciliationInconclusive(
+                "a window closed by the end of the record is only admissible "
+                "against a reference time, so its staleness can be measured"
+            )
+        reference = _aware(now, "now")
+        newest = before_at
+        for row in window.observations:
+            observed = _aware(row.get("observed_at"), "observation.observed_at")
+            if observed > newest:
+                newest = observed
+        age = (reference - newest).total_seconds()
+        if age > budget:
+            raise ReconciliationInconclusive(
+                f"the retained record's newest observation is {age:.1f}s old "
+                f"against a {budget:.1f}s budget; a stale record cannot settle "
+                f"a window that reaches the present"
+            )
+        after_at = newest
+
+    rows = [window.boundary_before, *window.observations]
+    flat = 0
+    for row in rows:
+        positions = _count(row, "positions_total")
+        orders = _count(row, "orders_total")
+        if positions or orders:
+            raise ReconciliationInconclusive(
+                "the retained record shows exposure inside the window; what it "
+                "belongs to is not settled by these streams and a live "
+                "read-side broker query is required"
+            )
+        flat += 1
+
+    if window.trade_events:
+        raise ReconciliationInconclusive(
+            f"{len(window.trade_events)} venue transaction(s) were received "
+            f"for this window; a transaction is a positive event and refuses "
+            f"the reconciliation rather than being explained away"
+        )
+
+    # The sequence ends at the WINDOW's end, not at the closing observation:
+    # what has to be bounded is the interval between the last flat observation
+    # and the moment the window closes.
+    times = sorted(
+        [_aware(row.get("observed_at"), "observation.observed_at")
+         for row in rows] + [end]
+    )
+    worst = 0.0
+    worst_from = None
+    worst_to = None
+    for index in range(len(times) - 1):
+        gap = (times[index + 1] - times[index]).total_seconds()
+        if gap > worst:
+            worst = gap
+            worst_from = times[index]
+            worst_to = times[index + 1]
+    if worst > budget:
+        raise ReconciliationInconclusive(
+            f"the retained observation is sampled across a {worst:.1f}s gap "
+            f"({None if worst_from is None else worst_from.isoformat()} -> "
+            f"{None if worst_to is None else worst_to.isoformat()}) against a "
+            f"{budget:.1f}s declared budget; in that gap the account was not "
+            f"observed at all, and absence of data is not absence of an order"
+        )
+
+    return OrderObservation(
+        query=QUERY_RETAINED_RECORDS,
+        observed_at=after_at,
+        order_exists=False,
+        detail={
+            "reconciliation_source": SOURCE_RETAINED_RECORDS,
+            "source_tables": list(window.source_tables),
+            "command_id": window.command_id,
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "window_closed_by": window.closed_by,
+            "flat_observations": flat,
+            "observation_row_ids": [row.get("row_id") for row in rows],
+            "closing_observation_row_id": (
+                None if window.boundary_after is None
+                else window.boundary_after.get("row_id")),
+            "trade_events": 0,
+            "max_observed_gap_seconds": worst,
+            "max_gap_budget_seconds": budget,
+            **dict(window.detail),
+        },
     )
 
 

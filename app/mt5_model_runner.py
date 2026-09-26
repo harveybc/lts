@@ -37,6 +37,16 @@ from app.mt5_unknown_outcome import (
     STATE_PENDING,
     STATE_SUCCEEDED,
 )
+from app.mt5_venue_break import (
+    SOURCE_CONFIGURED,
+    SOURCE_OBSERVED_RECORD,
+    VENUE_BREAK_UNDECLARED,
+    VenueBreak,
+    VenueBreakUndeclarable,
+    deferral_for,
+    venue_break_from_observed_record,
+    venue_breaks_from_config,
+)
 from app.project3_sac_observation import (
     SacObservationError,
     build_sac_observation,
@@ -356,6 +366,27 @@ class Mt5ModelRunner:
             load_live_observation_spec(self.selector)
             if self.policy_type == "sac" else None
         )
+        self.venue_breaks, self.venue_break_reason = self._resolve_venue_breaks()
+
+    def _resolve_venue_breaks(self) -> tuple[tuple[VenueBreak, ...], str]:
+        """The windows in which this lane does not issue a command.
+
+        Correction of 2026-09-26. Configuration is authoritative when it declares
+        breaks. Where it does not, the break is DERIVED from the venue's own
+        refusals in this store's retained record, and if the record cannot
+        establish one the lane carries no break and the reason is recorded by
+        name. Nothing is hardcoded and nothing is guessed: a misdeclared
+        configuration raises here rather than running with a wrong window.
+        """
+        configured = venue_breaks_from_config(self.config)
+        if configured:
+            return configured, SOURCE_CONFIGURED
+        try:
+            derived = venue_break_from_observed_record(
+                self.bridge_store.venue_break_command_rows())
+        except VenueBreakUndeclarable as exc:
+            return (), f"{VENUE_BREAK_UNDECLARED}: {exc}"
+        return (derived,), SOURCE_OBSERVED_RECORD
 
     def _latest_snapshot(self) -> Optional[dict[str, Any]]:
         row = self.bridge_store.connection.execute(
@@ -461,6 +492,17 @@ class Mt5ModelRunner:
         received = datetime.fromisoformat(snapshot["_received_at"])
         if (now - received).total_seconds() > self.config["snapshot_max_age_seconds"]:
             return {"state": "snapshot_stale", "received_at": snapshot["_received_at"]}
+        # Correction of 2026-09-26, the scheduling repair: a command is not
+        # issued into a known venue break. Four of this lane's five historical
+        # failures are MARKET_CLOSED at the venue's daily rollover, into which
+        # the four-hour bar boundary lands deterministically. The deferral is
+        # named, carries the break and its evidence, and loses nothing: the
+        # closed bar that produced the decision is still the closed bar when the
+        # venue reopens.
+        deferral = deferral_for(self.venue_breaks, now,
+                                boundary=snapshot["_received_at"])
+        if deferral is not None:
+            return {**deferral, "venue_break_source": self.venue_break_reason}
         symbol = self.config["route"]["symbol"]
         symbol_fact = self._symbol_fact(snapshot)
         if symbol_fact is None:

@@ -1,0 +1,134 @@
+{
+ "command_counts_by_window": {
+  "commands_carrying_the_artifact_and_config_the_flagged_manifest_declared": 53,
+  "commands_created_at_or_after_the_first_observation": 43,
+  "commands_created_before_the_first_observation": 10,
+  "commands_created_inside_the_directly_observed_window": 0,
+  "directly_observed_flag_window_utc": [
+   "2026-08-16T01:46:48Z",
+   "2026-08-16T04:22:41Z"
+  ],
+  "identity_bounded_window_utc": [
+   "2026-08-03T22:21:21Z",
+   "2026-09-01T21:01:00Z"
+  ],
+  "of_those_failed": 5,
+  "of_those_succeeded": 48,
+  "reading": "the manifest CONTENT is pinned only at the five 2026-08-16 observations, in which no command was created; the artifact and config hashes it declared are carried by all 53 commands, which bounds the window by identity rather than by observation. Whether the flag held the same value outside those five observations is NOT established by these records."
+ },
+ "commands_by_artifact": {
+  "539f946071a1": {
+   "config_sha256_12": "193cbeaecc75",
+   "failed": 5,
+   "first": "2026-08-03T22:21:21.588483+00:00",
+   "last": "2026-09-01T21:01:00.097100+00:00",
+   "n": 53,
+   "succeeded": 48
+  }
+ },
+ "manifest_observations": [
+  {
+   "account_binding_verified": true,
+   "artifact_sha256_12": "539f946071a1",
+   "collected_at": "2026-08-16T01:46:48.603711+00:00",
+   "config_sha256_12": "193cbeaecc75",
+   "evidence_file": "mt5_direct_evidence_20260816T014646Z.json",
+   "live_execution_eligible": false,
+   "live_inference_eligible": false,
+   "manifest_schema": "prediction_provider.live_linear_manifest.v1",
+   "manifest_sha256_12": "11a129b5e9e2",
+   "model_id": "ethusdt-4h-linear-live-v1",
+   "research_validated": true,
+   "runner_environment": "demo",
+   "runner_orders": 0,
+   "runner_positions": 1,
+   "runner_read_only": false,
+   "runner_state": "monitoring",
+   "runner_venue": "mt5_demo"
+  },
+  {
+   "account_binding_verified": true,
+   "artifact_sha256_12": "539f946071a1",
+   "collected_at": "2026-08-16T01:48:47.981849+00:00",
+   "config_sha256_12": "193cbeaecc75",
+   "evidence_file": "mt5_direct_evidence_20260816T014844Z.json",
+   "live_execution_eligible": false,
+   "live_inference_eligible": false,
+   "manifest_schema": "prediction_provider.live_linear_manifest.v1",
+   "manifest_sha256_12": "11a129b5e9e2",
+   "model_id": "ethusdt-4h-linear-live-v1",
+   "research_validated": true,
+   "runner_environment": "demo",
+   "runner_orders": 0,
+   "runner_positions": 1,
+   "runner_read_only": false,
+   "runner_state": "monitoring",
+   "runner_venue": "mt5_demo"
+  },
+  {
+   "account_binding_verified": true,
+   "artifact_sha256_12": "539f946071a1",
+   "collected_at": "2026-08-16T04:16:13.542406+00:00",
+   "config_sha256_12": "193cbeaecc75",
+   "evidence_file": "mt5_direct_evidence_20260816T041546Z.json",
+   "live_execution_eligible": false,
+   "live_inference_eligible": false,
+   "manifest_schema": "prediction_provider.live_linear_manifest.v1",
+   "manifest_sha256_12": "11a129b5e9e2",
+   "model_id": "ethusdt-4h-linear-live-v1",
+   "research_validated": true,
+   "runner_environment": "demo",
+   "runner_orders": 0,
+   "runner_positions": 1,
+   "runner_read_only": false,
+   "runner_state": "monitoring",
+   "runner_venue": "mt5_demo"
+  },
+  {
+   "account_binding_verified": true,
+   "artifact_sha256_12": "539f946071a1",
+   "collected_at": "2026-08-16T04:18:51.346892+00:00",
+   "config_sha256_12": "193cbeaecc75",
+   "evidence_file": "mt5_direct_evidence_20260816T041849Z.json",
+   "live_execution_eligible": false,
+   "live_inference_eligible": false,
+   "manifest_schema": "prediction_provider.live_linear_manifest.v1",
+   "manifest_sha256_12": "11a129b5e9e2",
+   "model_id": "ethusdt-4h-linear-live-v1",
+   "research_validated": true,
+   "runner_environment": "demo",
+   "runner_orders": 0,
+   "runner_positions": 1,
+   "runner_read_only": false,
+   "runner_state": "monitoring",
+   "runner_venue": "mt5_demo"
+  },
+  {
+   "account_binding_verified": true,
+   "artifact_sha256_12": "539f946071a1",
+   "collected_at": "2026-08-16T04:22:41.736459+00:00",
+   "config_sha256_12": "193cbeaecc75",
+   "evidence_file": "mt5_direct_evidence_20260816T042239Z.json",
+   "live_execution_eligible": false,
+   "live_inference_eligible": false,
+   "manifest_schema": "prediction_provider.live_linear_manifest.v1",
+   "manifest_sha256_12": "11a129b5e9e2",
+   "model_id": "ethusdt-4h-linear-live-v1",
+   "research_validated": true,
+   "runner_environment": "demo",
+   "runner_orders": 0,
+   "runner_positions": 1,
+   "runner_read_only": false,
+   "runner_state": "monitoring",
+   "runner_venue": "mt5_demo"
+  }
+ ],
+ "note": "what the retained 2026-08-16 direct evidence establishes about the manifest eligibility flags, and how many commands carry the artifact and config the flagged manifest pointed at. No account identifier, host name, IP or token is reproduced; hashes are truncated.",
+ "readers_of_the_flag_in_code": {
+  "app/live_model_selection.py": "checked ONLY on execution_tier 'promoted_paper'",
+  "app/live_sac_selection.py": "checked ONLY on execution_tier 'promoted_paper'",
+  "tools/controller_inventory.py": "reports authority; refuses nothing"
+ },
+ "runner_execution_tier_configured": "demo_research_canary",
+ "schema": "lts.mt5.eligibility_window_finding.v1"
+}

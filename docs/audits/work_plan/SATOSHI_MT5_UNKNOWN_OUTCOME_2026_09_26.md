@@ -239,3 +239,82 @@ fastapi and sqlalchemy on this host) rather than by touching the conftest. No te
 * **No live corpus was migrated**, because none exists (§4).
 * **No linter or type checker** is configured in this repository; nothing here
   claims to be lint- or type-clean.
+
+---
+
+## 9. Erratum, 2026-09-26 — two published numbers of mine were wrong
+
+Added after the forensics of the five `failed` MT5 commands read the store that
+actually holds them (`docs/audits/work_plan/SATOSHI_MT5_FIVE_FAILURES_FORENSICS_2026_09_26.md`)
+and after the corrections that followed it
+(`docs/audits/work_plan/SATOSHI_MT5_CORRECTIONS_2026_09_26.md`).
+Signed: **Satoshi** (Satoshi III, Mujuro Utsutsu), successor technical lead.
+
+**The claims above are left standing as published.** An erratum names what was
+wrong and why; it does not edit the claim away.
+
+### Erratum 1 — "entry budget slots reclaimed (now held, not free): 5"
+
+§4's table and `docs/audits/evidence/mt5_unknown_outcome_20260926/NOTE.md` publish
+**5**. Against the real store the number is **1**.
+
+* **What was wrong.** The 5 is the count over the **nine-row recorded corpus**
+  built by the test helper — one row per shape the old collapsing line could
+  leave. It measures the migration, not the fleet.
+* **Why it was published.** §4 states that there is no live corpus and that the
+  counts therefore measure the migration, and the NOTE beside the artifacts says
+  the same. The arithmetic is right for what it counted. The error is that a
+  count over a synthetic corpus was published in the same shape as a finding
+  about the lane, where a reader can carry it away as one.
+* **What the real store holds.** 53 commands, 48 succeeded, 5 failed. Exactly
+  **one** of the five — an `open_short` of 2026-08-03 storing `result_code: 0` —
+  is typed `effect_unknown` by the committed classifier, so exactly one budget
+  slot was freed wrongly. The other four carry `result_code: 10018`
+  (`TRADE_RETCODE_MARKET_CLOSED`), are `retcode_proves_no_order_exists`, and
+  releasing their slots was correct then and stays correct under the fix.
+
+### Erratum 2 — "this lane has never placed an order"
+
+§4 relays RP149's record that "this lane has never placed an order", and the
+evidence NOTE repeats it. **At the lane level that is false.**
+
+* **What was wrong.** It was true of *this host* — no `mt5-bridge.sqlite` exists
+  here, no bridge process runs here — and it was relayed as a statement about the
+  lane. The lane's store is on another host, and it holds a real order history.
+* **What the real store holds.** **42 opens and 6 closes succeeded**, with real
+  order tickets, real deal tickets and a real position history, from
+  2026-08-03T22:21:21Z to 2026-09-01T21:01:00Z. The command vocabulary is
+  `{open_long, open_short, close}` and contains **no read-only verb**, so every
+  command this bridge can carry is a mutating order operation.
+* **Why it matters beyond the number.** §8's first bullet ("No canary … none can
+  be until a confirmed Demo account and a risk mandate exist") was written on the
+  same belief. The canary had already run. The account is a demo account on
+  strong but **self-declared** evidence — `environment: "demo"` in the deployed
+  bridge config, in the runner config, and in all 220,643 heartbeat rows with no
+  second distinct value — and the lane's L1 attestation tables
+  (`l1_capabilities`, `l1_broker_facts`, `l1_effects`) are **empty**, so nothing
+  broker-side certifies the trade server. Nothing in this ruling or its erratum
+  assumes a certification we do not have.
+
+### Erratum 3 — §2.3's "only through a READ-side broker query" was too strict
+
+Not a wrong number: a wrong rule, and it was mine.
+
+Requiring a **live** broker query as the only exit from `effect_unknown` is
+stricter than the evidence requires and, whenever the terminal has gone silent,
+unsatisfiable — so an unknown effect would stay unknown forever and its route
+blocked forever. The correction admits a second source, the lane's own retained
+`account_snapshots` and `trade_events`, under conditions strict enough that the
+absence of data can never be read as the absence of an order. See
+`docs/audits/work_plan/SATOSHI_MT5_CORRECTIONS_2026_09_26.md` §1, and note the
+finding it produced: under those conditions the one real unknown effect in this
+fleet **still refuses**, because its own window holds a 424.7-second hole.
+
+### One recount, for completeness
+
+The forensics reports "13 consecutive account snapshots" across that window. The
+store holds **12** strictly inside it, ids 3837-3848 with no id missing, plus the
+bracketing observation at 23:30:24.922Z; and they are not one-minute continuous —
+the intervals run from 45 s to 424.7 s. The substance of the forensics' finding
+(no exposure was observed at any point it observed) is unchanged; the word
+"consecutive" was doing work the rows do not support.
