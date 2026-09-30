@@ -1,0 +1,29 @@
+{
+  "schema": "dgpd.portable_method_state.v1",
+  "initiative": "LTS candidate-to-paper read-only handoff",
+  "canonical_method": "portable fallback; LTS has no docs/metodologias/DISENO_GUIADO_POR_PRUEBAS_Y_DATOS.md",
+  "current_stage": "S12_ALPHA_ACCEPTANCE",
+  "stage_status": {
+    "S0_DISCOVERY": "passed",
+    "S1_REQUIREMENTS": "passed",
+    "S2_USE_CASES": "passed",
+    "S3_ACCEPTANCE_TEST_DESIGN": "passed",
+    "S4_ARCHITECTURE": "passed",
+    "S5_SYSTEM_TEST_DESIGN": "passed",
+    "S6_COMPONENT_DESIGN": "passed",
+    "S7_INTEGRATION_TEST_DESIGN": "passed",
+    "S8_UNIT_TEST_DESIGN": "passed",
+    "S9_UNIT_IMPLEMENTATION": "passed",
+    "S10_INTEGRATION_VERIFICATION": "passed",
+    "S11_SYSTEM_VERIFICATION": "passed",
+    "S12_ALPHA_ACCEPTANCE": "offline tests only",
+    "S13_BETA_ACCEPTANCE": "deferred: no owner artifact or broker access",
+    "S14_RELEASE_OPERATION": "not_started"
+  },
+  "traceability_file": "docs/CANDIDATE_PAPER_HANDOFF.md",
+  "next_allowed_actions": ["Review offline preflight report for a future staged candidate", "Owner-approved read-only Paper probe after linear interface compatibility"],
+  "blocked_actions": ["Model promotion", "Order submission or cancellation", "Service restart", "Modular inference deployment"],
+  "open_decisions": ["Model owner artifact and scientific acceptance receipt", "LTS modular adapter and route approval", "Paper broker owner permission for read-only probe"],
+  "evidence": ["tests/unit/test_candidate_paper_preflight.py", "tools/candidate_paper_preflight.py", "offline unit suite: 1137 passed, 348 skipped"],
+  "history": ["2026-09-30: discovery, design, test-first implementation, offline alpha; no broker contact"]
+}
