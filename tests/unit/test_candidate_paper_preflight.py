@@ -144,3 +144,44 @@ def test_cli_is_read_only_and_nonzero_on_refusal(tmp_path):
     assert run.returncode == 2
     assert json.loads(run.stdout)["paper_path"] == "refused"
     assert before == {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+
+
+def _with_contract(tmp_path, weights, *, artifact_sha=None, asset="equity:SPY"):
+    from tests.unit.test_modular_inference_adapter import _contract
+
+    engine = tmp_path / "engine.py"
+    engine.write_text("# engine\n")
+    data = _contract(**{
+        "model_id": "candidate-1", "asset_id": asset,
+        "engine.path": str(engine), "engine.sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
+        "artifact.file": str(weights),
+        "artifact.sha256": artifact_sha or hashlib.sha256(weights.read_bytes()).hexdigest()})
+    contract = tmp_path / "contract.json"
+    return {"path": str(contract), "sha256": _write(contract, data)}
+
+
+def test_modular_candidate_with_verified_contract_reaches_shadow_tier_only(tmp_path):
+    candidate, weights, _, _ = _fixture(tmp_path)
+    doc = json.loads(candidate.read_text())
+    doc["inference_contract"] = _with_contract(tmp_path, weights)
+    _write(candidate, doc)
+    result = preflight(candidate, "alpaca_spy")
+    assert result["paper_path"] == "shadow_inference_only"
+    assert result["promotion_authorized"] is False and result["orders_submitted"] == 0
+    assert "modular_runner_integration_not_wired" in result["reasons"]
+    assert "execution_authorized" not in result or result["execution_authorized"] is False
+
+
+def test_modular_contract_must_name_the_handed_off_weights(tmp_path):
+    candidate, weights, _, _ = _fixture(tmp_path)
+    other = tmp_path / "other.keras"
+    other.write_bytes(b"other")
+    doc = json.loads(candidate.read_text())
+    doc["inference_contract"] = _with_contract(tmp_path, other)
+    _write(candidate, doc)
+    result = preflight(candidate, "alpaca_spy")
+    assert result["paper_path"] == "refused"
+    assert "inference_contract_identity_mismatch" in result["reasons"]
+    doc["inference_contract"]["sha256"] = "0" * 64
+    _write(candidate, doc)
+    assert "inference_contract_hash_mismatch" in preflight(candidate, "alpaca_spy")["reasons"]

@@ -5,8 +5,13 @@ import argparse
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 
+# Resolve `app` from THIS checkout, not whichever checkout an editable install points at.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 ROUTES = {
     "alpaca_spy": ("equity:SPY", "1d", "alpaca_paper"),
@@ -105,6 +110,8 @@ def preflight(candidate_file: str | Path, route: str) -> dict:
     if candidate.get("asset_id") != asset or candidate.get("timeframe") != timeframe:
         reasons.append("route_mismatch")
         return result
+    if candidate.get("family") == "modular" and "inference_contract" in candidate:
+        return _modular_shadow(candidate, asset, timeframe, result, reasons)
     if candidate.get("family") != "linear":
         reasons.append("unsupported_model_family")
         return result
@@ -131,6 +138,37 @@ def preflight(candidate_file: str | Path, route: str) -> dict:
         reasons.append("mt5_bridge_evidence_required")
         return result
     result["paper_path"] = "interface_compatible_only"
+    return result
+
+
+def _modular_shadow(candidate, asset, timeframe, result, reasons):
+    """A modular candidate reaches the adapter's shadow tier, never the runner.
+
+    The contract digest, its engine/artifact/metrics/golden digests and the
+    route are verified without loading TensorFlow. The handoff's weights must
+    be the very archive the contract names. No runner consumes this tier.
+    """
+    contract_path = _check_file(candidate.get("inference_contract"), "inference_contract", reasons)
+    if contract_path is None:
+        return result
+    try:
+        from app.modular_inference_adapter import ModularAdapterError, load_contract
+    except ImportError:
+        reasons.append("modular_adapter_unavailable")
+        return result
+    try:
+        contract = load_contract(contract_path)
+    except ModularAdapterError:
+        reasons.append("inference_contract_refused")
+        return result
+    if (contract.model_id != candidate.get("model_id") or contract.asset_id != asset
+            or contract.timeframe != timeframe
+            or contract.data["artifact"]["sha256"] != candidate["weights"]["sha256"]):
+        reasons.append("inference_contract_identity_mismatch")
+        return result
+    result["paper_path"] = "shadow_inference_only"
+    result["inference_contract_sha256"] = contract.sha256
+    reasons.append("modular_runner_integration_not_wired")
     return result
 
 
