@@ -174,3 +174,57 @@ disposable scratch worktree. Nothing was committed to, checked out in, or merged
 the live checkout.
 
 Satoshi, successor technical lead, 2026-09-30.
+
+## Addendum 2: re-export against M01's tested tip `64a91a74`
+
+I re-exported once, as the coordinator ordered, on the secondary worker (worker_b). It
+ran in its pinned campaign environment `envs/tensorflow` (Python 3.12.13, TF 2.21.0,
+Keras 3.13.2), never trading-stack's Keras 3.15. The engine tree is a `git archive` of
+predictor `64a91a74b5ab168b31eb58b58c575fd45dc66c61`, with the exporter from this lane
+(predictor `a3218b78`) overlaid. The data, seed and recipe match the `556c5f3e` export.
+Every child ran through `crispdm-run` (4G export, 3G replay, 2G/1G for the rest) with
+CUDA hidden.
+
+| Item | `556c5f3e` export (v1) | `64a91a74` export (v2) |
+|---|---|---|
+| Engine sha256 | `2daa0d3d…` | `2851a7ee…` |
+| Keras | 3.15.0 (trading-stack) | 3.13.2 (pinned) |
+| Contract sha256 | `60a55af0…` | `480dafaa…` |
+| Validation MAE (zero naive 0.007632) | 0.007595, skill 0.0048 | 0.007610, skill 0.0028 |
+| Fit | 7 epochs, best 1 | 8 epochs, best 2 |
+| Replay | REPLAY_PASS | **REPLAY_PASS**: 12 points, deterministic, causal, window 0.0, forecast 7.5e-8, bottleneck 4.2e-7 |
+| Replayed actions | 12 hold | 11 hold, 1 long |
+
+The v2 contract records both tips and both Keras versions. `engine.source_commit` is
+`64a91a74…` and `engine.keras_version` is `3.13.2`. `engine.previous` carries
+`556c5f3e…` with Keras `3.15.0`, plus v1's contract and archive digests. The v1
+contract predates the `keras_version` field. Its 3.15.0 is the version observed in the
+environment the v1 export actually ran in, passed explicitly; it is not inferred.
+
+**Golden parity against the `556c5f3e` export: `FEATURE_SIDE_IDENTICAL`.** All 12
+as-of windows match bit for bit (max difference 0.0). The bars digest, train-only
+scaler, feature definitions, time contract and action contract are equal. The model
+side differs (max forecast difference 0.047, bottleneck 0.257) because the weights
+differ. That is recorded as information, not as a failure: the model was retrained
+under a different engine identity and Keras minor version. Following M01's rule
+(refuse a major.minor mismatch), the 3.15.0 archive was not deserialized under 3.13.2.
+The engine adds `schema`, `regime` and `alignment_probe` to the normalized config. The
+adapter's contract checks do not depend on them.
+
+**Route tests on worker_b (trading-stack), on lts `329d9a1`:** 30 passed before the
+re-export and 30 passed after. The lts code did not change. The adapter itself is
+unchanged. It does not yet refuse a Keras major.minor mismatch the way M01's
+`load_bundle` does; that is a candidate follow-up, not done here.
+
+One attempt was discarded and is kept: the first v2 export was labelled with a mistyped
+engine commit, so it was re-run with the full commit. The metrics are identical, which
+shows the fit is deterministic. Nothing was wired to a runner, and the v2 candidate is
+still plumbing with no skill.
+
+Evidence: `$HOME/Documents/GitHub/.runtime/m05-paper-adapter-20260930/m01-reexport-64a91a74/`
+(`candidate-v2/`, `replay-v2/replay_receipt.json`, `cross_engine_parity.json`,
+`routes/before.log`, `routes/after.log`, the discarded attempt). The earlier receipts
+stay in place beside it. The v2 contract's engine path is in worker_b's scratch tree,
+so v2 replays there, and that is where it was replayed.
+
+Satoshi, successor technical lead, 2026-09-30.
