@@ -211,6 +211,7 @@ class AlpacaModelRunner:
                 expected_asset_id=config["model"]["expected_asset_id"],
                 expected_timeframe=config["model"]["expected_timeframe"],
                 execution_tier=config["model"]["execution_tier"],
+                require_forecast_eligibility=bool(config["model"].get("require_forecast_eligibility", False)),
             )
         elif config["model"].get("family", "linear") != "linear":
             raise AlpacaModelRunnerError("unknown model family")

@@ -300,12 +300,27 @@ class Mt5ModelRunner:
             ZeroNetworkSink(),
         )
         self.sessions = ModelSessionStore(self.l0._con)
-        self.selector = SelectedLinearPolicy(
-            manifest_file=config["model"]["manifest_file"],
-            expected_asset_id=config["model"]["expected_asset_id"],
-            expected_timeframe=config["model"]["expected_timeframe"],
-            execution_tier=config["model"]["execution_tier"],
-        )
+        family = config["model"].get("family", "linear")
+        if family == "modular":
+            # Shadow tier only (refused otherwise, before tick); optionally dormant
+            # until the forecast-vs-naive evidence passes for the consumed horizon.
+            from app.modular_runner_policy import SelectedModularPolicy
+            self.selector = SelectedModularPolicy(
+                contract_file=config["model"]["contract_file"],
+                expected_asset_id=config["model"]["expected_asset_id"],
+                expected_timeframe=config["model"]["expected_timeframe"],
+                execution_tier=config["model"]["execution_tier"],
+                require_forecast_eligibility=bool(config["model"].get("require_forecast_eligibility", False)),
+            )
+        elif family != "linear":
+            raise Mt5ModelRunnerError("unknown model family")
+        else:
+            self.selector = SelectedLinearPolicy(
+                manifest_file=config["model"]["manifest_file"],
+                expected_asset_id=config["model"]["expected_asset_id"],
+                expected_timeframe=config["model"]["expected_timeframe"],
+                execution_tier=config["model"]["execution_tier"],
+            )
         self.manifest = self.selector.manifest
         self.policy = self.selector.policy
 
@@ -392,6 +407,9 @@ class Mt5ModelRunner:
         )
 
     def tick(self) -> dict[str, Any]:
+        if getattr(self.policy, "shadow_only", False) is True:
+            # Before any session, position, command or broker-bridge write.
+            return self._shadow_tick()
         now = _utc_now()
         selection_error = None
         try:
@@ -618,6 +636,33 @@ class Mt5ModelRunner:
             print(json.dumps({"due_bar_fact_error": str(exc)[:160]}),
                   flush=True)
 
+    def _shadow_tick(self) -> dict[str, Any]:
+        """Recorded snapshot bars -> modular observation -> inference -> one fact; no command."""
+        try:
+            if self.selector.refresh():
+                self.manifest = self.selector.manifest
+                self.policy = self.selector.policy
+        except LiveModelSelectionError as exc:
+            return {"state": "selection_refused", "reason": str(exc),
+                    "commands_queued": 0, "execution_authorized": False}
+        if getattr(self.policy, "shadow_only", False) is not True:
+            raise Mt5ModelRunnerError("shadow tick reached with a non-shadow policy")
+        snapshot = self._latest_snapshot()
+        if snapshot is None:
+            return {"state": "waiting_for_snapshot", "commands_queued": 0}
+        received = datetime.fromisoformat(snapshot["_received_at"])
+        if (_utc_now() - received).total_seconds() > self.config["snapshot_max_age_seconds"]:
+            return {"state": "snapshot_stale", "received_at": snapshot["_received_at"], "commands_queued": 0}
+        bars = self._bars(snapshot)
+        observation = self.policy.build_observation(bars)
+        inference = self.policy.predict(observation)
+        if inference.get("execution_authorized") is not False:
+            raise Mt5ModelRunnerError("shadow inference claimed execution authority")
+        self._record_due_bar(inference, inference["last_closed_bar"],
+                             outcome="shadow_inference_only", reason="modular_shadow_tier")
+        return {"state": "shadow_inference_only", "inference": inference,
+                "commands_queued": 0, "execution_authorized": False}
+
     def close(self) -> None:
         self.l0.close()
         self.bridge_store.close()
@@ -625,10 +670,11 @@ class Mt5ModelRunner:
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
         runtime = {
             **payload,
-            **linear_model_identity(self.selector),
+            **(self.selector.identity() if hasattr(self.selector, "identity")
+               else linear_model_identity(self.selector)),
             "venue": "mt5_demo",
             "environment": "demo",
-            "read_only": False,
+            "read_only": getattr(self.policy, "shadow_only", False) is True,
             "account_binding_verified": True,
             "account_fingerprint": self.bridge_config.account_fingerprint,
             "instrument": self.config["route"]["symbol"],

@@ -119,8 +119,12 @@ def _load(spec: Mapping[str, Any]) -> tuple[dict | None, str | None]:
 
 
 def evaluate(evidence: Mapping[str, Mapping[str, Any]] | None,
-             consumption: Mapping[str, Any]) -> dict[str, Any]:
-    """Decide eligibility from per-family records; never raises on bad evidence."""
+             consumption: Mapping[str, Any], families: tuple = FAMILIES) -> dict[str, Any]:
+    """Decide eligibility from per-family records; never raises on bad evidence.
+
+    ``families`` names the families the consumer reads (default: the heartbeat's
+    short_term and long_term); every named family must pass.
+    """
     failures: list[dict[str, Any]] = []
     horizons: list[dict[str, Any]] = []
     provenance: dict[str, Any] = {}
@@ -137,7 +141,7 @@ def evaluate(evidence: Mapping[str, Mapping[str, Any]] | None,
     elif declared.get("asset") != consumption.get("asset"):
         fail("asset_mismatch", detail={"declared": declared.get("asset"), "strategy": consumption.get("asset")})
     evidence = evidence or {}
-    for family in FAMILIES if isinstance(declared, Mapping) else ():
+    for family in families if isinstance(declared, Mapping) else ():
         plan = consumption["families"].get(family)
         if plan is None:
             fail("family_not_consumed_or_declared", family)

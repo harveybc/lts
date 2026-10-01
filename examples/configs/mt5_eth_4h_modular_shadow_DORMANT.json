@@ -1,0 +1,50 @@
+{
+  "schema": "lts.mt5.model_runner.v1",
+  "bridge_config_file": "~/.config/lts/mt5_execution_bridge.json",
+  "model": {
+    "family": "modular",
+    "contract_file": "~/.local/share/prediction-provider/candidates/ethusdt_4h_variant_a/contract.json",
+    "expected_asset_id": "crypto:ETHUSD",
+    "expected_timeframe": "4h",
+    "execution_tier": "shadow_inference_only",
+    "require_forecast_eligibility": true
+  },
+  "route": {
+    "symbol": "ETHUSD",
+    "timeframe": "4h"
+  },
+  "strategy": {
+    "stop_fraction": 0.01,
+    "take_profit_fraction": 0.02
+  },
+  "snapshot_max_age_seconds": 120,
+  "loop_seconds": 15,
+  "heartbeat_path": "~/.local/state/lts/mt5-modular-shadow-heartbeat.json",
+  "service": {
+    "venue": "mt5_demo",
+    "account_fingerprint": "${MT5_DEMO_ACCOUNT_FINGERPRINT}",
+    "environment": "demo",
+    "database_path": "~/.local/state/lts/mt5-bridge.sqlite",
+    "risk_fraction_at_stop": 2e-05,
+    "max_overshoot_ratio": 0.5,
+    "gross_notional_fraction_max": 0.003,
+    "margin_fraction_max": 0.003,
+    "daily_loss_budget_fraction": 8e-05,
+    "max_concurrent_positions": 1,
+    "signal_max_age_seconds": 28800,
+    "owner_issuer_allowlist": [
+      "harvey-owner"
+    ],
+    "command_phrases": {},
+    "asset_instrument_bindings": {
+      "crypto:ETHUSD": "ETHUSD"
+    }
+  },
+  "_dormant": {
+    "status": "DORMANT_NOT_INSTALLED",
+    "why": "no unit runs this config; the selector refuses until the contract's frozen forecast-vs-naive record (M07, ethusdt_4h variant A) passes for the consumed horizon",
+    "mandate": "existing MT5 Demo ETH mandate unchanged: same service/risk block as mt5_eth_model_runner_v1.json, no new limits, no exposure increase; the shadow tier never queues a command",
+    "activation": "requires its own order and a separate unit; never replaces lts-mt5-model-runner",
+    "account": "placeholder: bind from the existing route's configuration at activation; no identifier is written here"
+  }
+}
