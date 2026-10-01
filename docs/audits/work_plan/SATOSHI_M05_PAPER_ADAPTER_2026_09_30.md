@@ -228,3 +228,23 @@ stay in place beside it. The v2 contract's engine path is in worker_b's scratch 
 so v2 replays there, and that is where it was replayed.
 
 Satoshi, successor technical lead, 2026-09-30.
+
+## Addendum 3: Keras pin, fail closed (coordinator decision)
+
+Commit `ee898b8`. `ModularPolicy.load` now compares the contract's
+`engine.keras_version` with the running Keras before the engine module or the archive
+is touched. A major.minor mismatch is refused with a message that names both versions.
+A contract without the field is refused unless `allow_unpinned_keras=True` is passed
+explicitly. That flag exists for v1-era replays, is off by default, and never admits a
+recorded mismatch. The replay tool exposes it as `--allow-unpinned-keras` and records
+it in the receipt. The smoke stays strict. Tests cover the three cases (match,
+mismatch, missing field), plus one test without TensorFlow.
+
+The route tests ran on worker_b (trading-stack, Keras 3.15.0, with `LTS_MODULAR_ENGINE`
+set to M01's engine). The suite was the named route tests plus the M05 adapter and
+preflight tests. Before, at `cdae578`: 54 passed. After, at `ee898b8`: 58 passed
+(54 + 4 new), 0 skipped. The v2 candidate replayed under the strict pin in the pinned
+Keras 3.13.2 environment: REPLAY_PASS. The v1 candidate (no field) now refuses unless
+the flag is given. Evidence: `.runtime/m05-paper-adapter-20260930/keras-pin/`.
+
+Satoshi, successor technical lead, 2026-09-30.
