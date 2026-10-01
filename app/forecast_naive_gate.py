@@ -206,14 +206,18 @@ def evaluate(evidence: Mapping[str, Mapping[str, Any]] | None,
             row["rows"] = entry.get("rows")
             model_mae, naive_mae = entry.get("model_MAE"), entry.get("naive_MAE")
             row.update(mae=_paired(model_mae, naive_mae), mse=_paired(entry.get("model_MSE"), entry.get("naive_MSE")))
-            if isinstance(seasonal, Mapping) and ("seasonal_naive_MAE" in entry or "seasonal_naive_MSE" in entry):
-                row["seasonal_naive"] = {
-                    "mae": _paired(model_mae, entry.get("seasonal_naive_MAE")),
-                    "mse": _paired(entry.get("model_MSE"), entry.get("seasonal_naive_MSE")),
-                    "used_for_eligibility": False}
-            else:
+            # M04 b5ed0982: per_horizon[i].seasonal_naive is nested; report-only, never decides.
+            nested = entry.get("seasonal_naive")
+            if not isinstance(nested, Mapping):
                 row["seasonal_naive"] = {"status": NOT_AVAILABLE,
-                                         "reason": "no seasonal_naive values for this horizon in the evidence"}
+                                         "reason": "the record carries no seasonal naive for this horizon"}
+            elif "naive_MAE" not in nested and "naive_MSE" not in nested:
+                row["seasonal_naive"] = {"status": NOT_AVAILABLE,
+                                         "reason": nested.get("reason", "seasonal naive not available")}
+            else:
+                row["seasonal_naive"] = {"mae": _paired(model_mae, nested.get("naive_MAE")),
+                                         "mse": _paired(entry.get("model_MSE"), nested.get("naive_MSE")),
+                                         "used_for_eligibility": False}
             horizons.append(row)
             if entry.get("rows") != pop.get("rows"):
                 fail("rows_mismatch", family, horizon,

@@ -214,11 +214,14 @@ def test_receipt_carries_every_baseline_the_evidence_holds():
         assert block["seasonal_naive"]["status"] == "NOT_AVAILABLE"
     assert decision["horizons"][0]["seasonal_naive"]["status"] == "NOT_AVAILABLE"
     short = [_horizon(h, 0.10 * h, 0.12 * h) for h in range(1, 7)]
-    for entry in short:
-        entry["seasonal_naive_MAE"] = 0.05 * entry["horizon"]  # better than the model: reported only
-        entry["seasonal_naive_MSE"] = entry["seasonal_naive_MAE"] ** 2
+    for entry in short[:5]:  # M04 b5ed0982 nested form; better than the model: reported only
+        value = 0.05 * entry["horizon"]
+        entry["seasonal_naive"] = {"naive_MAE": value, "naive_MSE": value ** 2,
+                                   "MAE": {"skill": None, "delta": None, "status": "OK"}, "MSE": {}}
+    short[5]["seasonal_naive"] = {"status": "NOT_AVAILABLE",
+                                  "reason": "target time minus one period is not inside the input window"}
     record = _record(short, sample_hours=1.0, scaler=SCALER_SHORT, model="s" * 64)
-    record["seasonal_naive"] = {"definition": "value 24 steps before the target", "period_steps": 24}
+    record["seasonal_naive"] = {"period_steps": 24, "declared": True, "definition": "value one period earlier"}
     evidence = dict(_evidence(), short_term=seal(record))
     decision = evaluate(evidence, _consumption(_declared(evidence)))
     assert decision["status"] == ELIGIBLE  # eligibility stays against persistence, as written
@@ -226,6 +229,7 @@ def test_receipt_carries_every_baseline_the_evidence_holds():
     seasonal = decision["horizons"][0]["seasonal_naive"]
     assert seasonal["mae"]["baseline"] == pytest.approx(0.05) and seasonal["mae"]["delta"] > 0
     assert seasonal["used_for_eligibility"] is False
+    assert decision["horizons"][5]["seasonal_naive"]["reason"].startswith("target time minus one period")
     long_row = [r for r in decision["horizons"] if r["family"] == "long_term"][0]
     assert long_row["seasonal_naive"]["status"] == "NOT_AVAILABLE"
 

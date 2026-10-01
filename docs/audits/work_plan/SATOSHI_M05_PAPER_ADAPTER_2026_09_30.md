@@ -487,3 +487,78 @@ SYNTHETIC_OFFLINE and unrecognised values. The v3 contract's engine digest is un
 Evidence: `$HOME/Documents/GitHub/.runtime/m05-paper-adapter-20260930/naive-gate/`.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 7: the heuristic-strategy backtest runner is gated too
+
+**Count reconciliation for addendum 6.** The lts gate suite had **26** tests when
+the five mutants ran (each mutant run shows 25+1, 23+3, …). The receipt/baselines
+test was added afterwards, bringing it to **27**. That second count is what the
+110-passed suite and this round measure. Both numbers are correct for their own
+moment.
+
+**lts change, commit below.** M04 fixed the seasonal-naive form in `b5ed0982`: a
+top-level `seasonal_naive` {period_steps, declared, definition} and a nested
+`per_horizon[i].seasonal_naive` that is either {naive_MAE, naive_MSE, MAE, MSE} or
+{status: NOT_AVAILABLE, reason}. The lts gate now reads that nested form. It is
+report-only and never decides. Gate suite: 27 passed on worker_b.
+
+**heuristic-strategy**, branch `satoshi/s08-backtest-naive-gate-20261001` from
+`master` `5c87a25`, tip **`e6431e6`**, pushed. It ran in its own worktree; the main
+checkout's branch and untracked files were left untouched.
+- `app/forecast_naive_gate.py` is stdlib only. It does not import lts, because no
+  shared package exists. It implements the same contract and pins it as `CONTRACT`;
+  its digest **`5a5685893504cf84112132c639e255d14393cbad74fe3b3ccc147363f7bfdc27`**
+  is carried by every decision and pinned in a test.
+- Families are `hourly` and `daily`. The run config declares `asset` and
+  `forecast_evidence`; the consumed counts are the prediction files' column counts.
+- API-source runs skip, because per-tick consumption cannot be bound before the run.
+- Runs with no prediction files skip, because the plugin would synthesize oracle
+  predictions from the base data. That is not learned evidence.
+- `run_processing_pipeline`, which `app/main.py` calls, decides before the plugin
+  sees data. A SKIP evaluates the strategy zero times and writes no trades, summary,
+  plot or parameters. The receipt is `naive_gate_receipt_file`.
+- The trading-period MAE table the pipeline already printed now shows same-row
+  persistence and skill. It is labelled as not eligibility evidence.
+
+**Tests, worker_b** (venv on trading-stack, `crispdm-run` 2G, scratch under
+`~/.local/state/scratch/m05/hs`):
+- **Red:** the new test file against `master`: 1 error at collection.
+- **Green:** **26 passed** in 10.2 s.
+  - The required cases: short fail, long fail, favourable mean masking a member, tie,
+    zero naive, missing/NaN, mismatched rows/scaler/period, genuine pass.
+  - Provenance (trading test, test, unknown, None).
+  - Metric switch, tampering, candidate and asset refusals.
+  - Consumption mapping, API and auto-generated skips, and the seasonal report.
+  - The contract digest pin.
+  - The REAL `run_processing_pipeline` with the real `ls_pred_strategy` plugin on
+    the bundled EURUSD data: 0 evaluations on failure, 0 on missing evidence, ≥1
+    when it passes.
+  - The REAL `app/main.py` in a subprocess: SKIPPED, no trades/summary/plot/
+    parameters, and the receipt names the tie.
+- **Regression:** the repository's healthy subset (AGENTS.md) passed 17 on `master`
+  and 17 after.
+- **Mutants:**
+
+| Mutant | Tests failing |
+|---|---|
+| tie admitted | 2 |
+| gate unwired | 3 |
+| zero naive admitted | 1 |
+| provenance unchecked | 4 |
+| failing horizon suppressed | 4 |
+
+**Not gated.** These runners call `plugin.evaluate_candidate` directly and bypass
+`run_processing_pipeline`:
+- `run_wfo.py` / `app/walk_forward_optimizer.py`;
+- `run_phase_b_cnn.py`, `run_phase_c_ensemble.py`, `run_phase_d_neat.py`;
+- `run_oracle_ceiling.py` (oracle by design);
+- `sweep_noise.py`.
+
+The per-tick API plugin is also ungated when it is driven outside the pipeline.
+lts `plugins_broker/backtrader_simulation_broker.py` was not inspected for strategy
+invocation. Each of these needs the same gate or an explicit diagnostic exception
+order.
+
+Evidence: `$HOME/Documents/GitHub/.runtime/m05-paper-adapter-20260930/heuristic-gate/`.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
