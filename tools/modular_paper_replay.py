@@ -52,6 +52,41 @@ def _max_abs(a, b) -> float:
     return abs(float(a) - float(b))
 
 
+def latent_causality_probe(policy, window) -> dict:
+    """Perturbing input step i may move bottleneck step i // factor at the earliest.
+
+    factor = window length / bottleneck steps (24 / 6 = 4 for both the old
+    transformer core and lane A's residual Conv1D core): every latent step sits on
+    a right edge of the input grid, so an earlier latent step must not see a later
+    input.  The probe perturbs one input row at a time on a recorded window.
+    """
+    base_batch = np.asarray([window], dtype=np.float32)
+    _, base = policy.model([base_batch], training=False)
+    base = np.asarray(base)[0]
+    steps, length = base.shape[0], base_batch.shape[1]
+    if length % steps:
+        return {"checked": False, "reason": "window length is not a multiple of latent steps"}
+    factor = length // steps
+    leaks, earliest, max_leak = [], [], 0.0
+    for i in range(length):
+        batch = base_batch.copy()
+        batch[0, i, :] += 1.0
+        _, moved = policy.model([batch], training=False)
+        delta = np.abs(np.asarray(moved)[0] - base).max(axis=1)
+        allowed = i // factor
+        before = float(delta[:allowed].max()) if allowed else 0.0
+        max_leak = max(max_leak, before)
+        if before > 1e-6:
+            leaks.append(i)
+        changed = [j for j in range(steps) if delta[j] > 1e-6]
+        earliest.append(changed[0] if changed else None)
+    return {"checked": True, "factor": factor, "inputs_probed": length,
+            "leaking_inputs": leaks, "max_abs_before_allowed_step": max_leak,
+            "earliest_moved_step": earliest,
+            "earliest_equals_i_div_factor": all(e == i // factor for i, e in enumerate(earliest)),
+            "passed": not leaks}
+
+
 def replay(contract_path: Path, bars_path: Path, points: int, *, golden_path: Path | None = None,
            feature_tol: float = 1e-9, output_tol: float = 1e-5,
            allow_unpinned_keras: bool = False) -> dict:
@@ -88,6 +123,7 @@ def replay(contract_path: Path, bars_path: Path, points: int, *, golden_path: Pa
     inside[probe_index]["volume"] = str(float(inside[probe_index]["volume"]) * 3 + 1)
     inside_changes = build_observation(contract, inside, as_of=probe_as_of)["input_sha256"] != base
 
+    latent = latent_causality_probe(policy, first[-1][0]["window"])
     parity = {"checked": 0, "missing": 0, "max_abs_window": 0.0, "max_abs_forecast": 0.0,
               "max_abs_bottleneck": 0.0}
     if golden_path is not None:
@@ -121,7 +157,7 @@ def replay(contract_path: Path, bars_path: Path, points: int, *, golden_path: Pa
         actions[inference["action"]] = actions.get(inference["action"], 0) + 1
     no_execution = all(inference["execution_authorized"] is False for _, inference in first)
     verdict = ("REPLAY_PASS" if deterministic and future_unchanged and inside_changes
-               and parity["passed"] and no_execution else "REPLAY_FAIL")
+               and parity["passed"] and no_execution and latent.get("passed") else "REPLAY_FAIL")
     return {
         "schema": RECEIPT_SCHEMA, "verdict": verdict,
         "evidence_class": "recorded_input_replay",
@@ -134,7 +170,7 @@ def replay(contract_path: Path, bars_path: Path, points: int, *, golden_path: Pa
         "causal": {"future_rewrite_leaves_observation": future_unchanged,
                    "in_window_rewrite_changes_observation": inside_changes,
                    "probe_last_closed_bar": bars[probe_index]["time"]},
-        "golden_parity": parity, "actions": actions,
+        "golden_parity": parity, "latent_causality": latent, "actions": actions,
         "bottleneck_shape": first[-1][1]["bottleneck"]["shape"],
         "broker_calls": 0, "orders_submitted": 0, "execution_authorized": False,
         "inferences": [{"last_closed_bar": inference["last_closed_bar"],
@@ -167,7 +203,7 @@ def main(argv=None) -> int:
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text + "\n")
-    summary = {k: receipt.get(k) for k in ("verdict", "points", "deterministic", "causal",
+    summary = {k: receipt.get(k) for k in ("verdict", "points", "deterministic", "causal", "latent_causality",
                                             "golden_parity", "actions", "reason")}
     print(json.dumps(summary, sort_keys=True))
     return 0 if receipt["verdict"] == "REPLAY_PASS" else 2

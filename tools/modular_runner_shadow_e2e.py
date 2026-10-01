@@ -117,7 +117,7 @@ def decisions(database: Path) -> list[dict]:
 
 
 def run(contract: Path, bars_path: Path, points: int, workdir: Path, *,
-        replay_receipt: Path | None = None) -> dict:
+        replay_receipt: Path | None = None, label: str = "PRE-INTEGRATION") -> dict:
     bars = read_recorded(bars_path)
     config = shadow_config(contract, workdir)
     runner = build_runner(config, bars[:len(bars) - points + 1])
@@ -159,7 +159,7 @@ def run(contract: Path, bars_path: Path, points: int, workdir: Path, *,
                                   and parity["input_sha256_equal"] and parity["output_sha256_equal"])))
     profile = json.loads((ROOT / "examples/configs/alpaca_spy_l1_profile_v1.json").read_text())
     return {
-        "schema": RECEIPT_SCHEMA, "verdict": "RUNNER_SHADOW_PASS" if ok else "RUNNER_SHADOW_FAIL",
+        "schema": RECEIPT_SCHEMA, "label": label, "verdict": "RUNNER_SHADOW_PASS" if ok else "RUNNER_SHADOW_FAIL",
         "runner": "app.alpaca_model_runner.AlpacaModelRunner (real __init__ and tick)",
         "contract": {"sha256": identity["contract_sha256"], "model_id": identity["model_id"],
                      "artifact_sha256": identity["artifact_sha256"],
@@ -182,8 +182,11 @@ def run(contract: Path, bars_path: Path, points: int, workdir: Path, *,
             "semantics": "transformer_conv core latent: two causal-attention Transformer blocks over "
                          "the 12-step fused branch grid, then three learned compression stages to "
                          "6 right-edge tokens x 8 channels (engine 556c5f3e / 64a91a74).",
-            "new_core": "PENDING: lane A's integrated residual Conv1D core over 24-step branches "
-                        "(also (6, 8), different semantics) is not yet published.",
+            "new_core": "Lane A architecture proof (satoshi/a-engine-integration-20261001 c0d7b07b, "
+                        "engine da4ce7b4): also (6, 8), but the six latent steps sit on the right-edge "
+                        "grid [4, 8, 12, 16, 20, 24] of the 24-step window after residual Conv1D "
+                        "stages 24 -> 12 -> 6 -> 6 over 24-step branches. Not yet an installed "
+                        "integrated package; this receipt does not exercise it.",
         },
         "states": states, "ticks": len(results), "decisions": rows,
         "actions": {a: sum(1 for r in rows if r["action"] == a) for a in sorted({r["action"] for r in rows})},
@@ -203,12 +206,14 @@ def main(argv=None) -> int:
     parser.add_argument("--workdir", required=True, type=Path)
     parser.add_argument("--replay-receipt", type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--label", default="PRE-INTEGRATION",
+                        help="engine status label carried in the receipt")
     args = parser.parse_args(argv)
     receipt = run(args.contract, args.bars, args.points, args.workdir,
-                  replay_receipt=args.replay_receipt)
+                  replay_receipt=args.replay_receipt, label=args.label)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({k: receipt[k] for k in ("verdict", "states", "actions",
+    print(json.dumps({k: receipt[k] for k in ("label", "verdict", "states", "actions",
                                                "broker_attributes_touched", "replay_parity")},
                      sort_keys=True))
     return 0 if receipt["verdict"] == "RUNNER_SHADOW_PASS" else 2
