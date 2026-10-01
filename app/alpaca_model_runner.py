@@ -213,6 +213,16 @@ class AlpacaModelRunner:
                 execution_tier=config["model"]["execution_tier"],
                 require_forecast_eligibility=bool(config["model"].get("require_forecast_eligibility", False)),
             )
+        elif config["model"].get("family", "linear") == "recorded_forecast":
+            # Recorded predictions of a verified forecast cell through the heuristic rule;
+            # shadow tier only, dormant unless the naive gate passes on some horizon.
+            from app.recorded_forecast_policy import SelectedRecordedForecastPolicy
+            self.selector = SelectedRecordedForecastPolicy(
+                contract_file=config["model"]["contract_file"],
+                expected_asset_id=config["model"]["expected_asset_id"],
+                expected_timeframe=config["model"]["expected_timeframe"],
+                execution_tier=config["model"]["execution_tier"],
+            )
         elif config["model"].get("family", "linear") != "linear":
             raise AlpacaModelRunnerError("unknown model family")
         else:
