@@ -708,3 +708,40 @@ Nothing was applied to the live checkout.
 Logs: `.runtime/m05-paper-adapter-20260930/front-e/`.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 11: jose errors removed (isolated venv); direction classifier gate
+
+**(1) The 13 `jose` errors.** I did **not** install python-jose into worker_b's
+`trading-stack` itself. That environment runs live processes on worker_b: the MT5
+execution bridge (`app.mt5_execution_cli`), the ETH model runner (`app.mt5_model_runner`)
+and the agent-multi campaign supervisor. The order excludes any live host environment.
+
+What I did instead:
+- Made a venv on worker_b (`--system-site-packages` from trading-stack, under my scratch).
+- Installed, matched to the coordinator's trading-stack versions: `python-jose[cryptography]==3.5.0`,
+  then `bcrypt==5.0.0`, `passlib==1.7.4`, `python-multipart==0.0.32` and
+  `itsdangerous==2.2.0`. bcrypt was the next missing module once jose was present.
+- pip freeze before and after for the venv shows only those packages and their dependencies
+  were added (ecdsa, pyasn1, rsa).
+- `trading-stack`'s own freeze is byte-identical before and after.
+
+Rerun at lts `e9553e0`: **130 passed, 0 errors** on the TF side (was 117 passed, 13 errors)
+and 43 RL passed. Evidence: `.runtime/m05-paper-adapter-20260930/jose/`.
+
+**(2) Direction classifiers: `predictor.direction_naive_evidence.v1`** (coordinator
+design from question 21). heuristic-strategy **`64ab2f9`**.
+- `app/direction_naive_gate.py` is stdlib only; contract digest `754f016f…`. Schema:
+  `docs/contracts/predictor.direction_naive_evidence.v1.json`.
+- The rule, per consumed horizon of each consumed family (long, short): held-out/OOF
+  balanced accuracy AND log-loss must both strictly beat BOTH baselines, the TRAIN majority
+  class and sign persistence. The forecast gate's refusals apply.
+- Phases B/C/D now gate their direction sets through it instead of being excluded. With no
+  record they still skip at entry.
+- Tests: red at collection, then 18 passed; 89 with the rest of the heuristic suites.
+- Mutants killed: tie admitted (2), one baseline (5), balanced accuracy only (4),
+  provenance unchecked (4), one family (6), direction kind ignored (1). The phase
+  entry/candidate mutants, re-run with the new wiring, are each killed (1).
+- The predictor clone on worker_b was unchanged afterwards.
+- The schema was sent to M07.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
