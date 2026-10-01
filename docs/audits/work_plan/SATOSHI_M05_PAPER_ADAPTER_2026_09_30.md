@@ -745,3 +745,29 @@ design from question 21). heuristic-strategy **`64ab2f9`**.
 - The schema was sent to M07.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 12: isolated test venv recorded; cost and sizing sheet
+
+**Test environment.** worker_b's `trading-stack` runs the MT5 bridge, the ETH demo runner
+and the campaign supervisor, so nothing is ever installed into it. The coordinator
+confirmed this. The isolated test venv is
+`~/.local/state/scratch/m05/venv-ts-jose` on worker_b: `--system-site-packages` from
+trading-stack, plus `python-jose[cryptography]==3.5.0`, `bcrypt==5.0.0`,
+`passlib==1.7.4`, `python-multipart==0.0.32` and `itsdangerous==2.2.0`, with their
+dependencies ecdsa, pyasn1 and rsa. Its freezes are in
+`.runtime/m05-paper-adapter-20260930/jose/venv_freeze_{before,after}.txt`. No service
+ever uses it.
+
+**Cost and sizing sheet:** `docs/audits/work_plan/M05_COST_AND_SIZING_SHEET_2026_10_01.md`.
+Every value comes from an existing config or code path, with its file sha256; there are
+no new limits and no config changes. It covers:
+- the ETH 4h MT5 demo route: stop 1%, take profit 2%, risk at stop 2e-05, gross and margin
+  caps 0.3%, 1 position, 0.01-lot ceiling, 4 commands per day;
+- the EURUSD paper route: the IBKR L1 canary profile; its service block is a disabled
+  example, flagged as a placeholder;
+- the paired harness fields.
+
+It flags the sizing and cost mismatch between the harness and the demo route, the
+drift in the deployed daily loss budget, and the placeholders.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
