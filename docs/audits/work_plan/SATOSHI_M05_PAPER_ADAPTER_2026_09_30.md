@@ -562,3 +562,40 @@ order.
 Evidence: `$HOME/Documents/GitHub/.runtime/m05-paper-adapter-20260930/heuristic-gate/`.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 8: S09, every direct-evaluation runner gated; incident INCIDENT_S09-MUT-01
+
+heuristic-strategy `satoshi/s08-backtest-naive-gate-20261001`, tip **`71fa1a4`**. The
+contract digest is unchanged: `5a568589…`.
+- **Shared mechanism:** `app/runner_naive_gate.py` decides at entry, before any data or
+  model loads, and then again for each evaluated prediction set.
+- **Gated runners:**
+  - `run_wfo.py`, with `run_walk_forward` now refusing to run without an allowing gate;
+  - `run_phase_b_cnn.py`, `run_phase_c_ensemble.py` and `run_phase_d_neat.py`.
+    Direction-probability sets have no form in the contract, so they are never
+    admitted;
+  - `sweep_noise.py`, which no longer does any work at import time;
+  - `plugin_api_predictions`, which refuses however it is driven.
+- **regime_wfo:** declares `consumes_learned_predictions = False` and is recorded
+  `NOT_APPLICABLE_NO_LEARNED_PREDICTIONS`. An owner ruling is welcome.
+- **Oracle:** `run_oracle_ceiling.py` refuses without `--diagnostic-oracle`. With the
+  flag, the bypass is receipted and every output is stamped
+  `DIAGNOSTIC_ORACLE_NOT_A_STRATEGY_RESULT`.
+
+**Tests** (worker_b): red 16 failed / 1 passed, then green **18** (S09) + 26 (S08) + 17
+(healthy subset) = **61 passed** on the committed tip. All twelve mutants are killed
+(see the incident file for the table).
+
+**Incident.** The unsandboxed `d_entry` mutant ran real NEAT training in worker_b's
+predictor clone for 15 minutes. Three tracked files were backed up and restored. The
+details are in `docs/audits/evidence/S09/INCIDENT_S09-MUT-01.md` on that branch. The
+standing rule from now on: never run checkout/reset/clean in a checkout I do not own.
+
+**lts `plugins_broker/backtrader_simulation_broker.py`** was inspected, not gated (as
+ordered). It makes no direct strategy or prediction call of its own.
+`run_simulation(strategy_fn)` invokes a callable supplied by the caller on each bar. The
+only caller in lts is `tests/unit/test_backtrader_broker_simulation.py`. A future caller
+that passes a heuristic-strategy callable fed with learned predictions would need the gate
+at that caller.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
