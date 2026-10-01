@@ -303,8 +303,9 @@ def test_modular_policy_refuses_linear_observation(tmp_path):
 # ------------------------------------------------------------ inference side (TensorFlow)
 
 ENGINE = os.environ.get("LTS_MODULAR_ENGINE")
-needs_engine = pytest.mark.skipif(not ENGINE or not Path(ENGINE).is_file(),
-                                  reason="LTS_MODULAR_ENGINE does not name predictor's modular_temporal.py")
+needs_engine = pytest.mark.skipif(
+    not ENGINE or not (Path(ENGINE).is_file() or (Path(ENGINE) / "__init__.py").is_file()),
+    reason="LTS_MODULAR_ENGINE does not name predictor's modular_temporal (file or package)")
 
 
 def _export(tmp_path, *, seed=7, keras_version="running"):
@@ -312,9 +313,9 @@ def _export(tmp_path, *, seed=7, keras_version="running"):
 
     import numpy as np
 
-    spec = importlib.util.spec_from_file_location("m05_test_engine", ENGINE)
-    engine = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(engine)
+    from app.modular_inference_adapter import engine_digest, load_engine_module
+
+    engine = load_engine_module(ENGINE, engine_digest(ENGINE))
     engine.keras.utils.set_random_seed(seed)
     config = engine.default_config([f["name"] for f in FEATURES])
     config["sample_hours"] = 24
@@ -326,7 +327,9 @@ def _export(tmp_path, *, seed=7, keras_version="running"):
     model.save(path)
     data = _contract()
     data["modular_config"] = bundle.config
-    data["engine"] = {"path": ENGINE, "sha256": hashlib.sha256(Path(ENGINE).read_bytes()).hexdigest()}
+    from app.modular_inference_adapter import engine_digest
+
+    data["engine"] = {"path": ENGINE, "sha256": engine_digest(ENGINE)}
     if keras_version == "running":
         import keras
 
@@ -430,3 +433,21 @@ def test_policy_refuses_missing_keras_field_unless_explicitly_allowed(tmp_path, 
     with pytest.raises(ModularAdapterError, match="allow_unpinned_keras is off"):
         ModularPolicy.load(contract_path)
     assert ModularPolicy.load(contract_path, allow_unpinned_keras=True).model is not None
+
+
+def test_package_engine_digest_covers_every_module(tmp_path):
+    from app.modular_inference_adapter import engine_digest
+
+    package = tmp_path / "engine"
+    (package / "__pycache__").mkdir(parents=True)
+    (package / "__init__.py").write_text("from .core import x\n")
+    (package / "core.py").write_text("x = 1\n")
+    (package / "__pycache__" / "core.cpython-312.pyc").write_bytes(b"ignored")
+    first = engine_digest(package)
+    (package / "__pycache__" / "core.cpython-312.pyc").write_bytes(b"still ignored")
+    assert engine_digest(package) == first
+    (package / "core.py").write_text("x = 2\n")
+    assert engine_digest(package) != first
+    (package / "__init__.py").unlink()
+    with pytest.raises(ModularAdapterError, match="__init__"):
+        engine_digest(package)

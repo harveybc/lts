@@ -33,6 +33,7 @@ import importlib.util
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -264,8 +265,9 @@ def load_contract(path: str | Path, *, verify_files: bool = True) -> ModularCont
     validate_contract(data)
     contract = ModularContract(path=path.resolve(), sha256=_sha256_bytes(raw), data=data)
     if verify_files:
-        checks = [(contract.resolve(data["engine"]["path"]), data["engine"]["sha256"], "engine"),
-                  (contract.resolve(data["artifact"]["file"]), data["artifact"]["sha256"], "artifact")]
+        if engine_digest(contract.resolve(data["engine"]["path"])) != data["engine"]["sha256"]:
+            raise ModularAdapterError("engine hash mismatch")
+        checks = [(contract.resolve(data["artifact"]["file"]), data["artifact"]["sha256"], "artifact")]
         evidence = data["evidence"]
         for key in ("metrics", "golden"):
             if evidence.get(f"{key}_file"):
@@ -445,18 +447,50 @@ def map_action(forecast_value: float, action: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------- inference side
 
 
-def _load_engine(contract: ModularContract):
-    engine = contract.data["engine"]
-    path = contract.resolve(engine["path"])
-    if _sha256_file(path) != engine["sha256"]:
+def engine_digest(path: str | Path) -> str:
+    """sha256 of a one-file engine, or of a package engine's {relative .py path: sha256}.
+
+    The package form is the predictor exporter's ``engine_tree_sha256``: canonical
+    JSON of every ``.py`` file under the package directory, ``__pycache__`` excluded.
+    """
+    path = Path(path)
+    if path.is_dir():
+        files = {p.relative_to(path).as_posix(): _sha256_file(p)
+                 for p in sorted(path.rglob("*.py")) if "__pycache__" not in p.parts}
+        if "__init__.py" not in files:
+            raise ModularAdapterError("engine package has no __init__.py")
+        return _sha256_bytes(_canonical(files))
+    return _sha256_file(path)
+
+
+def load_engine_module(path: str | Path, expected_sha256: str):
+    """Import exactly the pinned engine file or package under a unique name; no fallback."""
+    path = Path(path)
+    if engine_digest(path) != expected_sha256:
         raise ModularAdapterError("engine hash mismatch")
-    name = "lts_pinned_modular_temporal_" + engine["sha256"][:16]
-    spec = importlib.util.spec_from_file_location(name, path)
+    name = "lts_pinned_modular_temporal_" + expected_sha256[:16]
+    if name in sys.modules:
+        return sys.modules[name]
+    if path.is_dir():
+        spec = importlib.util.spec_from_file_location(
+            name, path / "__init__.py", submodule_search_locations=[str(path)])
+    else:
+        spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ModularAdapterError("engine module cannot be loaded")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[name] = module  # relative imports inside a package resolve through this name
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
     return module
+
+
+def _load_engine(contract: ModularContract):
+    engine = contract.data["engine"]
+    return load_engine_module(contract.resolve(engine["path"]), engine["sha256"])
 
 
 def running_keras_version() -> str:
