@@ -202,12 +202,25 @@ class AlpacaModelRunner:
             self.store, self.client, self.profile, self.service
         )
         self.sessions = ModelSessionStore(self.store._con)
-        self.selector = SelectedLinearPolicy(
-            manifest_file=config["model"]["manifest_file"],
-            expected_asset_id=config["model"]["expected_asset_id"],
-            expected_timeframe=config["model"]["expected_timeframe"],
-            execution_tier=config["model"]["execution_tier"],
-        )
+        if config["model"].get("family", "linear") == "modular":
+            # Shadow tier only: the selector refuses any other tier and any
+            # contract that claims execution authority, before tick() runs.
+            from app.modular_runner_policy import SelectedModularPolicy
+            self.selector = SelectedModularPolicy(
+                contract_file=config["model"]["contract_file"],
+                expected_asset_id=config["model"]["expected_asset_id"],
+                expected_timeframe=config["model"]["expected_timeframe"],
+                execution_tier=config["model"]["execution_tier"],
+            )
+        elif config["model"].get("family", "linear") != "linear":
+            raise AlpacaModelRunnerError("unknown model family")
+        else:
+            self.selector = SelectedLinearPolicy(
+                manifest_file=config["model"]["manifest_file"],
+                expected_asset_id=config["model"]["expected_asset_id"],
+                expected_timeframe=config["model"]["expected_timeframe"],
+                execution_tier=config["model"]["execution_tier"],
+            )
         self.manifest = self.selector.manifest
         self.policy = self.selector.policy
 
@@ -241,6 +254,10 @@ class AlpacaModelRunner:
         )
 
     def tick(self, *, allow_execution: bool = True) -> dict[str, Any]:
+        if getattr(self.policy, "shadow_only", False) is True:
+            # Before any account, session, position, quote or order logic;
+            # allow_execution cannot reopen that path for a shadow policy.
+            return self._shadow_tick()
         now = _utc_now()
         selection_error = None
         try:
@@ -411,16 +428,38 @@ class AlpacaModelRunner:
             print(json.dumps({"due_bar_fact_error": str(exc)[:160]}),
                   flush=True)
 
+    def _shadow_tick(self) -> dict[str, Any]:
+        """Closed bars -> modular observation -> inference -> action -> one fact."""
+        try:
+            if self.selector.refresh():
+                self.manifest = self.selector.manifest
+                self.policy = self.selector.policy
+        except LiveModelSelectionError as exc:
+            return {"state": "selection_refused", "reason": str(exc),
+                    "orders_submitted": 0, "execution_authorized": False}
+        if getattr(self.policy, "shadow_only", False) is not True:
+            raise AlpacaModelRunnerError("shadow tick reached with a non-shadow policy")
+        bars = _bars(self.client, self.profile.symbol, self.config["data"]["start"])
+        observation = self.policy.build_observation(bars)
+        inference = self.policy.predict(observation)
+        if inference.get("execution_authorized") is not False:
+            raise AlpacaModelRunnerError("shadow inference claimed execution authority")
+        self._record_due_bar(inference, outcome="shadow_inference_only",
+                             reason="modular_shadow_tier")
+        return {"state": "shadow_inference_only", "inference": inference,
+                "orders_submitted": 0, "execution_authorized": False}
+
     def close(self) -> None:
         self.store.close()
 
     def write_heartbeat(self, payload: dict[str, Any]) -> None:
         runtime = {
             **payload,
-            **linear_model_identity(self.selector),
+            **(self.selector.identity() if hasattr(self.selector, "identity")
+               else linear_model_identity(self.selector)),
             "venue": "alpaca_paper",
             "environment": "paper",
-            "read_only": False,
+            "read_only": getattr(self.policy, "shadow_only", False) is True,
             "account_binding_verified": True,
             "account_fingerprint": self.profile.account_fingerprint,
             "instrument": self.profile.symbol,
