@@ -248,3 +248,90 @@ Keras 3.13.2 environment: REPLAY_PASS. The v1 candidate (no field) now refuses u
 the flag is given. Evidence: `.runtime/m05-paper-adapter-20260930/keras-pin/`.
 
 Satoshi, successor technical lead, 2026-09-30.
+
+## Addendum 4: lane E, the installed consumer end to end in shadow (PRE-INTEGRATION)
+
+Orders: predictor master `ac125db9`, section 3 row E, and the reconciliation's "M03 +
+M05". The weekly paper/observer lanes were left untouched and running. The live `lts`
+checkout (`12bce5f`, unit `lts-alpaca-model-runner`) was never modified, switched or
+restarted. No deployment was made and no activation file was written.
+
+**Consumer.** `AlpacaModelRunner` (`app/alpaca_model_runner.py`) serves the SPY 1d
+route. Commit `9bd5463` lets it consume a modular policy:
+- `model.family: modular` selects `SelectedModularPolicy` (`app/modular_runner_policy.py`).
+- That selector refuses every tier except `shadow_inference_only`, and any contract
+  that claims execution authority, before `tick()` can run. An unknown family is
+  refused too.
+- A shadow policy takes a branch at the top of `tick()`: the runner's own `_bars()`
+  closed-bar fetch, then the adapter observation, modular inference and action, then
+  one `due_bar_decisions` fact (`outcome: shadow_inference_only`).
+- The branch returns before any account, session, position, quote or order logic.
+  It ignores `allow_execution`.
+- The linear path is unchanged. The heartbeat reports the modular identity with
+  `read_only: true`.
+
+**End-to-end test.** `tests/unit/test_alpaca_runner_modular_shadow.py` (9 tests) and
+`tools/modular_runner_shadow_e2e.py` drive the real `__init__` and `tick()`. The broker
+double serves bars through `stock_bars` and raises on every other attribute. It
+uses dummy credentials under dedicated variable names, a dummy account fingerprint,
+and a fresh ledger.
+
+**Receipt** `runner_shadow_e2e_receipt_PRE-INTEGRATION.json` (sha256 `6da731bb…`):
+**RUNNER_SHADOW_PASS**.
+- Contract `480dafaa…` (engine `64a91a74`, Keras 3.13.2; previous `556c5f3e`, Keras
+  3.15.0).
+- Population: SPY 1d, recorded Alpaca IEX, 1,511 bars (2020-07-27 to 2026-07-31).
+  12 decision points, 2026-07-16 to 2026-07-31.
+- Scale: the profile's one share and four orders per day. Declared but **unused**:
+  the shadow tier never sizes or submits an order.
+- Execution was requested on every tick and ignored. All 12 ticks returned
+  `shadow_inference_only`. The only broker attribute touched was `stock_bars`.
+- No session or effect rows were written. The heartbeat was `read_only`.
+- Actions: 11 hold, 1 long.
+- The runner's 12 input and output digests equal the adapter replay receipt's
+  (`73ba5a43…`) exactly.
+
+**Latent causality probe** (in the replay tool; receipt
+`replay_v2_latent_probe_PRE-INTEGRATION.json`, sha256 `c015527b…`). Each of the 24
+input steps of a recorded window was perturbed in turn. In every case, no
+bottleneck step before `i // 4` moved (largest change 0.0), and the earliest step
+that moved was exactly `i // 4` for all 24. Verdict: REPLAY_PASS.
+
+**Bottleneck semantics, both recorded.**
+- Old core (`556c5f3e`/`64a91a74`, exercised here): causal-attention Transformer over
+  the 12-step fused branch grid, then three learned compression stages to 6
+  right-edge tokens × 8 channels.
+- Lane A's new core (`c0d7b07b`, engine `da4ce7b4`): also (6, 8), but on the
+  right-edge grid [4, 8, 12, 16, 20, 24] after residual Conv1D stages 24→12→6→6 over
+  24-step branches.
+- Not yet exercised: lane A has not published an installed integrated package.
+
+**Suites** (worker_b, `crispdm-run` ≤3G, CUDA hidden; measured wall times):
+
+| Run | Env | Result | Wall time |
+|---|---|---|---|
+| Named routes + adapter + preflight, before at `4e88c01` | trading-stack | 58 passed | 11 s |
+| The same + runner shadow tests, after at `9bd5463` / final `4f03cef` | trading-stack | 67 / 67 passed | 11.5 s / 13.3 s |
+| Live lineage, before at `12bce5f` (+ `test_mt5_symbol_model_compat_preflight`) | trading-stack, scratch cherry-pick | 66 passed | 1.1 s |
+| Live lineage, after: all four M05 code commits cherry-picked cleanly (`cccbba6`) | trading-stack | 103 passed | 11.5 s |
+| **Installed, PRE-INTEGRATION**: predictor `64a91a74` and lts `9bd5463` installed non-editable into separate venvs on `envs/tensorflow` (Keras 3.13.2); tests run from a copy outside the tree, so `app` and the engine resolve from site-packages | venv | 67 passed, 0 skipped | 13 s (109 s with admission) |
+
+**Installed-environment findings.**
+- Installing predictor and lts into one environment merges their two top-level `app`
+  packages. That is why the engine and the consumer live in separate venvs.
+- lts's non-editable install omits `plugins_core`, `plugins_aaa` and
+  `feeder_plugins`, so `tests/conftest.py` cannot import. Those three directories were
+  copied next to the tests. `app` and the adapter still come from the install.
+- Both are packaging gaps for their owners to decide on. They are not changed here.
+
+**Not done.**
+- No re-export or installed run against lane A's package yet: it is not yet an
+  installed, integrated package. When it is: re-export, re-run golden parity and the
+  latent probe, and record both semantics in the contract.
+- No real broker run of the shadow branch. Against the shared Paper account a real
+  shadow deployment would need its own ledger, and it is not authorized.
+- Position control (in the live lineage) is not applied to shadow decisions.
+- Nothing is promoted. A synthetic donor or a forecasting metric does not open real
+  money.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
