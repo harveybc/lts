@@ -307,7 +307,7 @@ needs_engine = pytest.mark.skipif(not ENGINE or not Path(ENGINE).is_file(),
                                   reason="LTS_MODULAR_ENGINE does not name predictor's modular_temporal.py")
 
 
-def _export(tmp_path, *, seed=7):
+def _export(tmp_path, *, seed=7, keras_version="running"):
     import importlib.util
 
     import numpy as np
@@ -327,6 +327,12 @@ def _export(tmp_path, *, seed=7):
     data = _contract()
     data["modular_config"] = bundle.config
     data["engine"] = {"path": ENGINE, "sha256": hashlib.sha256(Path(ENGINE).read_bytes()).hexdigest()}
+    if keras_version == "running":
+        import keras
+
+        data["engine"]["keras_version"] = keras.__version__
+    elif keras_version is not None:
+        data["engine"]["keras_version"] = keras_version
     data["artifact"] = {"file": "model.keras", "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                         "weights_sha256": engine.weights_hash(model)}
     contract_path = tmp_path / "contract.json"
@@ -371,3 +377,56 @@ def test_policy_refuses_gpu_env_tampered_weights_and_wrong_engine(tmp_path, monk
     contract_path.write_text(json.dumps(data))
     with pytest.raises(ModularAdapterError, match="engine hash"):
         ModularPolicy.load(contract_path)
+
+
+# ------------------------------------------------------------ Keras pin (fail closed)
+
+
+def test_keras_pin_match_mismatch_and_missing_without_tensorflow(tmp_path):
+    from app.modular_inference_adapter import check_keras_pin
+
+    contract = _write_contract(tmp_path, _contract(**{"engine.keras_version": "3.13.2"}))
+    check_keras_pin(contract, "3.13.9")  # same major.minor: admitted
+    with pytest.raises(ModularAdapterError, match=r"Keras 3\.13\.2.*running Keras 3\.15\.0"):
+        check_keras_pin(contract, "3.15.0")
+    bare = _write_contract(tmp_path, _contract())
+    with pytest.raises(ModularAdapterError, match="no engine.keras_version.*3.15.0"):
+        check_keras_pin(bare, "3.15.0")
+    check_keras_pin(bare, "3.15.0", allow_unpinned_keras=True)
+    with pytest.raises(ModularAdapterError, match="Keras 3.13.2"):  # the flag never admits a mismatch
+        check_keras_pin(contract, "3.15.0", allow_unpinned_keras=True)
+
+
+@needs_engine
+def test_policy_loads_when_keras_major_minor_matches(tmp_path, monkeypatch):
+    from app.modular_inference_adapter import ModularPolicy
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    contract_path, _, _ = _export(tmp_path)
+    assert ModularPolicy.load(contract_path).model is not None
+
+
+@needs_engine
+def test_policy_refuses_keras_mismatch_before_deserialization(tmp_path, monkeypatch):
+    import keras
+    from app import modular_inference_adapter as adapter
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    contract_path, _, _ = _export(tmp_path, keras_version="2.99.0")
+    called = []
+    monkeypatch.setattr(adapter, "_load_engine", lambda c: called.append(c))
+    with pytest.raises(ModularAdapterError) as error:
+        adapter.ModularPolicy.load(contract_path)
+    assert "2.99.0" in str(error.value) and keras.__version__ in str(error.value)
+    assert called == []  # refused before the engine or archive was touched
+
+
+@needs_engine
+def test_policy_refuses_missing_keras_field_unless_explicitly_allowed(tmp_path, monkeypatch):
+    from app.modular_inference_adapter import ModularPolicy
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    contract_path, _, _ = _export(tmp_path, keras_version=None)
+    with pytest.raises(ModularAdapterError, match="allow_unpinned_keras is off"):
+        ModularPolicy.load(contract_path)
+    assert ModularPolicy.load(contract_path, allow_unpinned_keras=True).model is not None

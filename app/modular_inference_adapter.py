@@ -459,6 +459,34 @@ def _load_engine(contract: ModularContract):
     return module
 
 
+def running_keras_version() -> str:
+    import keras
+
+    return str(keras.__version__)
+
+
+def _major_minor(version: str) -> tuple[str, ...]:
+    return tuple(str(version).split(".")[:2])
+
+
+def check_keras_pin(contract: ModularContract, running: str, *,
+                    allow_unpinned_keras: bool = False) -> None:
+    """Fail closed before deserialization, as predictor's load_bundle does."""
+    recorded = contract.data["engine"].get("keras_version")
+    if recorded is None:
+        if allow_unpinned_keras:
+            return
+        raise ModularAdapterError(
+            f"contract records no engine.keras_version; running Keras {running}. "
+            "Refusing to deserialize (allow_unpinned_keras is off)")
+    if not isinstance(recorded, str) or len(_major_minor(recorded)) != 2:
+        raise ModularAdapterError(f"contract engine.keras_version {recorded!r} is malformed")
+    if _major_minor(recorded) != _major_minor(running):
+        raise ModularAdapterError(
+            f"archive was exported under Keras {recorded}; running Keras {running}. "
+            "A major.minor mismatch is refused before deserialization")
+
+
 class ModularPolicy:
     """Hash-verified modular model behind the contract; shadow inference only."""
 
@@ -473,10 +501,19 @@ class ModularPolicy:
         self.contract_sha256 = contract.sha256
 
     @classmethod
-    def load(cls, contract_path: str | Path, *, require_cpu: bool = True) -> "ModularPolicy":
+    def load(cls, contract_path: str | Path, *, require_cpu: bool = True,
+             allow_unpinned_keras: bool = False) -> "ModularPolicy":
+        """Load the contract's model; refuse a Keras major.minor different from the export's.
+
+        ``allow_unpinned_keras`` admits a contract that predates the
+        ``engine.keras_version`` field (v1-era replays only); it never admits a
+        recorded version that disagrees with the running one.
+        """
         if require_cpu and os.environ.get("CUDA_VISIBLE_DEVICES") != "":
             raise ModularAdapterError("modular shadow inference must run with CUDA_VISIBLE_DEVICES=''")
         contract = load_contract(contract_path)
+        check_keras_pin(contract, running_keras_version(),
+                        allow_unpinned_keras=allow_unpinned_keras)
         engine = _load_engine(contract)
         artifact = contract.resolve(contract.data["artifact"]["file"])
         model = engine.keras.models.load_model(artifact, compile=False, safe_mode=True)

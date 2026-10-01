@@ -53,8 +53,9 @@ def _max_abs(a, b) -> float:
 
 
 def replay(contract_path: Path, bars_path: Path, points: int, *, golden_path: Path | None = None,
-           feature_tol: float = 1e-9, output_tol: float = 1e-5) -> dict:
-    policy = ModularPolicy.load(contract_path)
+           feature_tol: float = 1e-9, output_tol: float = 1e-5,
+           allow_unpinned_keras: bool = False) -> dict:
+    policy = ModularPolicy.load(contract_path, allow_unpinned_keras=allow_unpinned_keras)
     contract = policy.contract
     bars = read_recorded_bars(bars_path)
     offset = timedelta(hours=float(contract.data["time"]["bar_close_offset_hours"]))
@@ -152,9 +153,13 @@ def main(argv=None) -> int:
     parser.add_argument("--golden", type=Path)
     parser.add_argument("--points", type=int, default=12)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--allow-unpinned-keras", action="store_true",
+                        help="v1-era contracts without engine.keras_version only; default off")
     args = parser.parse_args(argv)
     try:
-        receipt = replay(args.contract, args.bars, args.points, golden_path=args.golden)
+        receipt = replay(args.contract, args.bars, args.points, golden_path=args.golden,
+                         allow_unpinned_keras=args.allow_unpinned_keras)
+        receipt["allow_unpinned_keras"] = args.allow_unpinned_keras
     except ModularAdapterError as exc:
         receipt = {"schema": RECEIPT_SCHEMA, "verdict": "REPLAY_REFUSED", "reason": str(exc),
                    "broker_calls": 0, "orders_submitted": 0, "execution_authorized": False}
