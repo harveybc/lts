@@ -771,3 +771,66 @@ It flags the sizing and cost mismatch between the harness and the demo route, th
 drift in the deployed daily loss budget, and the placeholders.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 13: ETH 4h paired backtest on M07's four R0 cells (DEVELOPMENT_NOT_CONFIRMATORY)
+
+**Inputs, all verified on worker_b:**
+- **Episode:** lane G `EPISODES.json` sha256 `1a7cacbe…`. Validation rows [13699, 15895), data sha `1b447c66…`.
+- **View:** predictor `b1f8a74f` `ethusdt_4h_tech_stat_full_model_ready.csv`, sha `1b447c66…`.
+- **Evidence and predictions:** M07 `artifacts_r0_v1/EVIDENCE_{10f83766,4a122eff,50ee6e9b,d26350d4}.json`
+  and the matching `PREDICTIONS_*.csv`.
+- **Manifest:** FROZEN_DEVELOPMENT, so every run is labelled `DEVELOPMENT_NOT_CONFIRMATORY`.
+- **Harness:** heuristic-strategy `85b0a45`, frozen `HeuristicParams`, lane G costs.
+- **Naive:** `naive_MAE` in the records is M04's strict minimum over persistence, train
+  mean (zero return) and seasonal-6. Here that is the train-mean naive on every horizon.
+
+MAE is in z_train units on 2190 identical rows per horizon; skill = 1 − model/naive.
+
+| Cell | h1 | h2 | h3 | h4 | h5 | h6 | Consumed |
+|---|---|---|---|---|---|---|---|
+| 10f83766 grouped32 s2021 | 0.464832 / 0.464673 ✗ | 0.659675 / 0.657202 ✗ | 0.828914 / 0.827491 ✗ | 0.955298 / 0.955080 ✗ | 1.094785 / 1.087890 ✗ | 1.201653 / 1.198114 ✗ | none: **SKIPPED, strategy not run** |
+| 4a122eff grouped32 s2022 | 0.464661 / 0.464673 ✓ | 0.659309 / 0.657202 ✗ | 0.827924 / 0.827491 ✗ | 0.961044 / 0.955080 ✗ | 1.089831 / 1.087890 ✗ | 1.198961 / 1.198114 ✗ | [1] |
+| 50ee6e9b control_mlp s2022 | 0.464669 / 0.464673 ✓ | 0.658902 / 0.657202 ✗ | 0.830782 / 0.827491 ✗ | 0.959063 / 0.955080 ✗ | 1.084217 / 1.087890 ✓ | 1.198524 / 1.198114 ✗ | [1, 5] |
+| d26350d4 control_mlp s2021 | 0.464612 / 0.464673 ✓ | 0.657928 / 0.657202 ✗ | 0.826506 / 0.827491 ✓ | 0.953524 / 0.955080 ✓ | 1.087738 / 1.087890 ✓ | 1.195745 / 1.198114 ✓ | [1, 3, 4, 5, 6] |
+
+Each cell shows model MAE / same-row naive MAE.
+
+No cell passes every horizon. The three partial cells ran only as declared
+reduced-input experiments, with the excluded horizons listed in each result. The margins
+are tiny: the largest skill is +0.00198 (d26350d4, h6), and 50ee6e9b at h1 has skill
++0.00001. On several passing horizons the MSE is worse than the naive (for example
+4a122eff h1: MSE 0.485568 vs 0.485500). The gate decides on MAE, as the frozen primary
+metric requires; the MSE is reported, not used.
+
+**Heuristic arm.** Primary = full episode, 2196 bars, of which the last 6 have no
+forecast and take no new entry. Cut = 2190 rows to 15888.
+
+| Cell | Episode | net_return | max_dd | Sharpe (per-bar, ddof=1) | turnover | trades | exposure |
+|---|---|---|---|---|---|---|---|
+| 10f83766 | both | NOT RUN (SKIPPED) | | | | | |
+| 4a122eff | primary / cut | 0.0 / 0.0 | 0 | undefined (zero variance) | 0 | 0 | 0 |
+| 50ee6e9b | primary | 0.007448 | 0.022506 | 0.006417 | 40 | 20 | 0.01275 |
+| 50ee6e9b | cut | 0.007448 | 0.022506 | 0.006426 | 40 | 20 | 0.01279 |
+| d26350d4 | primary | 0.038064 | 0.017811 | 0.029536 | 34 | 17 | 0.01138 |
+| d26350d4 | cut | 0.038064 | 0.017811 | 0.029577 | 34 | 17 | 0.01142 |
+
+The no-trade baseline is 0 on every metric, with an undefined Sharpe.
+
+**Beside lane G's RL-D0** (DQN native_flat, seed 101, `RESULT.json` sha `ca286788…`):
+net_return 0.383182, max_dd 0.099536, Sharpe 0.040385 (over 2476 bars), turnover 313,
+trades 156, exposure 0.8865. Four caveats bear on the pairing:
+1. RL-D0's checkpoint was **selected on this same validation episode**
+   (`selection_metric: net_return`, `best_validation_checkpoint`), so its validation
+   number is optimistically biased. The heuristic arm selected nothing on the episode.
+2. Its Sharpe counts 2476 bars, which includes the 280-bar forced-hold context prefix;
+   mine counts 2196.
+3. RL-D0 used variant A (`A_all_admissible_control`) features. The forecasting cells used
+   M07's manifest.
+4. RL-D0 is labelled `RESULT` on a `FROZEN_DEVELOPMENT` manifest. Lane G's own
+   `validate_result_record` admits RESULT only for `FROZEN`, so the label is lane G's to
+   reconcile.
+
+All runs used one CPU job on worker_b under `crispdm-run -m 2G`. Results, declarations and
+stdout are in `.runtime/m05-paper-adapter-20260930/eth4h_paired/`.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
