@@ -599,3 +599,27 @@ that passes a heuristic-strategy callable fed with learned predictions would nee
 at that caller.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 9: S09 logs and the owner's open questions
+
+**Logs** (in `/home/harveybc/Documents/GitHub/.runtime/m05-paper-adapter-20260930/heuristic-gate/`):
+- `s09_green_71fa1a4.log`: the committed tip `71fa1a4`, verbose, **61 passed**. That is
+  18 S09 tests, 26 S08 tests and the 17-test healthy subset. It was re-run on worker_b to
+  keep the full log; the earlier run printed only its summary line.
+- `s09_mutants.log`: the sandboxed rerun of all twelve mutants (2 m wall each). Its first
+  line, "green: 43 passed", predates the sandbox-proof test. At that point the S09 file
+  held 17 tests, so 17 + 26 = 43. The mutants ran against those 17 tests, and every one
+  was killed. Adding the 18th test (the sandbox proof) makes 18 + 26 + 17 = 61.
+
+**Questions 21–23 for the owner.** The current behaviour stands until he rules:
+- **21: direction classifiers (phases B/C/D).** Direction-probability sets have no form in
+  the forecast-vs-naive contract, so they are never admitted and B/C/D always skip. Should
+  a classification baseline be defined for them?
+- **22: regime_wfo.** It declares `consumes_learned_predictions = False`. It is allowed and
+  recorded as NOT_APPLICABLE_NO_LEARNED_PREDICTIONS, with the declaration in the receipt.
+  Is that exemption accepted?
+- **23: API mode.** Per-tick API predictions cannot be bound to declared horizons before a
+  run, so the API plugin and API-mode runs always skip. Should a binding mechanism be
+  specified?
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
