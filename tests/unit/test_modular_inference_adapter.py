@@ -451,3 +451,46 @@ def test_package_engine_digest_covers_every_module(tmp_path):
     (package / "__init__.py").unlink()
     with pytest.raises(ModularAdapterError, match="__init__"):
         engine_digest(package)
+
+
+# ------------------------------------------------------------ conditioning contract (M01 provenance v1)
+
+
+@pytest.mark.parametrize("declared, operational_ok", [
+    (None, False), ("UNKNOWN", False), ("SYNTHETIC_OFFLINE", False), ("OPERATIONAL", True)])
+def test_operational_requirement_refuses_unknown_and_synthetic(tmp_path, declared, operational_ok):
+    from app.modular_inference_adapter import check_conditioning
+
+    data = _contract()
+    if declared is not None:
+        data["provenance"] = {"provenance_schema": "predictor.modular.provenance.v1",
+                              "conditioning_contract": declared}
+    contract = _write_contract(tmp_path, data)
+    assert check_conditioning(contract, None) == (declared or "UNKNOWN")  # shadow records it
+    if operational_ok:
+        assert check_conditioning(contract, "OPERATIONAL") == "OPERATIONAL"
+    else:
+        with pytest.raises(ModularAdapterError, match="CONDITIONING_CONTRACT_NOT_OPERATIONAL"):
+            check_conditioning(contract, "OPERATIONAL")
+
+
+def test_unrecognised_conditioning_value_is_refused(tmp_path):
+    from app.modular_inference_adapter import check_conditioning
+
+    data = _contract()
+    data["provenance"] = {"conditioning_contract": "OPERATIONALISH"}
+    with pytest.raises(ModularAdapterError, match="not recognised"):
+        check_conditioning(_write_contract(tmp_path, data), None)
+
+
+@needs_engine
+def test_policy_load_refuses_non_operational_before_the_engine_is_touched(tmp_path, monkeypatch):
+    from app import modular_inference_adapter as adapter
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    contract_path, _, _ = _export(tmp_path)
+    touched = []
+    monkeypatch.setattr(adapter, "_load_engine", lambda c: touched.append(c))
+    with pytest.raises(ModularAdapterError, match="CONDITIONING_CONTRACT_NOT_OPERATIONAL"):
+        adapter.ModularPolicy.load(contract_path, require_conditioning="OPERATIONAL")
+    assert touched == []

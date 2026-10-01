@@ -493,6 +493,31 @@ def _load_engine(contract: ModularContract):
     return load_engine_module(contract.resolve(engine["path"]), engine["sha256"])
 
 
+CONDITIONING_CONTRACTS = ("OPERATIONAL", "SYNTHETIC_OFFLINE", "UNKNOWN")
+
+
+def conditioning_contract(contract: ModularContract) -> str:
+    """predictor.modular.provenance.v1 ``conditioning_contract``; absent reads UNKNOWN."""
+    value = (contract.data.get("provenance") or {}).get("conditioning_contract", "UNKNOWN")
+    if value not in CONDITIONING_CONTRACTS:
+        raise ModularAdapterError(f"contract provenance.conditioning_contract {value!r} is not recognised")
+    return value
+
+
+def check_conditioning(contract: ModularContract, require: str | None) -> str:
+    """OPERATIONAL serving refuses UNKNOWN and SYNTHETIC_OFFLINE; shadow only records."""
+    value = conditioning_contract(contract)
+    if require is None:
+        return value
+    if require != "OPERATIONAL":
+        raise ModularAdapterError(f"unsupported conditioning requirement {require!r}")
+    if value != "OPERATIONAL":
+        raise ModularAdapterError(
+            f"CONDITIONING_CONTRACT_NOT_OPERATIONAL: contract declares {value}; "
+            "operational serving requires OPERATIONAL")
+    return value
+
+
 def running_keras_version() -> str:
     import keras
 
@@ -536,7 +561,8 @@ class ModularPolicy:
 
     @classmethod
     def load(cls, contract_path: str | Path, *, require_cpu: bool = True,
-             allow_unpinned_keras: bool = False) -> "ModularPolicy":
+             allow_unpinned_keras: bool = False,
+             require_conditioning: str | None = None) -> "ModularPolicy":
         """Load the contract's model; refuse a Keras major.minor different from the export's.
 
         ``allow_unpinned_keras`` admits a contract that predates the
@@ -548,6 +574,7 @@ class ModularPolicy:
         contract = load_contract(contract_path)
         check_keras_pin(contract, running_keras_version(),
                         allow_unpinned_keras=allow_unpinned_keras)
+        check_conditioning(contract, require_conditioning)
         engine = _load_engine(contract)
         artifact = contract.resolve(contract.data["artifact"]["file"])
         model = engine.keras.models.load_model(artifact, compile=False, safe_mode=True)
@@ -599,6 +626,7 @@ class ModularPolicy:
                            "sha256": _sha256_bytes(np.ascontiguousarray(bottleneck).tobytes()),
                            "values": bottleneck.astype(np.float64).tolist()},
             "action": map_action(chosen, action),
+            "conditioning_contract": conditioning_contract(self.contract),
             "action_input": chosen,
         }
         result["output_sha256"] = _sha256_bytes(_canonical(result))

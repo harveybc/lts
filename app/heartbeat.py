@@ -36,6 +36,7 @@ async def run_heartbeat_cycle(config: Dict[str, Any], db: Database, plugins: Dic
         "portfolios_processed": 0,
         "signals_generated": 0,
         "orders_placed": 0,
+        "forecast_gate": [],
         "errors": []
     }
 
@@ -57,6 +58,7 @@ async def run_heartbeat_cycle(config: Dict[str, Any], db: Database, plugins: Dic
                     results["portfolios_processed"] += 1
                     results["signals_generated"] += portfolio_result.get("signals", 0)
                     results["orders_placed"] += portfolio_result.get("orders", 0)
+                    results["forecast_gate"].extend(portfolio_result.get("forecast_gate", []))
                 except Exception as e:
                     err = f"Portfolio {portfolio.id} error: {str(e)}"
                     results["errors"].append(err)
@@ -81,7 +83,7 @@ async def run_heartbeat_cycle(config: Dict[str, Any], db: Database, plugins: Dic
 async def _process_portfolio(session, portfolio, prediction_client, config, plugins):
     """Process a single portfolio: iterate assets, get signals, execute."""
     from sqlalchemy import select
-    result = {"signals": 0, "orders": 0}
+    result = {"signals": 0, "orders": 0, "forecast_gate": []}
 
     stmt = select(Asset).where(Asset.portfolio_id == portfolio.id, Asset.is_active == True)
     asset_result = await session.execute(stmt)
@@ -99,6 +101,15 @@ async def _process_portfolio(session, portfolio, prediction_client, config, plug
 
             if predictions.get('status') != 'success':
                 logger.warning(f"Prediction failed for {asset.symbol}")
+                continue
+
+            # Owner gate (b327b771 s5): no strategy invocation unless the learned
+            # predictions beat persistence on every consumed horizon of both families.
+            decision = _forecast_gate(asset, predictions)
+            result["forecast_gate"].append(decision)
+            if decision["status"] != "ELIGIBLE":
+                logger.warning(f"{asset.symbol}: {decision['status']} "
+                               f"({len(decision['failures'])} failure(s)); strategy not started")
                 continue
 
             # Run strategy to get signal
@@ -129,6 +140,22 @@ async def _process_portfolio(session, portfolio, prediction_client, config, plug
             logger.error(f"Asset {asset.symbol} processing error: {e}")
 
     return result
+
+
+def _forecast_gate(asset, predictions) -> Dict[str, Any]:
+    """Eligibility of this asset's predictions; any fault is a SKIP, never a pass."""
+    from app.forecast_naive_gate import SKIPPED, gate_asset
+
+    strategy_cfg = asset.strategy_config or {}
+    try:
+        if isinstance(strategy_cfg, str):
+            import json
+            strategy_cfg = json.loads(strategy_cfg)
+        return gate_asset(asset.symbol, strategy_cfg, predictions)
+    except Exception as exc:  # fail closed
+        return {"status": SKIPPED, "asset": asset.symbol, "provenance": {}, "horizons": [],
+                "failures": [{"reason": "gate_error", "family": None, "horizon": None,
+                              "detail": f"{type(exc).__name__}: {exc}"}]}
 
 
 def _compute_heuristic_signal(asset, predictions, config) -> Dict[str, Any]:
