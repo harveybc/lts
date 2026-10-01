@@ -898,3 +898,70 @@ heuristic's cell choice is post-hoc.
 Evidence: `.runtime/m05-paper-adapter-20260930/eth4h_paired_24/`.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 15: front E build-out (MAINLINE §4.E) and the integration replay
+
+**Integration test, ETH 4h dormant MT5 demo route** (lts `907e2fb` + `803904c`). The real
+`Mt5ModelRunner` ran offline: an isolated bridge store, network forbidden, family
+`recorded_forecast`, shadow tier. Inputs were the 2196 recorded validation bars
+[13699, 15895) and cell d26350d4's recorded predictions, gated to horizons [1,3,4,5,6]
+as a declared reduced experiment.
+- It was **crashed after 900 ticks and resumed** from the persisted state for the
+  remaining 1296.
+- Result: 2196 decisions logged, **0 commands queued**, `execution_authorized` false.
+- The per-bar targets are **identical to the paired harness on the same bars** (2196/2196,
+  0 mismatches, harness digest `78f47105…`).
+- Evidence: `.runtime/m05-paper-adapter-20260930/route-replay/` (part1/part2 receipts,
+  decisions JSONL, final state, contract).
+
+**New in lts:**
+- `app/recorded_forecast_policy.py`: the naive gate selects the readable horizons, and no
+  passing horizon keeps the route dormant. The decision rule mirrors the harness exactly.
+  State is persisted per bar with an atomic replace. A late tick catches up bar by bar from
+  the declared episode start. Each bar gets a JSONL observability line: decision, reason,
+  forecasts, sizing (none in shadow) and cost lines (MODELLED / BROKER_FILL, not
+  applicable in shadow).
+- Wired into both the MT5 demo and the Alpaca paper runners. Alpaca was exercised only
+  with the offline broker double; no credential was touched.
+- `tools/recorded_forecast_route_replay.py`: `--stop-after` for crash/resume and
+  `--compare` against a harness result.
+- Tests: red at collection, then 9. Mutants killed: state not persisted (2), failing column
+  read (survived at first; a poisoned-column test was added, then killed, 1), tier
+  unchecked (1), no catch-up (1), gate ignored (1).
+
+**New in heuristic-strategy** (`114779b`, `177847a`):
+- Campaign-2 smoke: `run_paired_families.py` on synthetic EURUSD/GBPUSD records with M07's
+  exact asset strings, separate hourly and daily records, `n_rows` columns and irregular
+  weekend bars. 3 assets × 3 gate outcomes, all as expected. `split_half` now uses the
+  per-row `n_rows`.
+- Explicit cost lines: commission MODELLED from fills; slippage, spread and swap MODELLED 0
+  per lane G's specification; `broker_fill_costs` BROKER_FILL NOT_AVAILABLE offline.
+- Per-run observability JSONL: header with gate, skipped-by-gate reasons, sizing and costs,
+  then one line per bar.
+- Ablation runners: `HeuristicParams.direction` long_only / short_only, and
+  `run_ablations.py`, which runs both/long/short and each horizon alone, only for a fully
+  eligible candidate. No ETH R0 config is eligible.
+- Tests: 14 (smoke) + 6 (observability/ablation). Mutants killed: direction ignored,
+  commission dropped, broker line claimed, observability skips bars, ablation on an
+  ineligible candidate (1 each).
+
+**Full lts suites** (worker_b, isolated venv `venv-ts-jose`, `crispdm-run` 2G):
+
+| Run | TF side | RL side |
+|---|---|---|
+| Branch before (`42035f1`) | 130 passed, 8 skipped | 43 |
+| Branch after (`803904c`) | 139 passed, 8 skipped | 43 |
+| Live lineage before (`12bce5f`) | 88 passed, 9 skipped | — |
+| Live lineage after: all M05 code commits cherry-picked into scratch (`693f96d`, removed), with the MT5 conflict resolved as before | 175 passed, 9 skipped | 43 |
+
+Every skip is a live SAC golden-parity file that is absent on worker_b. There are 0 errors.
+
+**Seeds 2023/2024:** M07's STATUS shows 48/48 verified, but only the seed-2021/2022 records
+are exported. I asked M07 for the remaining pairs; the 4-seed table and the split-half check
+will run when they land.
+
+**Front H:** H1 reports that no Kalman arm verifies (the ridge arms collapse to the
+train-mean naive; the MLP arms are worse than zero-return), so no records exist. The hook
+is ready.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
