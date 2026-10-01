@@ -623,3 +623,88 @@ Satoshi, successor technical lead, 2026-10-01 (UTC).
   specified?
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 10: front E under the autonomous-execution order
+
+**Coordinator rulings on questions 21–23** (recorded as coordinator rulings, not the
+owner's):
+- B/C/D direction classifiers stay excluded until a classification baseline exists.
+- regime_wfo is allowed as NOT_APPLICABLE, with its declaration recorded.
+- API mode skips.
+
+**1. RL shadow adapter (lts `c2304d6`).** `app/rl_shadow_adapter.py` handles lane G's
+`rl_temporal.policy_bundle.v1` (agent-multi `02db0701`):
+- validates every intake field and refuses a missing one by name, including
+  `execution_authorized` false and the evidence flags;
+- refuses an sb3/torch/gymnasium major.minor mismatch before loading;
+- gives read-only shadow decisions with zero orders.
+
+Tests: red at collection, then 43 passed, including real SB3 DQN and SAC bundles.
+Mutants killed: execution unchecked (2), zip unchecked (1), versions unchecked (2),
+mapping unchecked (1), bar_period unchecked (1).
+
+**2. Paired heuristic arm** (heuristic-strategy `b1383cb`, then `c81ccd0`).
+`app/paired_backtest.py` and `run_paired_eth4h.py`:
+- mirror lane G's `reconcile_episode` definitions on VALIDATION rows [13699, 15895),
+  a split M07 confirmed;
+- let the gate choose which horizons the strategy may read; failing ones are excluded
+  as a declared reduced experiment and never read;
+- give bars without a forecast an explicit hold policy, with the count recorded.
+
+Tests: red at collection, then 10 passed (71 with the S08/S09/healthy suites). Mutants
+killed: gate unwired (3), failing columns read (1), same-bar fill (2), Sharpe ddof 0 (1),
+reversal not counted (1).
+
+**3. Eligible-model integration path, dormant (lts `db9650f`).**
+- The MT5 runner (the ETH 4h demo route) accepts `family: modular` in the shadow tier
+  only. Its shadow branch reads recorded snapshot bars from its own bridge store and
+  queues no command.
+- `require_forecast_eligibility` keeps a modular route dormant: the selector refuses,
+  before any model loads, unless the contract's frozen
+  `predictor.forecast_naive_evidence.v1` record passes for exactly the horizon the
+  action consumes.
+- `examples/configs/mt5_eth_4h_modular_shadow_DORMANT.json` reuses the existing MT5
+  Demo ETH mandate block unchanged. The account is bound by a placeholder. It is not
+  installed as a unit.
+- Tests: red 7 failed, then green.
+- prediction_provider is not modified, because LTS consumes the file contract directly.
+
+**Suites** (worker_b, `crispdm-run` 2G):
+
+| Run | TF side | RL side (own process) |
+|---|---|---|
+| Branch before (`2b18e17`) | 110 passed, 8 skipped, 13 errors | — |
+| Branch after (`db9650f`) | 117 passed, 8 skipped, 13 errors | 43 passed |
+| Live lineage before (`12bce5f`) | 75 passed, 9 skipped, 13 errors | — |
+| Live lineage after (scratch `b264a22`) | 153 passed, 9 skipped, 13 errors | 43 passed |
+
+The skips (live SAC golden-parity artifacts absent on worker_b) and the 13 `jose`
+errors are identical before and after.
+
+**Finding:** running TF/Keras and torch/SB3 tests in ONE pytest process segfaults on
+worker_b, so the RL tests run in their own process.
+
+**Live-lineage port.** The cherry-pick onto `12bce5f` conflicts in the MT5 runner,
+because the live lineage has `policy_type` linear/sac. The conflict is resolved in
+scratch: `family: modular` takes precedence, otherwise the live selector logic is kept,
+and the heartbeat identity is merged. The resolved patch is in
+`.runtime/m05-paper-adapter-20260930/live-lineage/mt5_modular_shadow_on_12bce5f.patch`.
+Nothing was applied to the live checkout.
+
+**M5PHET** (read-only health check from the coordinator; no restarts):
+- `m5phet-chat` is active and running (since 2026-09-29, 0 restarts). The workbench
+  `GET /` returns 200 ("M5PHET · Workbench"). The API returns 401 without a token, so
+  authentication is enforced and the API answers.
+- `hermes-gateway`, `data-gov-m5phet` and `m5phet-tailnet-forward` are active, with 0
+  restarts.
+- The local interpreter endpoint returns 200.
+- No family task was exercised: that would need the API token and is beyond a health
+  check.
+
+**Pending:** item 3 (the ETH 4h paired run) waits for M07's first verified R0 cell
+(`EVIDENCE_<cid8>.json` and `PREDICTIONS_<cid8>.csv`) and lane G's
+`EPISODES.eth_4h.json`.
+
+Logs: `.runtime/m05-paper-adapter-20260930/front-e/`.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
