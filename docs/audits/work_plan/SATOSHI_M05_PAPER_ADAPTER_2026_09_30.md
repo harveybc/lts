@@ -834,3 +834,67 @@ All runs used one CPU job on worker_b under `crispdm-run -m 2G`. Results, declar
 stdout are in `.runtime/m05-paper-adapter-20260930/eth4h_paired/`.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 14: all 24 ETH R0 cells; split-half; families harness; equal-bar pairing
+
+**All 24 verified R0 cells** (M07 predictor `58572172`, `ARTIFACTS_INDEX.json`
+`37f1f5fc…`). Each was run through the harness, primary and cut, labelled
+DEVELOPMENT_NOT_CONFIRMATORY. All cells are reported; **any choice of a cell on this
+validation is post-hoc on DEVELOPMENT** (M07's and my statement).
+- 9 cells pass no horizon and are **SKIPPED** (strategy not run).
+- 15 run as declared reduced-input experiments.
+- Of those 15, 11 make **zero trades**. Their passing forecasts are too small to reach the
+  frozen 0.5% entry threshold. One of them is e1e1a2df, which passes all six horizons.
+- The 4 that trade, on the primary episode:
+
+| Cell | Net | Sharpe | Trades |
+|---|---|---|---|
+| d26350d4 | 0.0381 | 0.0295 | 17 |
+| b9338018 | 0.0682 | 0.0244 | 93 |
+| 50ee6e9b | 0.0074 | 0.0064 | 20 |
+| 5053628a | 0.0006 | 0.0008 | 30 |
+
+Seeds 2021/2022 summary (`seed_summary_s2021_s2022.json`): control_mlp_huber_adam net
+0.0341 ± 0.0483 (2 ran); control_mlp_mae_adamw 0.0228 ± 0.0216 (2 ran); every other
+config is 0 or skipped.
+
+**Split-half check** (`split_half_all.json`). Horizons are chosen on the first half of
+the 2190 validation origins (MAE strictly below the strict-minimum naive, recomputed from
+the predictions and bars in log-return space, with M07's declared mu) and scored on the
+second half only.
+- Only **3 of 24** cells keep every chosen horizon passing on the held-out half:
+  5053628a [2,4,6], d26350d4 [1,4,6], 790dc5b8 [6].
+- For most other cells, the horizons chosen on the first half fail on the second.
+- Second-half trading:
+  - 5053628a: net 0.0114, Sharpe 0.0175, 17 trades.
+  - d26350d4: net 0.0067, Sharpe 0.0181, 5 trades.
+  - b9338018: net 0.0301, 26 trades, but its horizon fails on the second half.
+  - 19e32355: net −0.0664.
+- This confirms M07's reading: selecting horizons on this validation is mostly selection
+  on noise.
+
+**Equal-bar pairing with lane G** (relabelled `RESULT.json` sha `cdd312d4…`, now
+DEVELOPMENT_NOT_CONFIRMATORY). On the same 2196 scored bars:
+- RL-D0 s101: Sharpe 0.04289, net 0.3832, max drawdown 0.0995, 156 trades, exposure 0.9995.
+- Best heuristic cell d26350d4: Sharpe 0.02954, net 0.0381, max drawdown 0.0178,
+  17 trades, exposure 0.0114.
+
+Caveats: both are single-seed numbers, RL-D0 was selected on this episode, and the
+heuristic's cell choice is post-hoc.
+
+**Families harness, for M07 campaign 2** (heuristic-strategy `4b5dd7e`):
+- `paired_backtest_families` / `run_paired_families.py` take separate hourly and daily
+  records and CSVs, paired on DATE_TIME, with per-family gates. Daily drives entry; hourly
+  only feeds exit variant E.
+- Any candidate id is accepted and named. This is the front H hook, confirmed to H1.
+- Tests: red at collection, then 8 (families) + 4 (split-half) green; 101 heuristic total.
+- Mutants killed: daily failing read (1), early close ungated (1), entry from hourly
+  (survived at first; a test was added, then killed, 1), split not split (1), population
+  sd (1), candidate not named (1).
+
+**Seeds table for the best 3 cells** waits for M07's seeds 2023/2024. The tool
+(`seed_summary`) is ready.
+
+Evidence: `.runtime/m05-paper-adapter-20260930/eth4h_paired_24/`.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
