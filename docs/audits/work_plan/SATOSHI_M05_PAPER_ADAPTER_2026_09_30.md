@@ -380,3 +380,110 @@ digest equals the tree's: `2939b82d…`.
 Evidence: `$HOME/Documents/GitHub/.runtime/m05-paper-adapter-20260930/integrated-3ecdb256/`.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 6: forecast-versus-naive eligibility gate for the heuristic strategy
+
+Owner order: predictor `b327b771`, section 5. Commit `a30a2b9`. The gate applies to the
+heuristic strategy. It does not apply to RL policy admission (section 6).
+
+**What it is.** `app/forecast_naive_gate.py` consumes M04's frozen
+`predictor.forecast_naive_evidence.v1` records (predictor
+`tools/modular_forecast_evidence.py`, `de164a09`), adopted as-is, one record per
+prediction family. Its `evidence_sha256` is re-derived exactly as M04's `verify()`.
+The asset's `strategy_config.forecast_evidence` declares, per family:
+- the record (`evidence_sha256`, file);
+- the model (`model_sha256`);
+- `period_hours`, `metric_space`, `scaler_identity`;
+- the mapping of each prediction the strategy actually consumes onto a record horizon.
+  M04 leaves that mapping to the consumer. Its length must equal what the strategy
+  receives, so nothing is dropped and nothing is invented.
+
+**The rule.** The status is ELIGIBLE only if every consumed horizon of BOTH families
+satisfies all of these:
+- the record verifies, is the declared one, and freezes MAE as primary;
+- its provenance is `held_out_validation` or `chronological_oof`, with `test_used` and
+  `reserved_trading_test` false. The reserved trading test, an unknown provenance or
+  None is refused;
+- asset, period, scale, scaler and candidate match the declaration, and the horizon
+  was scored on the population's own rows;
+- model and naive MAE are finite, naive MAE is not zero, and model MAE is strictly
+  below naive MAE.
+
+Anything else gives `SKIPPED_NOT_BETTER_THAN_NAIVE`, listing every failure (reason,
+family, horizon, detail). A favourable mean is reported but never overrides a failing
+member. The receipt (`lts.forecast_naive_gate_decision.v1`) carries:
+- per horizon, MAE and MSE with the same-row baseline and skill/delta, or
+  NOT_AVAILABLE with the reason (zero naive gives no infinite skill; the record holds
+  no NaN or inf);
+- per family, the provenance, the population identity and the baselines. Persistence
+  decides eligibility. A seasonal naive is reported when the evidence carries
+  `seasonal_naive` (per horizon `seasonal_naive_MAE/MSE`), and is NOT_AVAILABLE
+  otherwise. It is never used for eligibility.
+
+**Wiring.** `run_heartbeat_cycle` calls `_forecast_gate` before
+`_compute_heuristic_signal` and fails closed: missing configuration, an unreadable
+file, any exception, or a mapping mismatch each SKIP. A skipped asset invokes the
+strategy zero times and writes no order. Decisions are returned in
+`results["forecast_gate"]`.
+
+**Tests** (`tests/unit/test_forecast_naive_gate.py`, 27). They were red at collection
+before the module existed. The nine required cases are all green:
+1. one failing short horizon;
+2. one failing long horizon;
+3. a favourable mean masking a failing member;
+4. a tie;
+5. a zero naive;
+6. a missing or NaN metric (5 variants);
+7. mismatched rows, scaler or period (4 variants);
+8. one genuinely passing configuration;
+9. **zero `compute_signal` invocations through the real `run_heartbeat_cycle`** (real
+   in-memory DB, portfolio and asset; only the external prediction provider is
+   substituted).
+
+Also green:
+- missing evidence and a substituted evidence file each invoke the strategy zero times;
+- a passing gate invokes the strategy exactly once;
+- every provenance refusal, metric switch, tampering, candidate or asset mismatch, and
+  horizon-mapping case;
+- the baselines receipt.
+
+**Mutants** (worker_b): every one of the five is killed.
+
+| Mutant | Tests failing |
+|---|---|
+| tie admitted | 1 |
+| gate unwired | 3 |
+| zero naive admitted | 1 |
+| provenance unchecked | 4 |
+| failing member suppressed | 4 |
+
+**Suites** (worker_b, trading-stack, `crispdm-run` 3G; nothing ran on the coordinator):
+
+| Run | Result |
+|---|---|
+| Branch before `c734f34` | 77 passed, 13 errors |
+| Branch after `a30a2b9` | 110 passed, 13 errors |
+| Live lineage `12bce5f` (scratch) | 75 passed, 13 errors |
+| Live lineage + all M05 commits (`7ced25e`, scratch, removed) | 146 passed, 13 errors |
+
+The suites are the named routes plus `tests/test_web_ui.py` (which holds the heartbeat
+tests) plus the M05 suites. The 13 errors are identical in all four runs (same digest
+of the error list). They are `TestTemplateRendering` and `TestAuthIntegration` failing
+to import `jose`, which is not installed in worker_b's trading-stack: an environment
+gap that this change neither causes nor fixes. Both heartbeat tests pass.
+
+**Conditioning contract (M01 provenance v1).** `ModularPolicy.load(require_conditioning="OPERATIONAL")`
+refuses UNKNOWN (also when absent) and SYNTHETIC_OFFLINE with
+`CONDITIONING_CONTRACT_NOT_OPERATIONAL`, before the engine is touched. The shadow tier
+records the value and does not require it. Tests cover OPERATIONAL, UNKNOWN, absent,
+SYNTHETIC_OFFLINE and unrecognised values. The v3 contract's engine digest is unchanged.
+
+**Not done.**
+- No real financial evidence record exists yet for the heuristic strategy's
+  prediction models. Every live asset therefore stays SKIPPED until M04 issues one.
+- The gate is not wired into the separate heuristic-strategy repository's backtest
+  runner. That needs the same gate in that repository and an explicit order.
+
+Evidence: `$HOME/Documents/GitHub/.runtime/m05-paper-adapter-20260930/naive-gate/`.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
