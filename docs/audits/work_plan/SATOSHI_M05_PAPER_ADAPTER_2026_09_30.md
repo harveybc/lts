@@ -965,3 +965,63 @@ train-mean naive; the MLP arms are worse than zero-return), so no records exist.
 is ready.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 16: 4-seed table and split-half over all 48 ETH R0 cells
+
+**Inputs:** M07 predictor `c8b150da`, `ARTIFACTS_INDEX.json` `20231c86…`, `CLOSURE.json`
+`c47aaad7…` (12 configs × 4 seeds, all verified). Every cell was run on the primary and cut
+episodes with per-run observability files, labelled DEVELOPMENT_NOT_CONFIRMATORY.
+
+**Selection, declared:** the "best 3" are the configs with the lowest 4-seed mean validation
+MAE_z. That is a **post-hoc choice on DEVELOPMENT**, and choosing horizons on the same
+validation is optimistic; the split-half check measures how much.
+
+Per config, 4 seeds, full episode (heuristic metrics):
+
+| Config | Mean MAE_z | Ran / skipped | Net return mean ± sd | Sharpe mean (n) |
+|---|---|---|---|---|
+| control_mlp_huber_adam | 0.86454 | 4 / 0 | 0.0201 ± 0.0331 | 0.0117 (3; 1 undefined) |
+| control_mlp_mae_adamw | 0.86551 | 4 / 0 | 0.0204 ± 0.0135 | 0.0185 (4) |
+| per_feature_huber_adam | 0.86552 | 3 / 1 | 0.0000 ± 0 (no trades) | undefined |
+| per_feature_huber_adamw | 0.86555 | 3 / 1 | 0 (no trades) | undefined |
+| control_mlp_mae_adam | 0.86599 | 3 / 1 | 0.0013 ± 0.0015 | 0.0094 |
+| grouped32_huber_adamw | 0.86599 | 4 / 0 | 0 (no trades) | undefined |
+| per_feature_mae_adamw | 0.86623 | 2 / 2 | 0 | undefined |
+| per_feature_mae_adam | 0.86635 | 2 / 2 | 0 | undefined |
+| grouped32_mae_adam | 0.86689 | 0 / 4 | not run | — |
+| grouped32_mae_adamw | 0.86697 | 2 / 2 | 0 | undefined |
+| grouped32_huber_adam | 0.86705 | 4 / 0 | 0 | undefined |
+| control_mlp_huber_adamw | 0.86849 | 3 / 1 | 0.0063 ± 0.0076 | 0.0130 |
+
+**Best 3, per seed** (consumed horizons → full-episode net, trades | split-half: chosen on
+the first half → still passing on the second half, second-half net):
+
+- control_mlp_huber_adam:
+  - 2021: [2,4,5] → 0.0, 0 trades | [2,4,5] → [], 0.0
+  - 2022: [3,4,5,6] → 0.0682, 93 | [1] → [], 0.0301
+  - 2023: [2,5,6] → −0.0033, 22 | [] → not run
+  - 2024: [3,5] → 0.0153, 29 | [3] → [], −0.0073
+- control_mlp_mae_adamw:
+  - 2021: [1,3,4,5,6] → 0.0381, 17 | [1,4,6] → [1,4,6], 0.0067
+  - 2022: [1,5] → 0.0074, 20 | [] → not run
+  - 2023: [5,6] → 0.0235, 13 | [5,6] → [], 0.0012
+  - 2024: [3,4] → 0.0126, 10 | [] → not run
+- per_feature_huber_adam: no trades in any seed (forecasts never reach the frozen 0.5% entry
+  threshold); 2022 is skipped.
+
+Split-half second half, mean ± sd over the seeds that ran: control_mlp_huber_adam
+0.0076 ± 0.0198 (3); control_mlp_mae_adamw 0.0040 ± 0.0039 (2); per_feature_huber_adam 0 (3).
+
+**Reading:**
+- The passing horizons change from seed to seed. Only **1 of 12** best-3 seeds
+  (control_mlp_mae_adamw 2021) keeps its first-half horizons passing on the second half.
+- Second-half returns are near zero, with sd comparable to the mean.
+- This agrees with M07's closure (no config passes all six horizons in more than 1 of
+  4 seeds). It also stays the headline caveat: horizon choice on this validation is mostly
+  noise, and the full-episode returns above are optimistic.
+
+Evidence: `.runtime/m05-paper-adapter-20260930/eth4h_paired_48/` (`cells.json`,
+`seed_summary_4seeds.json`, `best3_4seeds.json`, the per-cell results, the split-half
+outputs and the observability JSONL files). One CPU job on worker_b, `crispdm-run` 2G.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
