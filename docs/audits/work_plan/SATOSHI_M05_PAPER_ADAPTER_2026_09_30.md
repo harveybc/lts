@@ -1094,3 +1094,58 @@ JSONL, `fx_cells.json`, `fx_seed_summary.json`) and `fx_sha_{worker_a,worker_b}.
 job on worker_b, `crispdm-run` 2G.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 18: EURUSD vDh under the coordinator's pre-declared FX rules: NOT economically viable
+
+**Declared before the run, never tuned** (heuristic-strategy `560fa89`). Cost profile
+`docs/contracts/fx_profile.eurusd_ibkr_canary.v1.json`, a versioned object:
+- `spread_cap_price` 0.0003, from the IBKR canary profile;
+- modelled round-trip spread 1e-4 (half charged per side);
+- commission per side 0.001, the harness value. That is lane G's ETH figure, **not**
+  IBKR's, and is flagged as such;
+- slippage and swap 0;
+- broker fills NOT_AVAILABLE.
+
+The SIGN rule: position = sign of the predicted cumulative return at the strongest passing
+horizon, defined as the largest record skill. It is held for that horizon's bar count,
+trades never overlap, and there is no threshold and no grid. The frozen 0.5% rule gave
+0 trades (addendum 17). The bootstrap interval is NOT_AVAILABLE: C2's block-bootstrap rule
+has not been delivered to M05.
+
+Per cell (h* = 1 in every cell; 18,710–18,711 one-bar trades). Edge is per unit, close to
+close; z uses sigma 0.001226 and mu −2.1e-6, recovered from the predictions' own
+z/log-return pairs.
+
+| Cell | Seed | Hit rate | Mean gross edge (price) | Edge (z) | Break-even round trip | Ratio to the 1e-4 spread |
+|---|---|---|---|---|---|---|
+| 90d91a43 grouped_all | 2021 | 0.5182 | 2.15e-05 | 0.0156 | 2.15e-05 | 0.21× |
+| 9c4c7577 grouped_all | 2022 | 0.5154 | 1.50e-05 | 0.0105 | 1.50e-05 | 0.15× |
+| 66583ab2 control_mlp | 2022 | 0.5200 | 2.16e-05 | 0.0159 | 2.16e-05 | 0.22× |
+| ef02938c control_mlp | 2021 | 0.5216 | 2.75e-05 | 0.0199 | 2.75e-05 | 0.28× |
+
+Episode metrics (harness execution: fill at next open, 1 unit on 10,000 cash, so the
+fractions are tiny):
+
+| Cell | GROSS net return | GROSS Sharpe | Net, spread only | Net, declared profile | Exposure |
+|---|---|---|---|---|---|
+| 90d91a43 | +0.000040 | 0.0196 | −0.000030 | −0.0016 | 0.965 |
+| 9c4c7577 | +0.000028 | 0.0137 | −0.000027 | −0.0013 | 0.965 |
+| 66583ab2 | +0.000041 | 0.0201 | −0.000028 | −0.0016 | 0.965 |
+| ef02938c | +0.000051 | 0.0253 | −0.000016 | −0.0015 | 0.965 |
+
+The no-trade baseline is 0 on every metric.
+
+**Verdict:**
+- The sign of the forecast carries a real but tiny edge: a hit rate of 51.5–52.2% over
+  ~18.7k trades per cell.
+- The break-even round-trip cost is 1.5–2.8e-5 price units, **0.15–0.28× the modelled 1e-4
+  spread alone**. Net of the spread alone, every cell loses; net of the declared profile it
+  loses more.
+- The result is **NOT economically viable** at any realistic EURUSD spread.
+- DEVELOPMENT_NOT_CONFIRMATORY; no selection on validation.
+
+Evidence: `.runtime/m05-paper-adapter-20260930/fx_lake_vdh/sign_rule/sign_rule_fx.json`.
+Tests (heuristic-strategy): sign rule 5, red, then green. Mutants killed: overlap allowed (1),
+spread not charged (1), mu ignored (1).
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
