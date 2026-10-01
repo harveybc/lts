@@ -335,3 +335,48 @@ that moved was exactly `i // 4` for all 24. Verdict: REPLAY_PASS.
   money.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 5: INTEGRATED_3ecdb256
+
+As the coordinator ordered, this is a single re-export against lane A's declared
+integrated revision, predictor `3ecdb2565ef35dec7600109516dde86d2488d921`. It ran on
+worker_b in the pinned `envs/tensorflow` (Keras 3.13.2), with every child under
+`crispdm-run` (≤4G) and CUDA hidden. Nothing ran against a real broker, nothing was
+promoted, and the live checkout was untouched.
+
+**Adapter change.** Commit `e4186cf`. At `3ecdb256` the engine is a package
+(`predictor_plugins/modular_temporal/`, 10 modules), so the adapter now pins and loads
+a package too. For a directory, `engine.sha256` is the digest of canonical JSON
+`{relative .py path: sha256}`, with `__pycache__` excluded. The predictor exporter
+(`303042dc`) writes the same definition. The package is imported under a unique
+pinned name, with no fallback. A new test covers the digest. The installed package's
+digest equals the tree's: `2939b82d…`.
+
+**Contract `19bba8e5…`** (`candidate-v3-INTEGRATED_3ecdb256`) records:
+- Engine kind `package`, commit `3ecdb256`, Keras 3.13.2.
+- `previous`: `64a91a74`, Keras 3.13.2, kind `file`, with lineage back to `556c5f3e`,
+  Keras 3.15.0.
+- Both bottleneck semantics, both shape (6, 8):
+  - `semantics` (new core): 24-step causal Conv1D branches preserve the grid;
+    positional encoding, projection and two causal Transformer blocks over 24 fused
+    steps; residual Conv1D stages 24→12→6→6 over complete adjacent windows; latent
+    steps on the right-edge grid [4, 8, 12, 16, 20, 24].
+  - `previous_semantics` (old core): branches compress 24→12; Transformer over 12
+    steps; compression to 6 right-edge tokens.
+
+**Results:**
+
+| Check | Result |
+|---|---|
+| Fit (local smoke) | 7 epochs, best epoch 1; validation MAE 0.007637 vs zero naive 0.007632 (skill −0.0006, worse than zero); persistence 0.011559. No skill. |
+| Replay `replay_v3_INTEGRATED_3ecdb256.json` (`f14dbe82…`) | **REPLAY_PASS**: 12 points, deterministic, causal; window 0.0; forecast 4.3e-7; bottleneck 8.9e-7 |
+| Latent probe, residual core | **passed**: earliest moved latent step = i//4 for all 24 inputs; change before the allowed step 0.0 |
+| Golden parity vs the `64a91a74` export (`050d8ebf…`) | **FEATURE_SIDE_IDENTICAL**: 12/12 windows bit-identical; bars, scaler, features, time and action contracts equal. Model side differs (forecast 0.081, bottleneck 2.26): information, by design |
+| Runner shadow receipt (`d2bb97cf…`) | **RUNNER_SHADOW_PASS**: 12 ticks, all `shadow_inference_only`; orders 0; `execution_authorized` false; only `stock_bars` touched; 10 hold / 2 long; runner digests equal the replay's 12/12 |
+| Installed suites: predictor `3ecdb256` and lts `e4186cf` installed non-editable in separate venvs (Keras 3.13.2); engine from site-packages | **68 passed**, 0 skipped |
+| Named routes + adapter + preflight + runner, trading-stack (Keras 3.15.0), before at `4f03cef` (engine 64a91a74) / after at `e4186cf` (engine 3ecdb256) | 67 / **68** passed |
+| Live lineage: all M05 code commits cherry-picked onto `12bce5f` (scratch `3d62da3`, removed) | **104** passed (66 before) |
+
+Evidence: `$HOME/Documents/GitHub/.runtime/m05-paper-adapter-20260930/integrated-3ecdb256/`.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
