@@ -113,7 +113,8 @@ def replay(bars, config, *, stop_after=None):
 
 
 def main(argv=None) -> int:
-    socket.socket = _no_network  # type: ignore[assignment]
+    socket.socket.connect = _no_network  # type: ignore[assignment]  (keeps the class importable)
+    socket.socket.connect_ex = _no_network  # type: ignore[assignment]
     socket.create_connection = _no_network  # type: ignore[assignment]
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     for name in ("--view", "--rows", "--predictions", "--evidence", "--declared", "--workdir"):
