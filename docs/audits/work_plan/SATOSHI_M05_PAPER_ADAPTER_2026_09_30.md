@@ -1025,3 +1025,72 @@ Evidence: `.runtime/m05-paper-adapter-20260930/eth4h_paired_48/` (`cells.json`,
 outputs and the observability JSONL files). One CPU job on worker_b, `crispdm-run` 2G.
 
 Satoshi, successor technical lead, 2026-10-01 (UTC).
+
+## Addendum 17: EURUSD lake vDh, the first FX evidence, as a declared reduced experiment
+
+**Inputs:** worker_a `~/.local/state/scratch/m07/artifacts_fx_wa/`, plus the EURUSD lake 1h
+view `eurusd_1h_from_lake_5m.csv` (sha `ab0ada28…`).
+- Copied to worker_b through a coordinator pipe (nothing stored on the coordinator). All 10
+  file sha256s are identical on both workers.
+- Cells:
+  - grouped_all_mae_adamw: 90d91a43 (seed 2021) and 9c4c7577 (seed 2022);
+  - control_mlp_mae_adamw: ef02938c (2021) and 66583ab2 (2022).
+- Asset: "EURUSD 1h (lake 5m->1h, HistData lineage; DEVELOPMENT)". Hourly family,
+  horizons 1..4 h, 18,711 validation origins.
+- Clock: `DATE_TIME` is New York local, stamped at bar end. The UTC availability epoch comes
+  from `row_id`: first origin 2019-08-13T11:00:00Z (NY 07:00), last 2022-09-22T21:00:00Z.
+  Bars and forecasts pair on the same NY stamp; the UTC epochs are recorded in the results.
+
+**Eligibility.** The strategy consumes hourly 1..24 and daily 24..144 h. Evidence exists
+only for hourly 1..4, so **full-consumption eligibility is NOT ELIGIBLE**. What is missing
+for deployment: hourly 5..24, the whole daily family, a FROZEN manifest, and FX-calibrated
+sizing and costs (see below). This run is a **DECLARED REDUCED experiment**: entry from
+hourly 1..4 only.
+
+Gate on MAE_z, model vs same-row strict-minimum naive:
+
+| Cell | Seed | h1 | h2 | h3 | h4 | Consumed |
+|---|---|---|---|---|---|---|
+| 90d91a43 grouped_all | 2021 | 0.509093 vs 0.509587 ✓ | 0.722536 vs 0.722995 ✓ | 0.893288 vs 0.893783 ✓ | 1.039291 vs 1.039615 ✓ | [1,2,3,4] |
+| 9c4c7577 grouped_all | 2022 | 0.508990 ✓ | 0.722291 ✓ | 0.893372 ✓ | 1.039081 ✓ | [1,2,3,4] |
+| 66583ab2 control_mlp | 2022 | 0.508706 ✓ | 0.722800 ✓ | 0.893707 ✓ | 1.039363 ✓ | [1,2,3,4] |
+| ef02938c control_mlp | 2021 | 0.508816 ✓ | 0.722949 ✓ | 0.893498 ✓ | 1.040117 vs 1.039615 ✗ | [1,2,3] |
+
+The gate decides on MAE only. M07's index flag `beats_zero_return` also requires MSE, so it
+marks 66583ab2 h2 false; my gate does not use MSE.
+
+**Strategy results**, DEVELOPMENT_NOT_CONFIRMATORY. 19,385 bars from the first origin to the
+last origin + 4; 674 bars without a forecast held. **All four cells: 0 trades**, so net
+return 0, drawdown 0, exposure 0 and an undefined Sharpe. That is identical to the no-trade
+baseline.
+
+Cost lines: commission MODELLED 0 (no fills); slippage, spread and swap MODELLED 0;
+broker_fill_costs BROKER_FILL NOT_AVAILABLE.
+
+The reason is structural, not a failure of the forecasts. The heuristic's frozen entry
+threshold is a 0.5% predicted move (ETH-scaled), and EURUSD 1–4 h forecasts are about
+1e-4 in log return. In addition, the paired harness uses lane G's ETH sizing (1 unit on
+10,000) and commission (0.001 per side). Both are uncalibrated for FX: a real EURUSD spread
+is about 1e-4. An FX run needs FX-scaled parameters and costs, **declared before** any run.
+Tuning them on this validation would be selection on the same data. That is a
+coordinator/owner decision; nothing was tuned here.
+
+**Split-half** (first 9,355 origins choose, last 9,356 are held out; zero-return naive with
+mu = 0 declared, because M07's train mu for EURUSD was not provided and the train-mean naive
+differs by less than 1e-3):
+
+| Cell | Chosen on first half | Still passing on second half | Second-half skill |
+|---|---|---|---|
+| 90d91a43 | [1,2,4] | [1,2,4] | +0.0018 / +0.0011 / +0.0005 |
+| 9c4c7577 | [] | — | — |
+| 66583ab2 | [1,4] | [1,4] | +0.0028 / +0.0003 |
+| ef02938c | [1] | [1] | +0.0021 |
+
+Unlike ETH, chosen horizons mostly hold on the held-out half, but the margins are tiny
+(0.03–0.28%).
+
+Evidence: `.runtime/m05-paper-adapter-20260930/fx_lake_vdh/` (results, observability
+JSONL, `fx_cells.json`, `fx_seed_summary.json`) and `fx_sha_{worker_a,worker_b}.txt`. One CPU
+job on worker_b, `crispdm-run` 2G.
+
+Satoshi, successor technical lead, 2026-10-01 (UTC).
