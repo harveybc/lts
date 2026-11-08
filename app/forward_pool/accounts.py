@@ -9,7 +9,7 @@ An unrelated position is not adopted.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from app.forward_pool.core import (
     BusinessContract,
@@ -22,6 +22,11 @@ from app.forward_pool.core import (
 from app.forward_pool.snapshot import HourlyBar, quote_for
 
 
+# A round trip charges one fee at entry and one fee at exit. Each amount is
+# one side, in account currency. Tests that pass fee 0 do not exercise it.
+FEE_UNIT = "per_side"
+
+
 @dataclass
 class Position:
     direction: int
@@ -30,6 +35,7 @@ class Position:
     sl: float
     tp: float
     owner: str
+    opened_bar_close_utc_ns: int | None = None
 
     def side_name(self) -> str:
         return "long" if self.direction == 1 else "short"
@@ -123,6 +129,7 @@ class VirtualAccount:
             "owner": self.owner,
             "entries": self.entries,
             "units": 0 if self.position is None else self.position.units,
+            "fee_unit": FEE_UNIT,
         }
 
     def _protections(self, bar: HourlyBar, fee: float, financing: float) -> str | None:
@@ -142,6 +149,10 @@ class VirtualAccount:
     def _intrabar(self, bar: HourlyBar, fee: float, financing: float) -> str | None:
         position = self.position
         if position is None or bar.high is None or bar.low is None:
+            return None
+        # The bar's high and low are already complete at the close. A position
+        # opened on this close has not yet seen a later market event.
+        if position.opened_bar_close_utc_ns == bar.bar_close_utc_ns:
             return None
         if position.direction == 1:
             stop_hit = bar.low <= position.sl
@@ -197,7 +208,15 @@ class VirtualAccount:
             self.refusals.append("UNITS")
             return "UNITS"
         assert sl is not None and tp is not None
-        self.position = Position(direction, units, entry, float(sl), float(tp), self.owner)
+        self.position = Position(
+            direction,
+            units,
+            entry,
+            float(sl),
+            float(tp),
+            self.owner,
+            bar.bar_close_utc_ns,
+        )
         self.balance -= fee
         self.entries += 1
         return None
@@ -246,6 +265,7 @@ class RouteBook:
     effects: dict[str, RouteEffect] = field(default_factory=dict)
     tenure: list[dict[str, Any]] = field(default_factory=list)
     halted_unknown: bool = False
+    persist: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if self.tier not in {"shadow", "paper", "demo"}:
@@ -308,10 +328,13 @@ class RouteBook:
             raise PoolRefusal("UNKNOWN_UNRECONCILED")
         effect = RouteEffect(effect_id, "journaled_pending", owner, command, snapshot_id)
         self.effects[effect_id] = effect
+        self._persist()
         if transport is None:
             effect.state = "acknowledged_shadow"
+            self._persist()
             return effect
         effect.transport_calls += 1
+        self._persist()
         try:
             result = transport(effect)
         except PoolRefusal as exc:
@@ -319,13 +342,20 @@ class RouteBook:
                 raise
             effect.state = "effect_unknown"
             self.halted_unknown = True
+            self._persist()
             raise
         if result != "ack":
             effect.state = "effect_unknown"
             self.halted_unknown = True
+            self._persist()
             raise PoolRefusal("UNKNOWN_OUTCOME")
         effect.state = "acknowledged"
+        self._persist()
         return effect
+
+    def _persist(self) -> None:
+        if self.persist is not None:
+            self.persist()
 
     def reconcile(self, effect_id: str, outcome: str) -> None:
         effect = self.effects.get(effect_id)

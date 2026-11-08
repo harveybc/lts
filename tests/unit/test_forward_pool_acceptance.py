@@ -6,6 +6,10 @@ No test opens a broker socket, reads a live ledger, or starts a service unit.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -13,6 +17,7 @@ import pytest
 from app.forward_pool.accounts import Position, RouteBook, VirtualAccount
 from app.forward_pool.adapter import AGENT_STATE_NONE, CODEC, SCHEMA, authenticate_bundle, greedy_signal
 from app.forward_pool.cohort import (
+    SELECTED70_COLUMNS,
     SELECTED70_HISTORICAL,
     SELECTED70_MODEL_HEX,
     CandidateSpec,
@@ -229,6 +234,9 @@ def test_p03_independent_ledgers_and_one_materialization(tmp_path: Path):
         left = service.register(spec(code_sha256="sha256:" + "11" * 32, fixed_signal=1), now_ns=NS)
         right = service.register(spec(code_sha256="sha256:" + "22" * 32, fixed_signal=1), now_ns=NS)
         assert left.candidate_id != right.candidate_id
+        for record in (left, right):
+            service.mark_parity(record.candidate_id)
+            service.mark_shadow(record.candidate_id, now_ns=NS)
         result = service.step(bar(), sl=1.05, tp=1.20)
         assert result["materialize_calls"] == 1
         assert left.account.balance == right.account.balance
@@ -518,6 +526,8 @@ def test_p10_restart_resumes_bar_without_catch_up_orders(tmp_path: Path):
     root = tmp_path / "pool"
     service = PoolService(root)
     record = service.register(spec(fixed_signal=1), now_ns=NS)
+    service.mark_parity(record.candidate_id)
+    service.mark_shadow(record.candidate_id, now_ns=NS)
     service.step(
         bar(snapshot_id="warm", catch_up=True, bar_close_utc_ns=NS - 1, decision_time_utc_ns=NS - 1, availability_watermark_utc_ns=NS - 1, published_utc_ns=(NS - 2,)),
         sl=1.05,
@@ -614,6 +624,285 @@ def test_p12_new_identity_and_immutable_artifact(tmp_path: Path):
         assert original.account.balance == 10_000.0
         successor.account.balance = 1.0
         assert original.account.balance == 10_000.0
+    finally:
+        service.close()
+
+
+def test_f01_selected70_registers_seventy_columns_and_refuses_silent_nop(tmp_path: Path):
+    service = PoolService(tmp_path / "pool")
+    try:
+        record = service.seed_selected70(
+            now_ns=NS,
+            recipe_sha256=HASH,
+            scaler_sha256=HASH,
+            strategy_sha256=HASH,
+            code_sha256=HASH,
+        )
+        assert len(record.spec.columns) == 70
+        assert record.spec.columns == SELECTED70_COLUMNS
+        assert record.spec.fixed_signal is None
+        service.mark_parity(record.candidate_id)
+        service.mark_shadow(record.candidate_id, now_ns=NS)
+        values = tuple(float(index + 1) / 1000 for index in range(70))
+        quiet = service.step(
+            bar(
+                columns=SELECTED70_COLUMNS,
+                values=values,
+                published_utc_ns=tuple(NS - 1 for _ in range(70)),
+            ),
+            sl=1.05,
+            tp=1.2,
+        )
+        assert quiet["decisions"][0]["refusal"] == "INFERENCE_ABSENT"
+        assert record.account.entries == 0
+        seen = {}
+
+        def infer(observed: tuple[float, ...]) -> int:
+            seen["width"] = len(observed)
+            return 2
+
+        service.bind_inference(record.candidate_id, infer)
+        unplanned = service.step(
+            bar(
+                snapshot_id="unplanned",
+                bar_close_utc_ns=NS + 3_600_000_000_000,
+                decision_time_utc_ns=NS + 3_600_000_000_000,
+                availability_watermark_utc_ns=NS + 3_600_000_000_000,
+                columns=SELECTED70_COLUMNS,
+                values=values,
+                published_utc_ns=tuple(NS + 3_600_000_000_000 - 1 for _ in range(70)),
+            ),
+            sl=1.15,
+            tp=1.05,
+        )
+        assert seen["width"] == 70
+        assert unplanned["decisions"][0]["refusal"] == "PLAN_ABSENT"
+        assert record.account.entries == 0
+
+        def planner(signal: int, observed: tuple[float, ...], balance: float) -> tuple[float, float]:
+            assert signal == 2 and len(observed) == 70 and balance == 10_000.0
+            return (1.15, 1.05)
+
+        service.bind_planner(record.candidate_id, planner)
+        called = service.step(
+            bar(
+                snapshot_id="planned",
+                bar_close_utc_ns=NS + 7_200_000_000_000,
+                decision_time_utc_ns=NS + 7_200_000_000_000,
+                availability_watermark_utc_ns=NS + 7_200_000_000_000,
+                columns=SELECTED70_COLUMNS,
+                values=values,
+                published_utc_ns=tuple(NS + 7_200_000_000_000 - 1 for _ in range(70)),
+            ),
+            sl=1.0,
+            tp=1.3,
+        )
+        assert called["decisions"][0]["signal"] == 2
+        assert called["decisions"][0]["position"] == -1
+        assert record.account.position is not None
+        assert record.account.position.sl == pytest.approx(1.15)
+        assert record.account.position.tp == pytest.approx(1.05)
+    finally:
+        service.close()
+
+
+def test_f02_unknown_effect_and_closes_survive_reload(tmp_path: Path):
+    root = tmp_path / "pool"
+    service = PoolService(root)
+    record = service.seed_selected70(
+        now_ns=NS,
+        recipe_sha256=HASH,
+        scaler_sha256=HASH,
+        strategy_sha256=HASH,
+        code_sha256=HASH,
+    )
+    service.route.writer = record.candidate_id
+    try:
+        service.route.submit(
+            effect_id="unknown-fixture",
+            owner=record.candidate_id,
+            command=1,
+            snapshot_id="completed-hour",
+            now_ns=NS,
+            transport=lambda _effect: "unknown",
+        )
+    except PoolRefusal as exc:
+        assert exc.code == "UNKNOWN_OUTCOME"
+    before = {"halted": service.route.halted_unknown, "effects": len(service.route.effects)}
+    book = VirtualAccount("book", "book")
+    book.apply(1, bar(), contract(), entry_sl=1.05, entry_tp=1.2)
+    later = bar(
+        snapshot_id="after",
+        bar_close_utc_ns=NS + 1,
+        decision_time_utc_ns=NS + 1,
+        availability_watermark_utc_ns=NS + 1,
+        published_utc_ns=(NS,),
+        low=1.0,
+        high=1.2,
+        bid=1.04,
+        ask=1.0402,
+    )
+    assert book.apply(0, later, contract())["close_reason"] == "SL"
+    record.account.closes = list(book.closes)
+    record.account.entries = book.entries
+    service._save()
+    service.close()
+    resumed = PoolService(root)
+    try:
+        after = {"halted": resumed.route.halted_unknown, "effects": len(resumed.route.effects)}
+        assert before == after
+        assert before == {"halted": True, "effects": 1}
+        effect = resumed.route.effects["unknown-fixture"]
+        assert effect.state == "effect_unknown" and effect.snapshot_id == "completed-hour"
+        with pytest.raises(PoolRefusal) as caught:
+            resumed.route.submit(
+                effect_id="retry",
+                owner=record.candidate_id,
+                command=1,
+                snapshot_id="next",
+                now_ns=NS + 1,
+                transport=lambda _effect: "ack",
+            )
+        assert caught.value.code == "UNKNOWN_UNRECONCILED"
+        restored = resumed.records[record.candidate_id].account
+        assert restored.closes[0].reason == "SL"
+        assert restored.closes[0].owner == "book"
+    finally:
+        resumed.close()
+
+
+def test_f02_process_death_during_transport_stays_unknown(tmp_path: Path):
+    root = tmp_path / "pool"
+    script = tmp_path / "die_at_transport.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import os
+            import signal
+            import sys
+
+            from app.forward_pool.cohort import PoolService
+
+            pool = PoolService(sys.argv[1])
+            digest = "sha256:" + "ab" * 32
+            record = pool.seed_selected70(
+                now_ns=1,
+                recipe_sha256=digest,
+                scaler_sha256=digest,
+                strategy_sha256=digest,
+                code_sha256=digest,
+            )
+            pool.route.writer = record.candidate_id
+
+            def transport(_effect):
+                os.kill(os.getpid(), signal.SIGKILL)
+
+            pool.route.submit(
+                effect_id="dying",
+                owner=record.candidate_id,
+                command=1,
+                snapshot_id="hour",
+                now_ns=1,
+                transport=transport,
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [sys.executable, str(script), str(root)],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+    )
+    assert completed.returncode != 0
+    service = PoolService(root)
+    try:
+        assert service.route.halted_unknown is True
+        effect = service.route.effects["dying"]
+        assert effect.state == "effect_unknown" and effect.transport_calls >= 1
+    finally:
+        service.close()
+
+
+def test_f03_shadow_wealth_does_not_replace_executor_cash(tmp_path: Path):
+    service = PoolService(tmp_path / "pool")
+    try:
+        record = service.register(spec(fixed_signal=1), now_ns=NS)
+        service.mark_parity(record.candidate_id)
+        service.mark_shadow(record.candidate_id, now_ns=NS)
+        record.account.balance = 12_000.0
+        record.account.position = None
+        service.route.writer = record.candidate_id
+        service.route.cash = 8_500.0
+        service.route_account.balance = 8_500.0
+        service.route.position = Position(1, 100, 1.1, 1.0, 1.2, record.candidate_id)
+        service.route_account.position = service.route.position
+        service._mirror_route(record.candidate_id, bar())
+        assert service.route.cash == 8_500.0
+        assert service.route.position is not None and service.route.position.owner == record.candidate_id
+        assert record.account.balance == 12_000.0
+        service.route.authorized = True
+        service.route.tier = "demo"
+        assert service.route.request_switch("successor", now_ns=NS, equity=8_500.0) == "QUEUED_UNTIL_FLAT"
+        service.route.position = None
+        assert service.route.note_flat(NS + 1, service.route.cash) == "successor"
+        assert service.route.cash == 8_500.0
+        assert record.account.balance == 12_000.0
+        assert service.route.tenure[-1]["cash"] == 8_500.0
+    finally:
+        service.close()
+
+
+def test_f04_pre_entry_extremes_do_not_close_a_new_order():
+    rules = contract()
+    completed = bar(high=1.1010, low=1.0990, bid=1.1000, ask=1.1002)
+    long_book = VirtualAccount("long", "long")
+    opened = long_book.apply(1, completed, rules, entry_sl=1.0995, entry_tp=1.1020)
+    assert long_book.entries == 1
+    assert opened["close_reason"] is None and opened["position"] == 1
+    assert long_book.balance == 10_000.0
+    short_book = VirtualAccount("short", "short")
+    short_open = short_book.apply(2, completed, rules, entry_sl=1.1005, entry_tp=1.0980)
+    assert short_open["close_reason"] is None and short_open["position"] == -1
+    gap = bar(
+        snapshot_id="gap",
+        bar_close_utc_ns=NS + 3_600_000_000_000,
+        decision_time_utc_ns=NS + 3_600_000_000_000,
+        availability_watermark_utc_ns=NS + 3_600_000_000_000,
+        published_utc_ns=(NS + 3_600_000_000_000 - 1,),
+        bid=1.0900,
+        ask=1.0902,
+        low=1.0890,
+        high=1.0910,
+    )
+    stopped = long_book.apply(0, gap, rules)
+    assert stopped["close_reason"] == "SL"
+    assert long_book.closes[-1].price == pytest.approx(1.0900)
+    both = bar(
+        snapshot_id="both-later",
+        bar_close_utc_ns=NS + 7_200_000_000_000,
+        decision_time_utc_ns=NS + 7_200_000_000_000,
+        availability_watermark_utc_ns=NS + 7_200_000_000_000,
+        published_utc_ns=(NS + 7_200_000_000_000 - 1,),
+        bid=1.1000,
+        ask=1.1002,
+        low=1.0970,
+        high=1.1040,
+    )
+    fresh = VirtualAccount("fresh", "fresh")
+    fresh.apply(2, completed, rules, entry_sl=1.1005, entry_tp=1.0980)
+    assert fresh.apply(0, both, rules)["close_reason"] == "SL"
+
+
+def test_registered_candidate_cannot_open(tmp_path: Path):
+    service = PoolService(tmp_path / "pool")
+    try:
+        record = service.register(spec(fixed_signal=1), now_ns=NS)
+        result = service.step(bar(), sl=1.05, tp=1.2)
+        assert result["decisions"][0]["refusal"] == "ADMISSION_STATE"
+        assert record.account.entries == 0
+        absent = materialize(bar(), SELECTED70_COLUMNS)
+        assert absent.refusal == "FEATURE_ABSENT" and absent.values is None
     finally:
         service.close()
 

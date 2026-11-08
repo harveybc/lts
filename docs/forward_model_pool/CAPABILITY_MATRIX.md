@@ -38,6 +38,12 @@ These are explicit. They are not silent edits of the checkpoint.
 | Tie | Native `argmax` | First maximum wins. A BUY/SELL tie above NOP selects BUY. |
 | Command 3 | Codec `NOP_BUY_SELL_CLOSE_OPPOSITE_V1` | Network outputs are 0/1/2. Command 3 is the controller close. |
 
+## Integration corrections
+
+Review `0447d6ab` reproduced F01–F04. The production registration uses the 70 recipe columns. A missing network call is `INFERENCE_ABSENT`. An entry without a bound planner is `PLAN_ABSENT`. Route effects, the unknown halt and close history reload from the isolated state file. A transport that dies after the journal is restored as `effect_unknown`. Executor cash is not copied from a shadow ledger. A position opened on a completed bar is not stopped by that bar's earlier high or low.
+
+The native `entry_plan` / `propose` calculation is not executed inside this service. The bound planner is an adapter slot. Full TRAIN and VALIDATION fill replay is not claimed. `SHADOW_OBSERVING` stays false.
+
 ## Not claimed
 
 - `CODE_VERIFIED` is true only after the named acceptance tests pass.

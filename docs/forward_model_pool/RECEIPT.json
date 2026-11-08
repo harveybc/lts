@@ -7,12 +7,29 @@
   "SHADOW_OBSERVING": false,
   "PAPER_DEMO_EXECUTING": false,
   "evidence_class": "OFFLINE_FIXTURE_AND_SAVED_PROBE",
+  "assignment_corrections": "0447d6ab4ec1e4636ee1d7c527e764e34b6f0ae3",
+  "counterexamples": {
+    "tool": "tools/audit_forward_pool_handoff.py",
+    "verdict": "WITNESSES_PASS",
+    "violates_expected": {
+      "F01": false,
+      "F02": false,
+      "F03": false,
+      "F04": false
+    }
+  },
+  "not_claimed": [
+    "full TRAIN/VALIDATION decision replay",
+    "native entry_plan execution against saved fills",
+    "governed hourly feed",
+    "MT5 EURUSD execution"
+  ],
   "tests": {
     "lts": {
       "file": "tests/unit/test_forward_pool_acceptance.py",
-      "passed": 13,
+      "passed": 19,
       "failed": 0,
-      "duration_seconds": 0.54,
+      "duration_seconds": 0.98,
       "names": [
         "test_p01_greedy_tie_policy_and_bundle_rejections",
         "test_p02_causal_snapshot_stale_revision_and_dst",
@@ -26,6 +43,12 @@
         "test_p10_restart_resumes_bar_without_catch_up_orders",
         "test_p11_divergence_explains_cash_and_does_not_rewrite_history",
         "test_p12_new_identity_and_immutable_artifact",
+        "test_f01_selected70_registers_seventy_columns_and_refuses_silent_nop",
+        "test_f02_unknown_effect_and_closes_survive_reload",
+        "test_f02_process_death_during_transport_stays_unknown",
+        "test_f03_shadow_wealth_does_not_replace_executor_cash",
+        "test_f04_pre_entry_extremes_do_not_close_a_new_order",
+        "test_registered_candidate_cannot_open",
         "test_isolated_root_refuses_live_ledger_paths"
       ]
     },

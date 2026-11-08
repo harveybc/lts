@@ -15,13 +15,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from app.forward_pool.accounts import Position, RouteBook, VirtualAccount
+from app.forward_pool.accounts import CloseRecord, Position, RouteBook, RouteEffect, VirtualAccount
 from app.forward_pool.core import BusinessContract, PoolRefusal, digest
 from app.forward_pool.snapshot import HourlyBar, materialize
 
 RULE_PATH = Path(__file__).with_name("RANKING_RULE.json")
+COLUMNS_PATH = Path(__file__).with_name("SELECTED70_COLUMNS.json")
 INITIAL_BALANCE = 10_000.0
 SELECTED70_MODEL_HEX = "079bef0ea6f3b9327772f4204e5d5dbbd4be69a5ab58c32b424aa3cb7c686404"
+SELECTED70_COLUMNS = tuple(json.loads(COLUMNS_PATH.read_text(encoding="utf-8")))
+TRADABLE_STATES = frozenset({"SHADOW_ACTIVE", "EXECUTION_ELIGIBLE"})
 SELECTED70_HISTORICAL = {
     "TRAIN": {"net_return_pct": 11.51453, "orders": 748, "orders_per_week": 3.57895},
     "VALIDATION": {"net_return_pct": 13.80849, "orders": 206, "orders_per_week": 3.81481},
@@ -82,7 +85,7 @@ class CandidateSpec:
     business_valid: bool = True
     inference: str = "greedy"
     loader: str = "categorical_greedy_bundle"
-    fixed_signal: int = 0
+    fixed_signal: int | None = None
     group_count: int = 28
     observations: int = 13
     stride: int = 2
@@ -154,6 +157,8 @@ class CandidateRecord:
     forward_started_utc_ns: int | None = None
     window: WindowMetrics | None = None
     admitted_utc_ns: int | None = None
+    infer: Callable[[tuple[float, ...]], int] | None = None
+    planner: Callable[[int, tuple[float, ...], float], tuple[float, float] | None] | None = None
 
     @property
     def candidate_id(self) -> str:
@@ -348,6 +353,7 @@ def _position_dict(position: Position | None) -> dict[str, Any] | None:
         "sl": position.sl,
         "tp": position.tp,
         "owner": position.owner,
+        "opened_bar_close_utc_ns": position.opened_bar_close_utc_ns,
     }
 
 
@@ -361,6 +367,7 @@ def _position_load(payload: dict[str, Any] | None) -> Position | None:
         float(payload["sl"]),
         float(payload["tp"]),
         str(payload["owner"]),
+        None if payload.get("opened_bar_close_utc_ns") is None else int(payload["opened_bar_close_utc_ns"]),
     )
 
 
@@ -396,6 +403,7 @@ class PoolService:
         state_path = self.root / "state.json"
         if state_path.exists():
             self._load(state_path)
+        self.route.persist = self._save
 
     def close(self) -> None:
         if self._lock_fd is None:
@@ -449,7 +457,7 @@ class PoolService:
             strategy_sha256=strategy_sha256,
             code_sha256=code_sha256,
             train_cutoff="2024-01-01",
-            columns=("RAW_CLOSE_LOG_RETURN",),
+            columns=SELECTED70_COLUMNS,
             train_return=11.51453,
             validation_return=13.80849,
             train_orders=748,
@@ -458,9 +466,31 @@ class PoolService:
             validation_orders_per_week=3.81481,
             historical=dict(SELECTED70_HISTORICAL),
             role="initial_reference",
-            fixed_signal=0,
+            fixed_signal=None,
         )
+        if len(spec.columns) != 70:
+            raise PoolRefusal("COLUMN_ORDER")
         return self.register(spec, now_ns=now_ns)
+
+    def bind_inference(self, candidate_id: str, infer: Callable[[tuple[float, ...]], int]) -> None:
+        """Attach the categorical eval callable. A missing callable is not a NOP."""
+
+        record = self._record(candidate_id)
+        if record.state == "INELIGIBLE":
+            raise PoolRefusal("ADMISSION_STATE")
+        record.infer = infer
+
+    def bind_planner(
+        self,
+        candidate_id: str,
+        planner: Callable[[int, tuple[float, ...], float], tuple[float, float] | None],
+    ) -> None:
+        """Attach native SL/TP sizing. Caller-supplied distances are not this plan."""
+
+        record = self._record(candidate_id)
+        if record.state == "INELIGIBLE":
+            raise PoolRefusal("ADMISSION_STATE")
+        record.planner = planner
 
     def seal(self, candidate_id: str, artifact_sha256: str) -> None:
         record = self._record(candidate_id)
@@ -586,42 +616,80 @@ class PoolService:
                 produced.append(result)
                 self.decisions[f"{candidate_id}:{bar.bar_close_utc_ns}"] = result
                 continue
-            if features.refusal:
-                result = record.account.apply(0, bar, self.contract, manage=True, entry_sl=sl, entry_tp=tp)
+            if record.state not in TRADABLE_STATES:
+                result = record.account.apply(0, bar, self.contract, manage=False)
+                result["signal"] = None
+                result["refusal"] = "ADMISSION_STATE"
+                result["outcome"] = "refused"
+                result["intent"] = "refuse"
+            elif features.refusal:
+                result = record.account.apply(0, bar, self.contract, manage=False)
                 result["signal"] = None
                 result["refusal"] = features.refusal
                 result["outcome"] = "refused"
                 result["intent"] = "refuse"
             else:
-                signal = int(signals[candidate_id]) if signals and candidate_id in signals else record.spec.fixed_signal
-                manage = self._manages_route(candidate_id)
-                result = record.account.apply(
-                    signal,
-                    bar,
-                    self.contract,
-                    manage=True,
-                    entry_sl=sl,
-                    entry_tp=tp,
-                )
-                if manage and record.state == "EXECUTION_ELIGIBLE" and transport is not None:
-                    effect_id = digest(
-                        {
-                            "candidate": candidate_id,
-                            "command": result["command"],
-                            "snapshot": bar.snapshot_id,
-                        }
-                    )
-                    self.route.submit(
-                        effect_id=effect_id,
-                        owner=candidate_id,
-                        command=int(result["command"]),
-                        snapshot_id=bar.snapshot_id,
-                        now_ns=bar.decision_time_utc_ns,
-                        transport=transport,
-                    )
-                    submitted += 1
-                if manage:
-                    self._mirror_route(candidate_id, bar)
+                signal = self._signal_for(record, candidate_id, signals, features.values)
+                if signal is None:
+                    result = record.account.apply(0, bar, self.contract, manage=False)
+                    result["signal"] = None
+                    result["refusal"] = "INFERENCE_ABSENT"
+                    result["outcome"] = "refused"
+                    result["intent"] = "refuse"
+                else:
+                    entry_sl, entry_tp = sl, tp
+                    if record.spec.fixed_signal is None and int(signal) in (1, 2):
+                        if record.planner is None or features.values is None:
+                            result = record.account.apply(0, bar, self.contract, manage=False)
+                            result["signal"] = int(signal)
+                            result["refusal"] = "PLAN_ABSENT"
+                            result["outcome"] = "refused"
+                            result["intent"] = "refuse"
+                            entry_sl = None
+                        else:
+                            planned = record.planner(int(signal), features.values, record.account.balance)
+                            if planned is None:
+                                result = record.account.apply(0, bar, self.contract, manage=False)
+                                result["signal"] = int(signal)
+                                result["refusal"] = "PLAN_REFUSED"
+                                result["outcome"] = "refused"
+                                result["intent"] = "refuse"
+                                entry_sl = None
+                            else:
+                                entry_sl, entry_tp = planned
+                    if entry_sl is not None or int(signal) not in (1, 2) or record.spec.fixed_signal is not None:
+                        result = record.account.apply(
+                            int(signal),
+                            bar,
+                            self.contract,
+                            manage=True,
+                            entry_sl=entry_sl,
+                            entry_tp=entry_tp,
+                        )
+                    if (
+                        result.get("outcome") != "refused"
+                        and self._manages_route(candidate_id)
+                        and record.state == "EXECUTION_ELIGIBLE"
+                        and transport is not None
+                    ):
+                        effect_id = digest(
+                            {
+                                "candidate": candidate_id,
+                                "command": result["command"],
+                                "snapshot": bar.snapshot_id,
+                            }
+                        )
+                        self.route.submit(
+                            effect_id=effect_id,
+                            owner=candidate_id,
+                            command=int(result["command"]),
+                            snapshot_id=bar.snapshot_id,
+                            now_ns=bar.decision_time_utc_ns,
+                            transport=transport,
+                        )
+                        submitted += 1
+                    if self._manages_route(candidate_id):
+                        self._mirror_route(candidate_id, bar)
             result.update(
                 {
                     "candidate_id": candidate_id,
@@ -640,30 +708,34 @@ class PoolService:
         self._write_snapshot(bar, produced)
         return {"replayed": False, "submitted": submitted, "materialize_calls": calls, "decisions": produced}
 
+    def _signal_for(
+        self,
+        record: CandidateRecord,
+        candidate_id: str,
+        signals: Mapping[str, int] | None,
+        values: tuple[float, ...] | None,
+    ) -> int | None:
+        if signals is not None and candidate_id in signals:
+            return int(signals[candidate_id])
+        if record.infer is not None:
+            if values is None:
+                return None
+            return int(record.infer(values))
+        if record.spec.fixed_signal is not None:
+            return int(record.spec.fixed_signal)
+        return None
+
     def _manages_route(self, candidate_id: str) -> bool:
         return self.route.writer == candidate_id
 
     def _mirror_route(self, candidate_id: str, bar: HourlyBar) -> None:
-        shadow = self.records[candidate_id].account
-        if self.route_account.owner != candidate_id and self.route.position is None:
-            self.route_account.owner = candidate_id
-        if self.route.position is None and shadow.position is not None and shadow.position.owner == candidate_id:
-            self.route.position = Position(
-                shadow.position.direction,
-                shadow.position.units,
-                shadow.position.entry,
-                shadow.position.sl,
-                shadow.position.tp,
-                candidate_id,
-            )
-            self.route_account.position = self.route.position
-            self.route.cash = self.route_account.balance
-        elif shadow.position is None and self.route.position is not None and self.route.position.owner == candidate_id:
-            self.route.position = None
-            self.route_account.position = None
-            self.route.cash = shadow.balance
-            self.route_account.balance = shadow.balance
-            self.route.note_flat(bar.decision_time_utc_ns, self.route.cash)
+        """Keep executor cash and custody off the shadow ledger.
+
+        Reconciled route fills are the only way the executor balance or
+        position changes. A shadow's historical wealth is not a fill.
+        """
+
+        del candidate_id, bar
 
     def _stored(self, bar_ns: int) -> list[dict[str, Any]]:
         return [value for key, value in self.decisions.items() if key.endswith(":" + str(bar_ns))]
@@ -726,15 +798,31 @@ class PoolService:
                 "tier": self.route.tier,
                 "position": _position_dict(self.route.position),
                 "tenure": self.route.tenure,
+                "halted_unknown": self.route.halted_unknown,
+                "authority_expires_utc_ns": self.route.authority_expires_utc_ns,
+                "connected": self.route.connected,
                 "effects": {
-                    key: {"state": value.state, "owner": value.owner, "command": value.command, "calls": value.transport_calls}
+                    key: {
+                        "state": value.state,
+                        "owner": value.owner,
+                        "command": value.command,
+                        "snapshot_id": value.snapshot_id,
+                        "transport_calls": value.transport_calls,
+                    }
                     for key, value in self.route.effects.items()
                 },
             },
         }
         temporary = self.root / "state.json.building"
         temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        with temporary.open("rb+") as handle:
+            os.fsync(handle.fileno())
         temporary.replace(self.root / "state.json")
+        directory = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     def _dump_record(self, record: CandidateRecord) -> dict[str, Any]:
         spec = record.spec
@@ -751,6 +839,11 @@ class PoolService:
             "balance": record.account.balance,
             "entries": record.account.entries,
             "position": _position_dict(record.account.position),
+            "closes": [
+                {"reason": item.reason, "price": item.price, "pnl": item.pnl, "owner": item.owner}
+                for item in record.account.closes
+            ],
+            "refusals": list(record.account.refusals),
             "window": window,
         }
 
@@ -775,6 +868,11 @@ class PoolService:
             account = VirtualAccount(spec.candidate_id(), spec.candidate_id(), float(raw["balance"]))
             account.entries = int(raw["entries"])
             account.position = _position_load(raw["position"])
+            account.closes = [
+                CloseRecord(str(item["reason"]), float(item["price"]), float(item["pnl"]), str(item["owner"]))
+                for item in raw.get("closes", [])
+            ]
+            account.refusals = [str(item) for item in raw.get("refusals", [])]
             window = WindowMetrics(**raw["window"]) if raw["window"] else None
             record = CandidateRecord(
                 spec=spec,
@@ -796,5 +894,29 @@ class PoolService:
         self.route.tier = route["tier"]
         self.route.position = _position_load(route["position"])
         self.route.tenure = list(route["tenure"])
+        self.route.authority_expires_utc_ns = route.get("authority_expires_utc_ns")
+        self.route.connected = bool(route.get("connected", True))
+        self.route.effects.clear()
+        halted = bool(route.get("halted_unknown", False))
+        for key, raw_effect in (route.get("effects") or {}).items():
+            calls = int(raw_effect.get("transport_calls", raw_effect.get("calls", 0)))
+            state = str(raw_effect["state"])
+            if state == "journaled_pending" and calls > 0:
+                state = "effect_unknown"
+                halted = True
+            if state == "effect_unknown":
+                halted = True
+            self.route.effects[str(key)] = RouteEffect(
+                str(key),
+                state,
+                str(raw_effect["owner"]),
+                int(raw_effect["command"]),
+                str(raw_effect.get("snapshot_id", "")),
+                calls,
+            )
+        self.route.halted_unknown = halted
+        self.route_account.balance = self.route.cash
+        self.route_account.position = self.route.position
+        self.route_account.owner = self.route.writer or "unassigned"
         self.paper_demo_executing = False
         self.shadow_observing = False

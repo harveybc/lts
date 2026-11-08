@@ -10,14 +10,14 @@ This plan does not activate a route. `orders_submitted = 0`.
 
 ## What activation still requires
 
-A first EURUSD paper or demo route is not created by either script. The owner must:
+A first EURUSD paper or demo route is not created by either script. `tools/mint_paper_capability.py` is a single-use IBKR capability tool. It is not an MT5 activation procedure, and this plan does not ask the owner to run it for EURUSD.
 
-1. Issue a paper or demo capability through the existing mint procedure (`tools/mint_paper_capability.py` or the IBKR mandate tool). This delivery does not run those tools.
-2. Bind that capability to a route whose venue can implement EURUSD with one position, mandatory stop and target, leverage 1:50, the 12-hour opening embargo and the 12-hour forced flat. MT5 and Alpaca are recorded as disabled until that proof exists.
-3. Start the route only through the existing authorized paper/demo procedure. No unit is enabled here.
+1. Reuse the existing MT5 demo authorization path. This delivery does not mint a capability and does not restart the VM.
+2. Bind a route only after EURUSD symbol, protection, margin and calendar facts are read from that path. The running Alpaca SPY service is not this route.
+3. Start the route only through the existing authorized demo procedure. No unit is enabled here.
 
 Until those three facts exist, the pool may keep shadow ledgers and a queued successor. It may not submit.
 
 ## Restart
 
-A new process on the same isolated directory reloads the cohort, the last processed bar and the warmup list. It does not emit catch-up orders for bars already marked processed. An `effect_unknown` route effect must be reconciled before another submission of that effect.
+A new process on the same isolated directory reloads the cohort, the last processed bar, the warmup list, route effects, the unknown-outcome halt and close history. It does not emit catch-up orders for bars already marked processed. A journaled effect whose transport had started, and any `effect_unknown`, must be reconciled before another submission. Executor cash is not replaced by a shadow balance.
