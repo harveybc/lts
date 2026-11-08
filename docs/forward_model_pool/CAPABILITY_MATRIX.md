@@ -44,10 +44,16 @@ Review `0447d6ab` reproduced F01–F04. The production registration uses the 70 
 
 The native `entry_plan` / `propose` calculation is not executed inside this service. The bound planner is an adapter slot. Full TRAIN and VALIDATION fill replay is not claimed. `SHADOW_OBSERVING` stays false.
 
+## Selected70 feed plugin
+
+`app/forward_pool/selected70_feed.py` is the consumer plugin. It reads the 70 store columns, applies a consumer `DIFF` only when the recipe asks for one, z-scores with the fixed TRAIN constants, and builds the 13-by-70 stride-2 window. The pinned recipe has an empty consumer operation on every column: `LOG`, `ASINH` and `DIFF` in the column names were already applied in the store. Learned columns stay with their producers: `activity` for `act.p_hit`, `kalman` for `kf.lc.level_minus_close`, and `gmm` for the four `rg.gmm` columns. Layer-1 and layer-2 pools publish the rest. A price-only MT5 bar is not a substitute for those columns, and a missing value is not filled with zero.
+
+`tools/forward_pool_selected70_feed.py` compared every window with the production `FrozenRecipeInputs` loader. The maximum absolute difference was 0 on 30859 rows (30234 valid) after 257 leading non-finite store rows were dropped. It then loaded checkpoint `079bef0ea6f3b9327772f4204e5d5dbbd4be69a5ab58c32b424aa3cb7c686404` and called greedy `surfaces` on CPU. The last finalized bar closes at `2024-12-31T21:00:00Z`. That call is `HISTORICAL_REPLAY`. There is no current-hour row, so `SHADOW_OBSERVING` stays false and no order was submitted.
+
 ## Not claimed
 
-- `CODE_VERIFIED` is true only after the named acceptance tests pass.
-- `SHADOW_OBSERVING` is false. No governed live feed was attached.
+- `CODE_VERIFIED` is true only after the named acceptance tests and the feed unit tests pass.
+- `SHADOW_OBSERVING` is false. The attached store ends at `2024-12-31T21:00:00Z`.
 - `PAPER_DEMO_EXECUTING` is false.
 - The published TRAIN 11.51453% and VALIDATION 13.80849% figures stay offline references on the original artifact. This delivery does not replay the 748-order tape through `AbsoluteBarEnv`.
 - Real capital is rejected at construction.

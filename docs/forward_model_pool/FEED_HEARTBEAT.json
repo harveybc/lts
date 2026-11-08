@@ -1,0 +1,39 @@
+{
+  "checkpoint_sha256": "079bef0ea6f3b9327772f4204e5d5dbbd4be69a5ab58c32b424aa3cb7c686404",
+  "column_count": 70,
+  "comparison_inference": {
+    "action": 0,
+    "logits": [
+      1.6864957809448242,
+      -0.5156782865524292,
+      -2.1398000717163086
+    ],
+    "row_close_utc": "2022-07-08T20:00:00Z"
+  },
+  "evidence_class": "HISTORICAL_REPLAY",
+  "last_finalized_bar_close_utc": "2024-12-31T21:00:00Z",
+  "last_inference": {
+    "action": 0,
+    "evaluation_device": "cpu",
+    "logits": [
+      1.0735708475112915,
+      -0.9497488737106323,
+      -0.7469913959503174
+    ],
+    "mode": "greedy"
+  },
+  "last_ledger_event": null,
+  "observations": 13,
+  "orders_submitted": 0,
+  "paper_demo_executing": false,
+  "scaler_policy": "fixed_train",
+  "schema": "forward_pool.selected70_feed_heartbeat.v1",
+  "shadow_observing": false,
+  "stride_rows": 2,
+  "window_parity": {
+    "exact": true,
+    "max_abs_error": 0.0,
+    "rows": 30859,
+    "valid_rows": 30234
+  }
+}

@@ -6,7 +6,7 @@
   "CODE_VERIFIED": true,
   "SHADOW_OBSERVING": false,
   "PAPER_DEMO_EXECUTING": false,
-  "evidence_class": "OFFLINE_FIXTURE_AND_SAVED_PROBE",
+  "evidence_class": "HISTORICAL_REPLAY",
   "assignment_corrections": "0447d6ab4ec1e4636ee1d7c527e764e34b6f0ae3",
   "counterexamples": {
     "tool": "tools/audit_forward_pool_handoff.py",
@@ -21,7 +21,7 @@
   "not_claimed": [
     "full TRAIN/VALIDATION decision replay",
     "native entry_plan execution against saved fills",
-    "governed hourly feed",
+    "a current-hour governed bar; the pinned store closes 2024-12-31T21:00:00Z",
     "MT5 EURUSD execution"
   ],
   "tests": {
@@ -29,7 +29,7 @@
       "file": "tests/unit/test_forward_pool_acceptance.py",
       "passed": 19,
       "failed": 0,
-      "duration_seconds": 0.98,
+      "duration_seconds": 0.79,
       "names": [
         "test_p01_greedy_tie_policy_and_bundle_rejections",
         "test_p02_causal_snapshot_stale_revision_and_dst",
@@ -50,6 +50,18 @@
         "test_f04_pre_entry_extremes_do_not_close_a_new_order",
         "test_registered_candidate_cannot_open",
         "test_isolated_root_refuses_live_ledger_paths"
+      ]
+    },
+    "feed": {
+      "file": "tests/unit/test_selected70_feed.py",
+      "passed": 4,
+      "failed": 0,
+      "duration_seconds": 0.41,
+      "names": [
+        "test_window_scales_and_does_not_use_the_future",
+        "test_missing_value_is_not_zero_and_old_store_is_replay",
+        "test_diff_is_applied_only_when_the_recipe_asks",
+        "test_closed_split_drops_the_tail_and_a_path_cannot_enter_the_inventory"
       ]
     },
     "trading_contracts": {
@@ -73,6 +85,23 @@
     "command_disagreements": 0,
     "unit_disagreements": 0,
     "mode": "greedy"
+  },
+  "selected70_feed": {
+    "tool": "tools/forward_pool_selected70_feed.py",
+    "window_exact": true,
+    "max_abs_error": 0.0,
+    "store_rows": 31116,
+    "rows": 30859,
+    "valid_rows": 30234,
+    "leading_nonfinite_rows_dropped": 257,
+    "last_bar_close_utc": "2024-12-31T21:00:00Z",
+    "checkpoint_sha256": "079bef0ea6f3b9327772f4204e5d5dbbd4be69a5ab58c32b424aa3cb7c686404",
+    "last_action": 0,
+    "last_logits": [1.0735708475112915, -0.9497488737106323, -0.7469913959503174],
+    "mode": "greedy",
+    "evaluation_device": "cpu",
+    "evidence_class": "HISTORICAL_REPLAY",
+    "orders_submitted": 0
   },
   "activations": {
     "broker_orders": 0,
