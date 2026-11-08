@@ -106,14 +106,25 @@ def build_windows(
     timestamps_ns: Sequence[int] | np.ndarray,
     values: np.ndarray,
 ) -> dict[str, Any]:
-    """Build one scaled window per store row. ``timestamps_ns`` are bar starts."""
+    """Historical replay, including its split cutoff. Timestamps are bar starts."""
+
+    return _build_window_table(recipe, timestamps_ns, values, historical_split=True)
+
+
+def _build_window_table(
+    recipe: Mapping[str, Any],
+    timestamps_ns: Sequence[int] | np.ndarray,
+    values: np.ndarray,
+    *,
+    historical_split: bool,
+) -> dict[str, Any]:
 
     contract = require_recipe(recipe)
     stamps = np.asarray(timestamps_ns, dtype=np.int64)
     matrix = np.asarray(values, dtype=np.float64)
     if matrix.ndim != 2 or matrix.shape[1] != len(contract["columns"]) or matrix.shape[0] != len(stamps):
         raise PoolRefusal("COLUMN_ORDER")
-    cutoff = _cutoff_ns(recipe)
+    cutoff = _cutoff_ns(recipe) if historical_split else None
     if cutoff is not None:
         keep = stamps < cutoff
         if not bool(keep.any()):
@@ -145,6 +156,55 @@ def build_windows(
         "bar_close_utc_ns": close_ns,
         "windows": windows,
         "valid": valid,
+    }
+
+
+def build_forward_observation(
+    recipe: Mapping[str, Any],
+    timestamps_ns: Sequence[int] | np.ndarray,
+    values: np.ndarray,
+    *,
+    published_ns: np.ndarray,
+    decision_time_ns: int,
+    expected_close_ns: int,
+) -> dict[str, Any]:
+    """Build the exact requested completed bar without the historical split cap.
+
+    The caller supplies the calendar's expected close and per-cell availability
+    timestamps from governed producers. This function neither acquires data nor
+    attests producer causality. A missing requested bar never falls back to an
+    older valid observation. The frozen recipe and scaler remain unchanged.
+    """
+
+    contract = require_recipe(recipe)
+    stamps = np.asarray(timestamps_ns, dtype=np.int64)
+    matrix = np.asarray(values, dtype=np.float64)
+    published = np.asarray(published_ns)
+    if stamps.ndim != 1 or matrix.shape != (len(stamps), len(contract["columns"])):
+        raise PoolRefusal("COLUMN_ORDER")
+    if published.shape != matrix.shape or published.dtype.kind not in "iu":
+        raise PoolRefusal("PUBLICATION_TIME")
+    if expected_close_ns > decision_time_ns or expected_close_ns % HOUR_NS:
+        raise PoolRefusal("DECISION_TIME")
+    if len(stamps) == 0 or np.any(np.diff(stamps) <= 0):
+        raise PoolRefusal("STALE_INPUT")
+    # Cut at the requested completed bar before applying DIFF or scaling.
+    included = stamps + HOUR_NS <= expected_close_ns
+    if not included.any() or int(stamps[included][-1]) + HOUR_NS != expected_close_ns:
+        raise PoolRefusal("EXPECTED_BAR_ABSENT")
+    visible = matrix[included].copy()
+    available = published[included] <= decision_time_ns
+    visible[~available] = np.nan
+    table = _build_window_table(recipe, stamps[included], visible, historical_split=False)
+    index = len(table["valid"]) - 1
+    window = observation_at(table, index)
+    return {
+        "columns": contract["columns"],
+        "bar_close_utc_ns": int(table["bar_close_utc_ns"][index]),
+        "decision_time_utc_ns": int(decision_time_ns),
+        "features": window,
+        "scaler_policy": "fixed_train",
+        "purpose": "forward_inference",
     }
 
 
