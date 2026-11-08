@@ -1,0 +1,60 @@
+{
+  "schema": "forward_pool.receipt.v1",
+  "assignment": "e6f787a107c6b0eeac1117ea3188c6f1f8a4d32a",
+  "lts_base": "12bce5f2c4fe2ab0e6a7433d7208d9e05a9cffaa",
+  "orders_submitted": 0,
+  "CODE_VERIFIED": true,
+  "SHADOW_OBSERVING": false,
+  "PAPER_DEMO_EXECUTING": false,
+  "evidence_class": "OFFLINE_FIXTURE_AND_SAVED_PROBE",
+  "tests": {
+    "lts": {
+      "file": "tests/unit/test_forward_pool_acceptance.py",
+      "passed": 13,
+      "failed": 0,
+      "duration_seconds": 0.54,
+      "names": [
+        "test_p01_greedy_tie_policy_and_bundle_rejections",
+        "test_p02_causal_snapshot_stale_revision_and_dst",
+        "test_p03_independent_ledgers_and_one_materialization",
+        "test_p04_journal_before_send_unknown_and_replay",
+        "test_p05_single_writer_tier_and_real_capital_disabled",
+        "test_p06_flat_handover_keeps_owner_and_cash",
+        "test_p07_size_protection_and_weekly_boundaries_long_and_short",
+        "test_p08_eligibility_nulls_and_common_window",
+        "test_p09_disconnect_unknown_position_and_stale_authority",
+        "test_p10_restart_resumes_bar_without_catch_up_orders",
+        "test_p11_divergence_explains_cash_and_does_not_rewrite_history",
+        "test_p12_new_identity_and_immutable_artifact",
+        "test_isolated_root_refuses_live_ledger_paths"
+      ]
+    },
+    "trading_contracts": {
+      "file": "tests/test_forward_pool_contracts.py",
+      "passed": 5,
+      "failed": 0,
+      "duration_seconds": 0.68
+    }
+  },
+  "probe": {
+    "action_parity": true,
+    "logit_exact": false,
+    "model_sha256": "079bef0ea6f3b9327772f4204e5d5dbbd4be69a5ab58c32b424aa3cb7c686404",
+    "rows": 32,
+    "evaluation_device": "cpu",
+    "probe_device": "cuda",
+    "probe_torch": "2.13.0+cu130",
+    "max_abs_error_cpu": 1.0117888450622559e-05,
+    "max_abs_error_cuda_same_torch_build": 1.9073486328125e-06,
+    "action_disagreements": 0,
+    "command_disagreements": 0,
+    "unit_disagreements": 0,
+    "mode": "greedy"
+  },
+  "activations": {
+    "broker_orders": 0,
+    "capabilities_minted": 0,
+    "units_changed": 0,
+    "live_ledger_writes": 0
+  }
+}

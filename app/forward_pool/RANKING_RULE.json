@@ -1,0 +1,14 @@
+{
+  "schema_version": "forward_pool.ranking_rule.v1",
+  "rule_id": "weekly_net_return_after_costs.v1",
+  "objective": "net_return_after_costs",
+  "activity_orders_per_week_gt": 2.0,
+  "activity_resolution": "The assignment requires strictly more than two orders per week. The exported recipe text says >= 2.0. Exactly 2.0 is not eligible.",
+  "tie_break": ["lower_max_drawdown", "retain_incumbent"],
+  "forbid_objectives": ["train_profit", "critic_q"],
+  "minimum_complete_common_week": true,
+  "retain_incumbent_when_support_insufficient": true,
+  "permanent_reference_role": "initial_selected70",
+  "risk_contract_required": true,
+  "higher_return_outside_risk_is_not_a_winner": true
+}
